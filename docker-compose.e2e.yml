@@ -2,10 +2,11 @@ services:
   chronoframe:
     build: .
     environment:
-      CF_ADMIN_TOKEN: e2e-admin-token-change-before-real-use
       CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
       CF_WEB_DIR: /app/web
       CF_CONVERSION_WORKERS: "4"
+      CF_COOKIE_SECURE: "auto"
+      CF_TRUST_PROXY_HEADERS: "true"
     ports:
       - "127.0.0.1:8188:8080"
     volumes:

@@ -10,12 +10,13 @@
 
 ## VPS 构建与部署
 
-本仓库只在本地编辑源码；依赖安装、Nuxt/Rust 编译、自动化测试和 Docker 构建都应放在 VPS 的隔离工作目录中执行。先复制 `.env.example` 并将 `CF_ADMIN_TOKEN` 换成高强度随机值，再在 VPS 上运行：
+本仓库只在本地编辑源码；依赖安装、Nuxt/Rust 编译、自动化测试和 Docker 构建都应放在 VPS 的隔离工作目录中执行。先复制 `.env.example`，确认数据库、主密钥文件和 Cookie 策略的路径，再在 VPS 上运行：
 
 ```bash
 corepack enable
 corepack prepare pnpm@10.34.1 --activate
 pnpm install --frozen-lockfile
+pnpm typecheck
 pnpm build
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -23,7 +24,9 @@ cargo test --all-targets
 docker compose up -d --build
 ```
 
-`pnpm build` 运行 `nuxt generate`，产物位于 `.output/public`。Docker 的前端阶段同样通过 Corepack 固定使用 pnpm 10.34.1，最终由 Rust 容器从 `/app/web` 同源提供页面和 API；容器内服务监听 `8080`。对公网开放时应使用高强度管理员令牌，并通过防火墙或反向代理只暴露预期的 HTTP/HTTPS 端口。
+`pnpm build` 运行 `nuxt generate`，产物位于 `.output/public`。Docker 的前端阶段同样通过 Corepack 固定使用 pnpm 10.34.1，最终由 Rust 容器从 `/app/web` 同源提供页面和 API；容器内服务监听 `8080`。
+
+全新数据库第一次打开 `/dashboard` 时会显示管理员注册页。第一笔合法注册会在同一个 SQLite 事务中创建管理员和初始会话；一旦创建成功，注册入口永久关闭，之后只能使用该用户名和密码登录。不要让尚未完成首次注册的实例长期暴露在公网，否则其他访问者可能先行取得管理员身份。生产环境应通过 HTTPS 反向代理访问后台，并将 `CF_COOKIE_SECURE=true`；若需要使用代理提供的外部协议或主机头，还须在后端端口不对公网开放且代理会覆盖客户端同名请求头的前提下设置 `CF_TRUST_PROXY_HEADERS=true`。直接 HTTP 只适合隔离测试或通过 SSH 隧道访问。
 
 ## 存储后端
 
@@ -31,12 +34,16 @@ docker compose up -d --build
 
 环境变量只负责服务运行时，不负责存储：
 
-- `CF_ADMIN_TOKEN`：管理员令牌，同时用于派生存储密钥加密密钥。
 - `CF_DATABASE_URL`：SQLite 数据库位置。
+- `CF_MASTER_KEY_FILE`：存储凭据加密主密钥文件位置；文件首次启动自动随机生成，不是 WebDAV/S3 配置项。
+- `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；HTTPS 生产环境应为 `true`。
+- `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`；默认 `false`，只可对受控反向代理开启。
 - `CF_CONVERSION_WORKERS`：全局转换 worker 上限，限制为 1–16。
 - `CF_WEB_DIR`、`CF_BIND_ADDR`：前端静态目录和监听地址。
 
-WebDAV 密码和 S3 秘密访问密钥使用从管理员令牌派生的 AES-256-GCM 密钥加密后存储，读取设置时永不返回明文；若更换 `CF_ADMIN_TOKEN`，需要在后台重新保存相应密钥。上传和转换在 WebDAV 中会先写入临时对象，再使用 `MOVE` 原子提交；S3 使用临时对象复制到最终键；本地存储则先写入同目录临时文件后重命名。请使用支持 WebDAV `MKCOL`、`PUT`、`MOVE`、`DELETE` 的服务端，以及兼容 S3 path-style 请求的对象存储服务。
+WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-GCM 加密，读取设置时永不返回明文。主密钥与管理员密码完全解耦；备份或迁移时必须同时保存 SQLite 数据库和 `CF_MASTER_KEY_FILE`，缺少任意一项都无法恢复存储凭据。上传和转换在 WebDAV 中会先写入临时对象，再使用 `MOVE` 原子提交；S3 使用临时对象复制到最终键；本地存储则先写入同目录临时文件后重命名。请使用支持 WebDAV `MKCOL`、`PUT`、`MOVE`、`DELETE` 的服务端，以及兼容 S3 path-style 请求的对象存储服务。
+
+从旧的 `X-Admin-Token` 版本升级时，可在第一次启动新版时暂时保留原 `CF_ADMIN_TOKEN`。只有在主密钥文件尚不存在时，程序才会一次性用旧令牌派生兼容密钥并写入 `CF_MASTER_KEY_FILE`；确认密钥文件已经生成后即可移除该环境变量。它不会再被用于登录或 API 鉴权。
 
 上传必须指定一个已存在的相簿。单次请求最多 128 张、总计 384 MiB、单张 100 MiB；服务会在写入任何对象前校验整批文件的扩展名、文件签名和完整解码，批次中任一文件无效时不会留下部分上传。
 
@@ -50,10 +57,13 @@ WebDAV 密码和 S3 秘密访问密钥使用从管理员令牌派生的 AES-256-
 - 转换成功会把新图加入原相簿，旧图默认保留。管理员确认删除后，系统先在同一个数据库事务中写入全部删除授权，再通过持久化 outbox 幂等执行；即使删除途中被强制终止，重启后也会继续完成已确认的删除，而不会误删未确认原图。
 - 页面任务中心会在刷新或重新打开后恢复最近 100 个任务及其进度/错误详情；完成前可随时安全中断。
 
-所有写操作都要求 `X-Admin-Token`，Nuxt 界面仅将它保存于当前浏览器会话中。
+管理员密码使用带随机盐的 Argon2id 哈希保存，不会写入 Cookie 或前端存储。登录成功后服务端签发 7 天有效的随机会话：浏览器只持有 `HttpOnly`、`SameSite=Strict` 的会话 Cookie，数据库只保存令牌摘要；管理写操作还必须通过与该会话绑定的 CSRF 双重校验。退出会立即删除服务端会话，过期会话不能重放。项目是前后端同源应用，不开放宽松 CORS。
 
 ## API 摘要
 
+- `GET /api/auth/status` — 查询是否已完成首次注册及当前会话状态
+- `POST /api/auth/register` — 仅在无管理员时原子创建第一个管理员并登录
+- `POST /api/auth/login`、`POST /api/auth/logout`
 - `GET/PUT /api/settings/storage` — 管理员读取或保存存储后端设置
 - `POST /api/settings/storage/test` — 在不保存的情况下测试候选存储
 - `GET/POST /api/albums`
@@ -68,6 +78,6 @@ WebDAV 密码和 S3 秘密访问密钥使用从管理员令牌派生的 AES-256-
 
 ## 验收测试
 
-`scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中覆盖本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-delete-interrupt.sh` 专门验证管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
+`scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中覆盖并发首次注册、Argon2id 哈希、Cookie/CSRF、会话过期与退出，以及本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-delete-interrupt.sh` 专门验证登录会话和管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
 
 本项目基于原项目的 MIT 许可继续发布，原作者为 HoshinoSuzumi / Timothy Yin。
