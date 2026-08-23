@@ -9,11 +9,9 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ close: []; indexChange: [number] }>()
 
-const infoOpen = ref(false)
 const controlsVisible = ref(true)
 const scale = ref(1)
 const touchStart = ref<number | null>(null)
-const isMobile = useMediaQuery('(max-width: 768px)')
 const currentPhoto = computed(() => props.photos[props.currentIndex])
 
 const move = (delta: number) => {
@@ -28,7 +26,6 @@ const onKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') close()
   if (event.key === 'ArrowLeft') move(-1)
   if (event.key === 'ArrowRight') move(1)
-  if (event.key.toLowerCase() === 'i') infoOpen.value = !infoOpen.value
 }
 const onWheel = (event: WheelEvent) => {
   scale.value = Math.min(4, Math.max(1, scale.value + (event.deltaY < 0 ? 0.2 : -0.2)))
@@ -44,7 +41,6 @@ useEventListener('keydown', onKeydown)
 watch(() => props.isOpen, open => {
   if (import.meta.client) document.body.style.overflow = open ? 'hidden' : ''
   if (!open) {
-    infoOpen.value = false
     scale.value = 1
   }
 })
@@ -64,7 +60,7 @@ onBeforeUnmount(() => { if (import.meta.client) document.body.style.overflow = '
         :transition="{ duration: 0.3 }"
         @mousemove="controlsVisible = true"
       >
-        <div class="flex h-full w-full" :class="isMobile ? 'flex-col' : 'flex-row'">
+        <div class="flex h-full w-full">
           <div class="z-10 flex min-h-0 min-w-0 flex-1 flex-col">
             <div class="group relative min-h-0 min-w-0 flex-1 overflow-hidden bg-black/90" @wheel.prevent="onWheel">
               <motion.img
@@ -85,13 +81,8 @@ onBeforeUnmount(() => { if (import.meta.client) document.body.style.overflow = '
                 <div class="flex items-start justify-between gap-4">
                   <div class="min-w-0">
                     <h2 class="truncate text-base font-semibold sm:text-lg">{{ currentPhoto.title || $t('ui.photo.untitled') }}</h2>
-                    <p class="mt-0.5 text-xs text-white/60">
-                      {{ formatGalleryDate(currentPhoto.dateTaken, { year: 'numeric', month: 'long', day: 'numeric' }) }}
-                      <span v-if="currentPhoto.city"> · {{ currentPhoto.city }}</span>
-                    </p>
                   </div>
                   <div class="pointer-events-auto flex shrink-0 items-center gap-1 rounded-full bg-black/25 p-1 backdrop-blur-xl">
-                    <button v-if="isMobile" class="grid size-9 place-items-center rounded-full transition hover:bg-white/15" type="button" :title="$t('exif.sections.basic')" @click="infoOpen = !infoOpen"><Icon name="tabler:info-circle" class="size-5" /></button>
                     <a :href="currentPhoto.originalUrl" :download="currentPhoto.title" class="grid size-9 place-items-center rounded-full transition hover:bg-white/15" :title="$t('ui.action.share.actions.downloadOriginal')"><Icon name="tabler:download" class="size-5" /></a>
                     <button class="grid size-9 place-items-center rounded-full transition hover:bg-white/15" type="button" :aria-label="$t('viewer.navigation.close')" @click="close"><Icon name="tabler:x" class="size-5" /></button>
                   </div>
@@ -107,10 +98,6 @@ onBeforeUnmount(() => { if (import.meta.client) document.body.style.overflow = '
             </div>
             <PhotoGalleryThumbnail :photos="photos" :current-index="currentIndex" @index-change="emit('indexChange', $event)" />
           </div>
-          <AnimatePresence v-if="isMobile">
-            <PhotoInfoPanel v-if="infoOpen" :current-photo="currentPhoto" :on-close="() => (infoOpen = false)" />
-          </AnimatePresence>
-          <PhotoInfoPanel v-else :current-photo="currentPhoto" />
         </div>
       </motion.div>
     </AnimatePresence>
