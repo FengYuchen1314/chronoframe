@@ -36,8 +36,8 @@ services:
       CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
       CF_MASTER_KEY_FILE: /app/data/secret.key
       CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-4}"
-      CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-false}"
-      CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-false}"
+      CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-auto}"
+      CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-true}"
     volumes:
       - ./data:/app/data
 ```
@@ -61,9 +61,9 @@ docker compose start
 
 主密钥权限固定为 `0600`，因此打包必须使用 `sudo` 并确认命令成功；恢复时同样使用 `sudo tar --numeric-owner -xzf chronoframe-backup.tgz`。在新机器解压后进入目录执行 `docker compose up -d` 即可。若使用 WebDAV 或 S3，目录备份会保留数据库、管理员数据、加密主密钥及连接配置，远端图片本身仍在原 WebDAV/S3 中；需要离线完整迁移时还必须另行迁移远端对象。
 
-Compose 无需 `.env`。如需覆盖端口或 HTTPS 策略，可在同目录创建可选 `.env`，可用变量见 `.env.example`。直连 HTTP 使用默认的 `CF_COOKIE_SECURE=false`。配置 HTTPS 反向代理时，应将 `CHRONOFRAME_BIND=127.0.0.1`、`CF_COOKIE_SECURE=true`；只有代理会覆盖客户端传入的转发头时才设置 `CF_TRUST_PROXY_HEADERS=true`。
+Compose 无需 `.env`。默认同时允许通过公网 `IP:8188`、域名和 HTTP/HTTPS 反向代理访问；管理请求不会因为 Origin、反代协议、域名或端口不同而被拒绝。程序默认信任 `Forwarded` / `X-Forwarded-Proto` 来自动决定 Cookie 是否增加 `Secure`，代理没有发送这些头时仍可正常使用。需要修改监听地址、端口或 Cookie 策略时，才需使用 `.env.example` 中的可选变量。
 
-全新数据库第一次打开 `/dashboard` 时会显示管理员注册页。第一笔合法注册会在同一个 SQLite 事务中创建管理员和初始会话；一旦创建成功，注册入口永久关闭，之后只能使用该用户名和密码登录。不要让尚未完成首次注册的实例长期暴露在公网，否则其他访问者可能先行取得管理员身份。生产环境应通过 HTTPS 反向代理访问后台，并将 `CF_COOKIE_SECURE=true`；若需要使用代理提供的外部协议或主机头，还须在后端端口不对公网开放且代理会覆盖客户端同名请求头的前提下设置 `CF_TRUST_PROXY_HEADERS=true`。直接 HTTP 只适合隔离测试或通过 SSH 隧道访问。
+全新数据库第一次打开 `/dashboard` 时会显示管理员注册页。第一笔合法注册会在同一个 SQLite 事务中创建管理员和初始会话；一旦创建成功，注册入口永久关闭，之后只能使用该用户名和密码登录。不要让尚未完成首次注册的实例长期暴露在公网，否则其他访问者可能先行取得管理员身份。默认配置可直接使用 HTTP `IP:端口`，也可放在常见的 HTTPS 反向代理后面，无需额外切换环境变量。
 
 ## 存储后端
 
@@ -74,8 +74,8 @@ Compose 无需 `.env`。如需覆盖端口或 HTTPS 策略，可在同目录创�
 Compose 变量只负责服务运行时，不负责存储：
 
 - `CHRONOFRAME_BIND`、`CHRONOFRAME_PORT`：宿主机监听地址和端口。
-- `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；HTTPS 生产环境应为 `true`。
-- `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded`、`X-Forwarded-Proto` 和 `X-Forwarded-Host`；默认 `false`，只可对受控反向代理开启。
+- `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；默认 `auto`，反代报告 HTTPS 时自动使用 Secure Cookie。
+- `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded` 和 `X-Forwarded-Proto`；默认 `true`，以兼容无需额外配置的反向代理部署。
 - `CF_CONVERSION_WORKERS`：全局转换 worker 上限，限制为 1–16。
 
 容器内部的 SQLite 路径、主密钥路径、静态前端目录和监听地址已固定在镜像与 Compose 中，无需用户配置。
