@@ -6,6 +6,7 @@ import type {
   ImageTargetFormat,
   SourceDeletionResult,
 } from '~/types/dashboard'
+import { isAbortedRequest } from '~/utils/requestAbort'
 
 definePageMeta({
   layout: 'dashboard',
@@ -130,7 +131,7 @@ const loadJobDetail = async (jobId: string, includeItems?: boolean) => {
       if (requestIncludesItems) fullDetailLoadedJobIds.add(jobId)
     }
   } catch (error) {
-    if ((error as { name?: string })?.name !== 'AbortError') {
+    if (!isAbortedRequest(error, controller.signal)) {
       toast.add({
         title: '任务详情加载失败',
         description: getAdminApiErrorMessage(error),
@@ -220,7 +221,7 @@ async function pollJobs(generation: number) {
       await loadJobDetail(currentSelected.id, true)
     }
   } catch (error) {
-    if ((error as { name?: string })?.name !== 'AbortError') {
+    if (!isAbortedRequest(error, controller.signal)) {
       consecutivePollFailures += 1
       pollWarning.value = `进度同步暂时失败：${getAdminApiErrorMessage(error)}。已自动降低轮询频率。`
     }
@@ -243,6 +244,7 @@ const refreshPage = async () => {
   disposePolling()
   isLoading.value = true
   pageError.value = ''
+  const selectedJobIdBeforeRefresh = selectedJobId.value
 
   try {
     const [albumList, jobList] = await Promise.all([
@@ -255,7 +257,11 @@ const refreshPage = async () => {
     )
     applyJobList(jobList)
 
-    if (selectedJobId.value) await loadJobDetail(selectedJobId.value)
+    // A changed selection is loaded by the watcher. Loading it here as well would
+    // create two requests and immediately abort one of them on the initial refresh.
+    if (selectedJobId.value && selectedJobId.value === selectedJobIdBeforeRefresh) {
+      await loadJobDetail(selectedJobId.value)
+    }
   } catch (error) {
     pageError.value = getAdminApiErrorMessage(error)
   } finally {
