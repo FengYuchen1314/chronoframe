@@ -1,0 +1,17 @@
+services:
+  chronoframe:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8188:8080"
+    env_file: .env
+    environment:
+      # This profile is for the current direct-IP HTTP deployment. Put a TLS reverse proxy
+      # in front and switch this to true before serving the admin session over HTTPS.
+      CF_COOKIE_SECURE: "false"
+      CF_TRUST_PROXY_HEADERS: "false"
+    volumes:
+      - chronoframe-public-data:/app/data
+
+volumes:
+  chronoframe-public-data:

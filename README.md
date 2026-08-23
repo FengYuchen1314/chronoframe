@@ -26,6 +26,14 @@ docker compose up -d --build
 
 `pnpm build` 运行 `nuxt generate`，产物位于 `.output/public`。Docker 的前端阶段同样通过 Corepack 固定使用 pnpm 10.34.1，最终由 Rust 容器从 `/app/web` 同源提供页面和 API；容器内服务监听 `8080`。
 
+当前直连 IP 的公网实例使用独立生产模板，只启动 ChronoFrame，不会带上 E2E 所需的 MinIO 或 WebDAV 测试容器：
+
+```bash
+docker compose -p app -f docker-compose.production.yml up -d --build
+```
+
+该模板在 `8188` 端口提供直接 HTTP 访问，因此明确使用非 Secure Cookie。配置域名和 HTTPS 反向代理后，应把模板中的 `CF_COOKIE_SECURE` 改为 `true`；只有代理会覆盖客户端传入的转发头、且 Rust 端口不直接暴露时，才可把 `CF_TRUST_PROXY_HEADERS` 改为 `true`。
+
 全新数据库第一次打开 `/dashboard` 时会显示管理员注册页。第一笔合法注册会在同一个 SQLite 事务中创建管理员和初始会话；一旦创建成功，注册入口永久关闭，之后只能使用该用户名和密码登录。不要让尚未完成首次注册的实例长期暴露在公网，否则其他访问者可能先行取得管理员身份。生产环境应通过 HTTPS 反向代理访问后台，并将 `CF_COOKIE_SECURE=true`；若需要使用代理提供的外部协议或主机头，还须在后端端口不对公网开放且代理会覆盖客户端同名请求头的前提下设置 `CF_TRUST_PROXY_HEADERS=true`。直接 HTTP 只适合隔离测试或通过 SSH 隧道访问。
 
 ## 存储后端
