@@ -134,7 +134,7 @@ impl Config {
                 "false" | "0" | "no" => Some(false),
                 _ => bail!("CF_COOKIE_SECURE must be auto, true, or false"),
             },
-            trust_proxy_headers: match get("CF_TRUST_PROXY_HEADERS", "false")
+            trust_proxy_headers: match get("CF_TRUST_PROXY_HEADERS", "true")
                 .trim()
                 .to_ascii_lowercase()
                 .as_str()
@@ -1534,46 +1534,7 @@ fn no_store(response: &mut Response) {
     );
 }
 
-fn require_same_origin(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
-    let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Ok(());
-    };
-    let forwarded_host = state.trust_proxy_headers.then(|| {
-        headers
-            .get("x-forwarded-host")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-    });
-    let host = forwarded_host
-        .flatten()
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-        })
-        .ok_or_else(|| AppError::forbidden("无法验证请求来源"))?;
-    let scheme = if request_is_https(headers, state) {
-        "https"
-    } else {
-        "http"
-    };
-    let supplied = url::Url::parse(origin).map_err(|_| AppError::forbidden("请求来源无效"))?;
-    let expected = url::Url::parse(&format!("{scheme}://{host}"))
-        .map_err(|_| AppError::forbidden("无法验证请求来源"))?;
-    if supplied.scheme() != expected.scheme()
-        || supplied.host_str() != expected.host_str()
-        || supplied.port_or_known_default() != expected.port_or_known_default()
-    {
-        return Err(AppError::forbidden("不允许跨站管理请求"));
-    }
-    Ok(())
-}
-
-fn require_requested_with(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
-    require_same_origin(headers, state)?;
+fn require_requested_with(headers: &HeaderMap) -> ApiResult<()> {
     if headers
         .get("x-requested-with")
         .and_then(|value| value.to_str().ok())
@@ -1637,7 +1598,6 @@ async fn require_admin(
         }
     };
     if require_csrf {
-        require_same_origin(headers, state)?;
         let cookie = cookie_value(headers, CSRF_COOKIE)
             .ok_or_else(|| AppError::forbidden("CSRF 校验失败"))?;
         let supplied = headers
@@ -1838,7 +1798,7 @@ async fn register_admin(
     headers: HeaderMap,
     input: std::result::Result<Json<CredentialsInput>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_requested_with(&headers, &state)?;
+    require_requested_with(&headers)?;
     let Json(input) = input.map_err(auth_json_error)?;
     if admin_initialized(&state.db).await? {
         return Err(AppError::conflict("管理员账号已经注册"));
@@ -1902,7 +1862,7 @@ async fn login_admin(
     headers: HeaderMap,
     input: std::result::Result<Json<CredentialsInput>, JsonRejection>,
 ) -> ApiResult<Response> {
-    require_requested_with(&headers, &state)?;
+    require_requested_with(&headers)?;
     let Json(input) = input.map_err(auth_json_error)?;
     if !admin_initialized(&state.db).await? {
         return Err(AppError::conflict("尚未注册管理员账号"));
@@ -1933,7 +1893,7 @@ async fn logout_admin(
     headers: HeaderMap,
     body: std::result::Result<Bytes, BytesRejection>,
 ) -> ApiResult<Response> {
-    require_requested_with(&headers, &state)?;
+    require_requested_with(&headers)?;
     let _body = body.map_err(auth_body_error)?;
     let session = require_admin(&headers, &state, true).await?;
     sqlx::query("DELETE FROM admin_sessions WHERE token_hash=?")
@@ -3402,6 +3362,24 @@ mod tests {
         let mut trusted_state = state.clone();
         trusted_state.trust_proxy_headers = true;
         assert!(request_is_https(&headers, &trusted_state));
+    }
+
+    #[test]
+    fn requested_with_allows_proxy_domain_and_ip_origins() {
+        for origin in [
+            "https://gallery.example.com",
+            "http://192.0.2.10:8188",
+            "https://another-proxy.example:8443",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-requested-with",
+                HeaderValue::from_static(REQUESTED_WITH),
+            );
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            headers.insert(header::HOST, HeaderValue::from_static("chronoframe:8080"));
+            assert!(require_requested_with(&headers).is_ok(), "origin: {origin}");
+        }
     }
 
     #[test]
