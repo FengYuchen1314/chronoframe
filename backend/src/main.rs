@@ -2170,7 +2170,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(api)
         .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")))
-        .fallback_service(ServeDir::new(&config.web_dir).not_found_service(ServeFile::new(index)))
+        .fallback_service(ServeDir::new(&config.web_dir).fallback(ServeFile::new(index)))
         .layer(CorsLayer::very_permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

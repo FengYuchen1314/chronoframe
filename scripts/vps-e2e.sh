@@ -289,7 +289,14 @@ S3_BAD_SETTINGS='{"backend":"s3","localPath":"/app/data/e2e-local","webdavUrl":"
 
 # Start from clean, project-scoped Docker volumes and prove the static Nuxt app plus auth boundary.
 reset_stack
-curl -fsS --connect-timeout 5 --max-time 30 "$BASE/" | grep -q 'id="__nuxt"'
+for route in / /photos /albums /dashboard; do
+  curl -fsS --connect-timeout 5 --max-time 30 "$BASE$route" | grep -q 'id="__nuxt"'
+done
+unknown_api=$(curl -sS --connect-timeout 5 --max-time 30 -o /tmp/e2e-api-not-found.json -w '%{http_code}' "$BASE/api/does-not-exist")
+[[ "$unknown_api" = 404 ]] || fail "unknown API route returned HTTP $unknown_api"
+python3 -c 'import json; assert json.load(open("/tmp/e2e-api-not-found.json"))["error"]'
+missing_asset=$(curl -sS --connect-timeout 5 --max-time 30 -o /dev/null -w '%{http_code}' "$BASE/_nuxt/does-not-exist.js")
+[[ "$missing_asset" = 404 ]] || fail "missing Nuxt asset returned HTTP $missing_asset"
 unauthorized=$(curl -sS --connect-timeout 5 --max-time 30 -o /tmp/e2e-unauthorized.json -w '%{http_code}' -H 'Content-Type: application/json' -d '{"name":"forbidden"}' "$BASE/api/albums")
 [[ "$unauthorized" = 401 ]] || fail "unauthenticated mutation returned HTTP $unauthorized"
 echo "PASS Nuxt entrypoint and mutation authentication"
