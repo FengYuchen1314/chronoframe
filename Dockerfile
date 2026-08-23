@@ -1,53 +1,27 @@
-FROM node:22.22.3-alpine AS base
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
+FROM node:24-alpine AS web-builder
+WORKDIR /src/frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend ./
+RUN npm run build
 
-FROM base AS deps
-WORKDIR /usr/src/app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY packages/webgl-image/package.json ./packages/webgl-image/
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+FROM rust:1.96-bookworm AS api-builder
+WORKDIR /src
+COPY Cargo.toml ./
+COPY backend/Cargo.toml backend/Cargo.toml
+RUN mkdir backend/src && printf 'fn main() {}' > backend/src/main.rs && cargo build --release -p chronoframe-api && rm -rf backend/src
+COPY backend backend
+# The dependency warm-up stage compiles a placeholder main. Touch the real entrypoint so
+# Docker's normalized COPY timestamps can never reuse that placeholder executable.
+RUN touch backend/src/main.rs && cargo build --release -p chronoframe-api
 
-FROM base AS build
-WORKDIR /usr/src/app
-COPY --from=deps /usr/src/app/node_modules ./node_modules
-COPY --from=deps /usr/src/app/packages/webgl-image/node_modules ./packages/webgl-image/node_modules
-COPY . .
-RUN NODE_OPTIONS="--max-old-space-size=4096" pnpm run build:deps
-RUN NODE_OPTIONS="--max-old-space-size=8192" pnpm run build
-RUN find ./.output -type f -name '*.map' -delete
-
-FROM node:22.22.3-alpine AS runtime_deps
-RUN apk add --no-cache ca-certificates perl exiftool \
-	&& install -Dm755 "$(readlink -f /usr/bin/perl)" /opt/runtime-bin/perl \
-	&& install -Dm755 "$(readlink -f /usr/bin/env)" /opt/runtime-bin/env \
-	&& install -Dm755 "$(readlink -f /usr/bin/exiftool)" /opt/runtime-bin/exiftool
-
-FROM scratch AS runtime
+FROM debian:bookworm-slim
+RUN useradd --system --create-home chronoframe
 WORKDIR /app
-
-COPY --from=runtime_deps /usr/local/bin/node /usr/bin/node
-COPY --from=runtime_deps /opt/runtime-bin/perl /usr/bin/perl
-COPY --from=runtime_deps /opt/runtime-bin/env /usr/bin/env
-COPY --from=runtime_deps /opt/runtime-bin/exiftool /usr/bin/exiftool
-COPY --from=runtime_deps /usr/lib /usr/lib
-COPY --from=runtime_deps /usr/share /usr/share
-COPY --from=runtime_deps /lib /lib
-COPY --from=runtime_deps /etc/ssl /etc/ssl
-
-COPY --from=build /usr/src/app/.output ./.output
-COPY --from=build /usr/src/app/server/database/migrations ./server/database/migrations
-
-EXPOSE 3000
-VOLUME ["/app/data"]
-
-ENV NODE_ENV=production
-ENV NITRO_PORT=3000
-ENV NITRO_HOST=0.0.0.0
-ENV DATABASE_URL=./data/app.sqlite3
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
-ENV EXIFTOOL_PATH=/usr/bin/exiftool
-
-CMD ["/usr/bin/node", ".output/server/index.mjs"]
+COPY --from=api-builder /src/target/release/chronoframe-api /usr/local/bin/chronoframe-api
+COPY --from=web-builder /src/frontend/dist /app/web
+RUN mkdir -p /app/data/storage && chown -R chronoframe:chronoframe /app
+USER chronoframe
+ENV CF_WEB_DIR=/app/web CF_DATABASE_URL=sqlite:///app/data/chronoframe.db?mode=rwc
+EXPOSE 8080
+CMD ["chronoframe-api"]
