@@ -21,7 +21,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dashmap::DashMap;
@@ -50,6 +50,7 @@ struct AppState {
     jobs: Arc<DashMap<String, CancellationToken>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
+    thumbnail_slots: Arc<tokio::sync::Semaphore>,
     photo_graph_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -101,7 +102,7 @@ impl Config {
                 .parse::<usize>()
                 .unwrap_or(4)
                 .clamp(1, 16),
-            web_dir: get("CF_WEB_DIR", "./frontend/dist"),
+            web_dir: get("CF_WEB_DIR", "./.output/public"),
         })
     }
 }
@@ -897,7 +898,16 @@ struct Photo {
     format: String,
     content_type: String,
     byte_size: i64,
+    width: i64,
+    height: i64,
     created_at: i64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumDetail {
+    #[serde(flatten)]
+    album: Album,
+    photos: Vec<Photo>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -942,6 +952,8 @@ fn photo_from(row: &sqlx::sqlite::SqliteRow) -> Photo {
         format: row.get("format"),
         content_type: row.get("content_type"),
         byte_size: row.get("byte_size"),
+        width: row.get("width"),
+        height: row.get("height"),
         created_at: row.get("created_at"),
     }
 }
@@ -1165,6 +1177,14 @@ impl IntoResponse for AppError {
     }
 }
 type ApiResult<T> = std::result::Result<T, AppError>;
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "API 路径不存在"})),
+    )
+}
+
 fn admin(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
     if headers.get("x-admin-token").and_then(|v| v.to_str().ok())
         == Some(state.admin_token.as_str())
@@ -1228,6 +1248,29 @@ async fn list_albums(State(state): State<AppState>) -> ApiResult<Json<Vec<Album>
     let rows = sqlx::query("SELECT a.id,a.name,a.created_at,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.created_at DESC").fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(album_from).collect()))
 }
+async fn album_detail(
+    State(state): State<AppState>,
+    AxumPath(album_id): AxumPath<String>,
+) -> ApiResult<Json<AlbumDetail>> {
+    let row = sqlx::query("SELECT a.id,a.name,a.created_at,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
+        .bind(&album_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "相簿不存在".into(),
+        })?;
+    let photos = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC")
+        .bind(&album_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(AlbumDetail {
+        album: album_from(&row),
+        photos: photos.iter().map(photo_from).collect(),
+    }))
+}
 async fn create_album(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1257,7 +1300,14 @@ async fn album_photos(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
 ) -> ApiResult<Json<Vec<Photo>>> {
-    let rows = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC").bind(album_id).fetch_all(&state.db).await.map_err(AppError::internal)?;
+    let rows = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC").bind(album_id).fetch_all(&state.db).await.map_err(AppError::internal)?;
+    Ok(Json(rows.iter().map(photo_from).collect()))
+}
+async fn list_photos(State(state): State<AppState>) -> ApiResult<Json<Vec<Photo>>> {
+    let rows = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos ORDER BY created_at DESC,id DESC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(photo_from).collect()))
 }
 async fn upload_photos(
@@ -1328,15 +1378,16 @@ async fn upload_photos(
                 "{filename} 的扩展名与实际图片格式不一致"
             )));
         }
-        let (bytes, valid) = tokio::task::spawn_blocking(move || {
-            let valid = image::load_from_memory(&bytes).is_ok();
-            (bytes, valid)
+        let (bytes, dimensions) = tokio::task::spawn_blocking(move || {
+            let dimensions = image::load_from_memory(&bytes)
+                .ok()
+                .map(|decoded| (decoded.width() as i64, decoded.height() as i64));
+            (bytes, dimensions)
         })
         .await
         .map_err(AppError::internal)?;
-        if !valid {
-            return Err(AppError::bad(format!("{filename} 不是有效图片")));
-        }
+        let (width, height) =
+            dimensions.ok_or_else(|| AppError::bad(format!("{filename} 不是有效图片")))?;
         let id = Uuid::new_v4().to_string();
         let key = format!("albums/{album_id}/original/{id}.{format}");
         let content_type = mime_for(&format).to_string();
@@ -1349,6 +1400,8 @@ async fn upload_photos(
                 format,
                 content_type,
                 byte_size: bytes.len() as i64,
+                width,
+                height,
                 created_at: now(),
             },
             bytes,
@@ -1374,7 +1427,7 @@ async fn upload_photos(
     }
     let mut tx = state.db.begin().await.map_err(AppError::internal)?;
     for (photo, _) in &prepared {
-        sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(&photo.id).bind(&photo.album_id).bind(&photo.original_name).bind(&photo.storage_key).bind(&photo.format).bind(&photo.content_type).bind(photo.byte_size).bind(photo.created_at).execute(&mut *tx).await.map_err(AppError::internal)?;
+        sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(&photo.id).bind(&photo.album_id).bind(&photo.original_name).bind(&photo.storage_key).bind(&photo.format).bind(&photo.content_type).bind(photo.byte_size).bind(photo.width).bind(photo.height).bind(photo.created_at).execute(&mut *tx).await.map_err(AppError::internal)?;
         sqlx::query("DELETE FROM pending_blobs WHERE key=?")
             .bind(&photo.storage_key)
             .execute(&mut *tx)
@@ -1389,7 +1442,7 @@ async fn photo_file(
     AxumPath(photo_id): AxumPath<String>,
 ) -> ApiResult<Response> {
     let _storage_guard = state.storage.gate.read().await;
-    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,created_at FROM photos WHERE id=?").bind(photo_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "图片不存在".into() })?;
+    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE id=?").bind(photo_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "图片不存在".into() })?;
     let photo = photo_from(&row);
     let data = state
         .storage
@@ -1406,6 +1459,50 @@ async fn photo_file(
             (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
         ],
         data,
+    )
+        .into_response())
+}
+
+async fn photo_thumbnail(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+) -> ApiResult<Response> {
+    let _permit = state
+        .thumbnail_slots
+        .acquire()
+        .await
+        .map_err(|_| AppError::bad("缩略图工作池已关闭"))?;
+    let storage_key: String = sqlx::query_scalar("SELECT storage_key FROM photos WHERE id=?")
+        .bind(photo_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "图片不存在".into(),
+        })?;
+    let data = {
+        let _storage_guard = state.storage.gate.read().await;
+        state
+            .storage
+            .store()
+            .await
+            .map_err(AppError::internal)?
+            .get(&storage_key)
+            .await
+            .map_err(AppError::internal)?
+    };
+    let thumbnail = tokio::task::spawn_blocking(move || encode_thumbnail(&data, 720))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/webp"),
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        thumbnail,
     )
         .into_response())
 }
@@ -1435,7 +1532,7 @@ async fn start_conversion(
         return Err(AppError::bad("至少选择一个相簿"));
     }
     let mut q = QueryBuilder::<Sqlite>::new(
-        "SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,created_at FROM photos WHERE album_id IN (",
+        "SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id IN (",
     );
     {
         let mut separated = q.separated(",");
@@ -1526,7 +1623,9 @@ async fn get_conversion(
     State(state): State<AppState>,
     AxumPath(job_id): AxumPath<String>,
     Query(query): Query<JobQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
+    admin(&headers, &state)?;
     let row = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs WHERE id=?").bind(&job_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "转换任务不存在".into() })?;
     let items = if query.items.unwrap_or(true) {
         sqlx::query("SELECT i.id,i.source_photo_id,COALESCE(p.original_name,'已删除原图') source_name,i.status,i.target_photo_id,i.error FROM conversion_items i LEFT JOIN photos p ON p.id=i.source_photo_id WHERE i.job_id=? ORDER BY source_name").bind(&job_id).fetch_all(&state.db).await.map_err(AppError::internal)?.iter().map(|r| ConversionItem { id:r.get("id"), source_photo_id:r.get::<Option<String>, _>("source_photo_id").unwrap_or_default(), source_name:r.get("source_name"), status:r.get("status"), target_photo_id:r.get("target_photo_id"), error:r.get("error") }).collect::<Vec<_>>()
@@ -1737,7 +1836,7 @@ async fn convert_one(
         .bind(item_id)
         .execute(&state.db)
         .await?;
-    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,created_at FROM photos WHERE id=?").bind(photo_id).fetch_one(&state.db).await?;
+    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE id=?").bind(photo_id).fetch_one(&state.db).await?;
     let source = photo_from(&row);
     let storage = state.storage.store().await?;
     let input = tokio::select! {
@@ -1753,7 +1852,7 @@ async fn convert_one(
             .fetch_one(&state.db)
             .await?;
     let format = target_format.clone();
-    let output = tokio::task::spawn_blocking(move || encode_image(&input, &format))
+    let encoded = tokio::task::spawn_blocking(move || encode_image(&input, &format))
         .await
         .context("image worker panicked")??;
     if token.is_cancelled() {
@@ -1765,10 +1864,15 @@ async fn convert_one(
         source.album_id
     );
     let content_type = mime_for(&target_format).to_string();
+    let digest = Sha256::digest(&encoded.data);
+    let digest_prefix = hex_digest(&digest)[..8].to_string();
+    let byte_size = encoded.data.len() as i64;
+    let width = encoded.width;
+    let height = encoded.height;
     register_pending_blob(&state.db, &key).await?;
     // Atomic object mutations are allowed to reach their bounded deadline; dropping MOVE/CopyObject midway would make the commit state unknowable.
     storage
-        .put_atomic(&key, &content_type, output.clone())
+        .put_atomic(&key, &content_type, encoded.data)
         .await?;
     if token.is_cancelled() {
         let cleanup_error = cleanup_pending_blob(&storage, &state.db, &key)
@@ -1786,19 +1890,20 @@ async fn convert_one(
         .await;
     }
     let name = renamed(&source.original_name, &target_format);
-    let digest = Sha256::digest(&output);
     let photo = Photo {
         id: new_id,
         album_id: source.album_id,
-        original_name: format!("{name} [{}]", &hex_digest(&digest)[..8]),
+        original_name: format!("{name} [{digest_prefix}]"),
         storage_key: key,
         format: target_format,
         content_type,
-        byte_size: output.len() as i64,
+        byte_size,
+        width,
+        height,
         created_at: now(),
     };
     let mut tx = state.db.begin().await?;
-    sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(&photo.id).bind(&photo.album_id).bind(&photo.original_name).bind(&photo.storage_key).bind(&photo.format).bind(&photo.content_type).bind(photo.byte_size).bind(photo.created_at).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(&photo.id).bind(&photo.album_id).bind(&photo.original_name).bind(&photo.storage_key).bind(&photo.format).bind(&photo.content_type).bind(photo.byte_size).bind(photo.width).bind(photo.height).bind(photo.created_at).execute(&mut *tx).await?;
     sqlx::query("UPDATE conversion_items SET status='succeeded',target_photo_id=? WHERE id=?")
         .bind(&photo.id)
         .bind(item_id)
@@ -1811,8 +1916,16 @@ async fn convert_one(
     tx.commit().await?;
     refresh_job_counts(&state.db, job_id).await
 }
-fn encode_image(input: &[u8], target: &str) -> Result<Vec<u8>> {
+struct EncodedImage {
+    data: Vec<u8>,
+    width: i64,
+    height: i64,
+}
+
+fn encode_image(input: &[u8], target: &str) -> Result<EncodedImage> {
     let image = image::load_from_memory(input)?;
+    let width = image.width() as i64;
+    let height = image.height() as i64;
     let mut output = Cursor::new(Vec::new());
     image.write_to(
         &mut output,
@@ -1823,6 +1936,34 @@ fn encode_image(input: &[u8], target: &str) -> Result<Vec<u8>> {
             _ => bail!("invalid target format"),
         },
     )?;
+    Ok(EncodedImage {
+        data: output.into_inner(),
+        width,
+        height,
+    })
+}
+
+fn encode_thumbnail(input: &[u8], longest_edge: u32) -> Result<Vec<u8>> {
+    if longest_edge == 0 {
+        bail!("thumbnail edge must be positive");
+    }
+    let image = image::load_from_memory(input)?;
+    let width = image.width();
+    let height = image.height();
+    let longest = width.max(height);
+    let thumbnail = if longest > longest_edge {
+        let target_width = ((width as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
+        let target_height = ((height as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
+        image.resize_exact(
+            target_width,
+            target_height,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+    let mut output = Cursor::new(Vec::new());
+    thumbnail.write_to(&mut output, ImageFormat::WebP)?;
     Ok(output.into_inner())
 }
 fn normalize_format(value: &str) -> Option<String> {
@@ -1859,7 +2000,23 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    let photo_columns: HashSet<String> = sqlx::query("PRAGMA table_info(photos)")
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| row.get("name"))
+        .collect();
+    if !photo_columns.contains("width") {
+        sqlx::query("ALTER TABLE photos ADD COLUMN width INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
+    if !photo_columns.contains("height") {
+        sqlx::query("ALTER TABLE photos ADD COLUMN height INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
     for (key, value) in [
         ("storage_backend", "local"),
         ("storage_local_path", "./data/storage"),
@@ -1905,7 +2062,7 @@ async fn main() -> Result<()> {
         .init();
     let config = Config::from_env()?;
     if config.admin_token == "change-me" || config.admin_token.contains("change-this") {
-        warn!("using an insecure default CF_ADMIN_TOKEN; set a strong value before deployment");
+        bail!("CF_ADMIN_TOKEN must be set to a strong non-default value before startup");
     }
     if let Some(parent) = Path::new(
         &config
@@ -1977,6 +2134,7 @@ async fn main() -> Result<()> {
         jobs: Arc::new(DashMap::new()),
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
     let api = Router::new()
@@ -1986,11 +2144,14 @@ async fn main() -> Result<()> {
         )
         .route("/api/settings/storage/test", post(test_storage_settings))
         .route("/api/albums", get(list_albums).post(create_album))
+        .route("/api/albums/{album_id}", get(album_detail))
         .route(
             "/api/albums/{album_id}/photos",
             get(album_photos).post(upload_photos),
         )
+        .route("/api/photos", get(list_photos))
         .route("/api/photos/{photo_id}/file", get(photo_file))
+        .route("/api/photos/{photo_id}/thumbnail", get(photo_thumbnail))
         .route(
             "/api/conversions",
             get(list_conversions).post(start_conversion),
@@ -2001,10 +2162,14 @@ async fn main() -> Result<()> {
             "/api/conversions/{job_id}/delete-sources",
             delete(confirm_delete_sources),
         )
+        .route("/api", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
         .layer(DefaultBodyLimit::max(400 * 1024 * 1024));
-    let index = PathBuf::from(&config.web_dir).join("index.html");
+    let web_dir = PathBuf::from(&config.web_dir);
+    let index = web_dir.join("index.html");
     let app = Router::new()
         .merge(api)
+        .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")))
         .fallback_service(ServeDir::new(&config.web_dir).not_found_service(ServeFile::new(index)))
         .layer(CorsLayer::very_permissive())
         .layer(TraceLayer::new_for_http())
@@ -2014,4 +2179,72 @@ async fn main() -> Result<()> {
     info!("ChronoFrame listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(width, height);
+        let mut output = Cursor::new(Vec::new());
+        image.write_to(&mut output, ImageFormat::Png).unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn thumbnail_is_webp_and_limits_the_longest_edge() {
+        let thumbnail = encode_thumbnail(&png_fixture(1600, 800), 720).unwrap();
+        assert_eq!(image::guess_format(&thumbnail).unwrap(), ImageFormat::WebP);
+        let decoded = image::load_from_memory(&thumbnail).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (720, 360));
+    }
+
+    #[test]
+    fn thumbnail_does_not_enlarge_small_images() {
+        let thumbnail = encode_thumbnail(&png_fixture(120, 80), 720).unwrap();
+        let decoded = image::load_from_memory(&thumbnail).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (120, 80));
+    }
+
+    #[test]
+    fn converted_image_reports_its_actual_dimensions() {
+        let converted = encode_image(&png_fixture(321, 123), "jpg").unwrap();
+        assert_eq!((converted.width, converted.height), (321, 123));
+        let decoded = image::load_from_memory(&converted.data).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (321, 123));
+    }
+
+    #[tokio::test]
+    async fn setup_database_adds_missing_photo_dimensions_without_losing_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,created_at INTEGER NOT NULL); INSERT INTO albums(id,name,created_at) VALUES('album','Album',1); INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,created_at) VALUES('photo','album','old.png','old.png','png','image/png',10,1);")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        setup_database(&pool).await.unwrap();
+
+        let row = sqlx::query("SELECT width,height,original_name FROM photos WHERE id='photo'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("width"), 0);
+        assert_eq!(row.get::<i64, _>("height"), 0);
+        assert_eq!(row.get::<String, _>("original_name"), "old.png");
+
+        setup_database(&pool).await.unwrap();
+        let dimensions = sqlx::query("PRAGMA table_info(photos)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|column| matches!(column.get::<String, _>("name").as_str(), "width" | "height"))
+            .count();
+        assert_eq!(dimensions, 2);
+    }
 }

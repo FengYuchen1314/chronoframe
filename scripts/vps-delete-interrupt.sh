@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://127.0.0.1:8188"
-TOKEN="e2e-admin-token-change-before-real-use"
-ROOT="/opt/chronoframe-e2e/app"
-SOURCE="/tmp/e2e-large-fixture.png"
+BASE="${BASE:-http://127.0.0.1:8188}"
+TOKEN="${TOKEN:-e2e-admin-token-change-before-real-use}"
+ROOT="${ROOT:-/opt/chronoframe-e2e/app}"
+SOURCE="${SOURCE:-/tmp/e2e-large-fixture.png}"
+PROJECT_NAME="${PROJECT_NAME:-app}"
+DATA_VOLUME="${PROJECT_NAME}_chronoframe-data"
 HDR=(-H "X-Admin-Token: $TOKEN")
-COMPOSE=(docker compose --project-name app -f "$ROOT/docker-compose.e2e.yml")
+COMPOSE=(docker compose --project-name "$PROJECT_NAME" -f "$ROOT/docker-compose.e2e.yml")
+if [[ -n "${COMPOSE_OVERRIDE:-}" ]]; then COMPOSE+=(-f "$COMPOSE_OVERRIDE"); fi
 
 api() { curl -fsS --connect-timeout 5 --max-time 300 "${HDR[@]}" "$@"; }
 json_value() { python3 -c "import json,sys; value=json.load(sys.stdin)$1; print(value)"; }
@@ -60,14 +63,15 @@ while IFS= read -r source_id; do
   [[ "$code" = 404 ]] || { echo "source $source_id returned HTTP $code" >&2; exit 1; }
 done </tmp/e2e-delete-source-ids
 
-database_path="$(docker volume inspect -f '{{.Mountpoint}}' app_chronoframe-data)/chronoframe.db"
+database_path="$(docker volume inspect -f '{{.Mountpoint}}' "$DATA_VOLUME")/chronoframe.db"
 python3 - "$database_path" <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1]) as db:
     assert db.execute('select count(*) from source_deletion_outbox').fetchone()[0] == 0
     assert db.execute('select count(*) from pending_blobs').fetchone()[0] == 0
 PY
-found=$(docker exec app-chronoframe-1 find /app/data -type f -name '*.cf-pending' -print)
+chronoframe_container=$("${COMPOSE[@]}" ps -q chronoframe)
+found=$(docker exec "$chronoframe_container" find /app/data -type f -name '*.cf-pending' -print)
 [[ -z "$found" ]] || { echo "temporary files remain: $found" >&2; exit 1; }
 "${COMPOSE[@]}" logs --tail=300 chronoframe 2>&1 | grep -q 'replayed source deletion outbox'
 echo "PASS source-deletion outbox replay after SIGKILL"

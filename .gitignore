@@ -1,10 +1,14 @@
 /target
-/frontend/node_modules
-/frontend/dist
-/frontend/*.tsbuildinfo
+/node_modules
+/frontend/
+/.nuxt
+/.output
+/.pnpm-store
+*.tsbuildinfo
 /data
 .agents
 __pycache__/
 *.py[cod]
 .env
+pnpm-debug.log*
 *.zip

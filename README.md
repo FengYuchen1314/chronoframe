@@ -1,31 +1,29 @@
 # ChronoFrame
 
-面向自托管的相簿优先画廊。项目已从原 Nuxt/Node 实现迁移为：
+面向自托管的个人画廊。项目恢复原作者的 Nuxt 视觉框架，并将服务端重构为：
 
-- `frontend/`：React + TypeScript + Vite 单页界面
+- 根目录 `app/`、`i18n/`、`shared/`、`public/`：Nuxt 4 + Vue 3 + TypeScript 静态前端
 - `backend/`：Rust + Axum + SQLite API
 - 存储：本地磁盘、WebDAV 或 S3 兼容对象存储
 
-地图、地理编码、EXIF 地图探索和“所有图片”入口均不再存在。根页面默认且只以相簿空间作为浏览入口：先创建相簿，之后才能上传图片。
+公共端恢复原版的相簿动效主页、照片瀑布流、标签/相机/镜头/城市/评分筛选、排序、相簿详情和沉浸式查看器；地图、Globe 和地图管理功能不再存在。默认 `/` 直接展示相簿空间，全图瀑布流位于 `/photos`。上传严格遵循相簿优先的数据规则：管理员必须先创建相簿，之后才能向其中上传图片。
 
-## 本地开发
+## VPS 构建与部署
 
-```powershell
-Copy-Item .env.example .env
-# 编辑 .env，将 CF_ADMIN_TOKEN 改为高强度值
-cd frontend; npm install; npm run dev
-# 新开终端，但保持在项目根目录
-cargo run --manifest-path backend/Cargo.toml
+本仓库只在本地编辑源码；依赖安装、Nuxt/Rust 编译、自动化测试和 Docker 构建都应放在 VPS 的隔离工作目录中执行。先复制 `.env.example` 并将 `CF_ADMIN_TOKEN` 换成高强度随机值，再在 VPS 上运行：
+
+```bash
+corepack enable
+corepack prepare pnpm@10.34.1 --activate
+pnpm install --frozen-lockfile
+pnpm build
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+docker compose up -d --build
 ```
 
-开发前端位于 `http://localhost:5173`，并代理 API 到 Rust 服务的 `http://localhost:8080`。生产构建：
-
-```powershell
-cd frontend; npm run build
-cd ..; cargo run --release --manifest-path backend/Cargo.toml
-```
-
-也可运行 `docker compose up --build`。容器服务监听 `8080`。
+`pnpm build` 运行 `nuxt generate`，产物位于 `.output/public`。Docker 的前端阶段同样通过 Corepack 固定使用 pnpm 10.34.1，最终由 Rust 容器从 `/app/web` 同源提供页面和 API；容器内服务监听 `8080`。对公网开放时应使用高强度管理员令牌，并通过防火墙或反向代理只暴露预期的 HTTP/HTTPS 端口。
 
 ## 存储后端
 
@@ -52,15 +50,17 @@ WebDAV 密码和 S3 秘密访问密钥使用从管理员令牌派生的 AES-256-
 - 转换成功会把新图加入原相簿，旧图默认保留。管理员确认删除后，系统先在同一个数据库事务中写入全部删除授权，再通过持久化 outbox 幂等执行；即使删除途中被强制终止，重启后也会继续完成已确认的删除，而不会误删未确认原图。
 - 页面任务中心会在刷新或重新打开后恢复最近 100 个任务及其进度/错误详情；完成前可随时安全中断。
 
-所有写操作都要求 `X-Admin-Token`，React 界面仅将它保存于当前浏览器会话中。
+所有写操作都要求 `X-Admin-Token`，Nuxt 界面仅将它保存于当前浏览器会话中。
 
 ## API 摘要
 
 - `GET/PUT /api/settings/storage` — 管理员读取或保存存储后端设置
 - `POST /api/settings/storage/test` — 在不保存的情况下测试候选存储
 - `GET/POST /api/albums`
+- `GET /api/albums/:album_id` — 相簿详情及其中的图片
 - `GET/POST /api/albums/:album_id/photos`
-- `GET /api/photos/:photo_id/file`
+- `GET /api/photos` — 按创建时间倒序列出图片
+- `GET /api/photos/:photo_id/file`、`GET /api/photos/:photo_id/thumbnail`
 - `GET/POST /api/conversions` — 列出任务，或提交 `{ "albumIds": [], "targetFormat": "png|jpg|jpeg|webp" }`
 - `GET /api/conversions/:job_id`
 - `POST /api/conversions/:job_id/cancel`

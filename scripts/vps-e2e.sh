@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://127.0.0.1:8188"
-TOKEN="e2e-admin-token-change-before-real-use"
-ROOT="/opt/chronoframe-e2e/app"
-SOURCE="$ROOT/public/favicon-96x96.png"
-LARGE_SOURCE="/tmp/e2e-large-fixture.png"
+BASE="${BASE:-http://127.0.0.1:8188}"
+TOKEN="${TOKEN:-e2e-admin-token-change-before-real-use}"
+ROOT="${ROOT:-/opt/chronoframe-e2e/app}"
+SOURCE="${SOURCE:-$ROOT/public/favicon-96x96.png}"
+LARGE_SOURCE="${LARGE_SOURCE:-/tmp/e2e-large-fixture.png}"
+PROJECT_NAME="${PROJECT_NAME:-app}"
+NETWORK_NAME="${PROJECT_NAME}_default"
 HDR=(-H "X-Admin-Token: $TOKEN")
-COMPOSE=(docker compose --project-name app -f "$ROOT/docker-compose.e2e.yml")
+COMPOSE=(docker compose --project-name "$PROJECT_NAME" -f "$ROOT/docker-compose.e2e.yml")
+if [[ -n "${COMPOSE_OVERRIDE:-}" ]]; then COMPOSE+=(-f "$COMPOSE_OVERRIDE"); fi
 LOAD_PID=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -63,7 +66,7 @@ wait_minio_ready() {
 
 ensure_test_bucket() {
   wait_minio_ready
-  docker run --rm --network app_default --entrypoint /bin/sh minio/mc:latest -c \
+  docker run --rm --network "$NETWORK_NAME" --entrypoint /bin/sh minio/mc:latest -c \
     'mc alias set e2e http://minio:9000 e2e-minio-access e2e-minio-secret-change-me >/dev/null && mc mb --ignore-existing e2e/chronoframe-e2e >/dev/null'
 }
 
@@ -258,20 +261,22 @@ assert_secret_hidden() {
 }
 
 assert_no_local_temps() {
-  local found
-  found=$(docker exec app-chronoframe-1 find /app/data -type f \( -name '.upload-*' -o -name '*.tmp-*' -o -name '*.cf-pending' \) -print)
+  local container found
+  container=$("${COMPOSE[@]}" ps -q chronoframe)
+  found=$(docker exec "$container" find /app/data -type f \( -name '.upload-*' -o -name '*.tmp-*' -o -name '*.cf-pending' \) -print)
   [[ -z "$found" ]] || fail "local temporary objects remain: $found"
 }
 
 assert_no_webdav_temps() {
-  local found
-  found=$(docker exec app-webdav-1 find /var/lib/dav -type f \( -name '.upload-*' -o -name '*.tmp-*' -o -name '*.cf-pending' \) -print)
+  local container found
+  container=$("${COMPOSE[@]}" ps -q webdav)
+  found=$(docker exec "$container" find /var/lib/dav -type f \( -name '.upload-*' -o -name '*.tmp-*' -o -name '*.cf-pending' \) -print)
   [[ -z "$found" ]] || fail "WebDAV temporary objects remain: $found"
 }
 
 assert_no_s3_temps() {
   local found
-  found=$(docker run --rm --network app_default --entrypoint /bin/sh minio/mc:latest -c \
+  found=$(docker run --rm --network "$NETWORK_NAME" --entrypoint /bin/sh minio/mc:latest -c \
     'mc alias set e2e http://minio:9000 e2e-minio-access e2e-minio-secret-change-me >/dev/null && { mc find e2e/chronoframe-e2e/e2e --name "*.tmp-*"; mc find e2e/chronoframe-e2e/e2e --name "*.cf-pending"; }')
   [[ -z "$found" ]] || fail "S3 temporary objects remain: $found"
 }
@@ -282,12 +287,12 @@ WEBDAV_BAD_SETTINGS='{"backend":"webdav","localPath":"/app/data/e2e-local","webd
 S3_SETTINGS='{"backend":"s3","localPath":"/app/data/e2e-local","webdavUrl":"","webdavUsername":"","webdavPrefix":"chronoframe","s3Endpoint":"http://minio:9000","s3Region":"us-east-1","s3Bucket":"chronoframe-e2e","s3AccessKey":"e2e-minio-access","s3SecretKey":"e2e-minio-secret-change-me","s3Prefix":"e2e"}'
 S3_BAD_SETTINGS='{"backend":"s3","localPath":"/app/data/e2e-local","webdavUrl":"","webdavUsername":"","webdavPrefix":"chronoframe","s3Endpoint":"http://minio:9000","s3Region":"us-east-1","s3Bucket":"chronoframe-e2e","s3AccessKey":"e2e-minio-access","s3SecretKey":"definitely-wrong","s3Prefix":"e2e"}'
 
-# Start from clean, project-scoped Docker volumes and prove the static React app plus auth boundary.
+# Start from clean, project-scoped Docker volumes and prove the static Nuxt app plus auth boundary.
 reset_stack
-curl -fsS --connect-timeout 5 --max-time 30 "$BASE/" | grep -q 'id="root"'
+curl -fsS --connect-timeout 5 --max-time 30 "$BASE/" | grep -q 'id="__nuxt"'
 unauthorized=$(curl -sS --connect-timeout 5 --max-time 30 -o /tmp/e2e-unauthorized.json -w '%{http_code}' -H 'Content-Type: application/json' -d '{"name":"forbidden"}' "$BASE/api/albums")
 [[ "$unauthorized" = 401 ]] || fail "unauthenticated mutation returned HTTP $unauthorized"
-echo "PASS React entrypoint and mutation authentication"
+echo "PASS Nuxt entrypoint and mutation authentication"
 
 # Local storage and the JPEG alias.
 settings "$LOCAL_SETTINGS" >/dev/null
@@ -351,7 +356,8 @@ assert_delete_sources "$webdav_job" 1
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/photos/$webdav_source/file")" = 404 ]]
 curl -fsS "$BASE/api/photos/$webdav_target/file" -o /tmp/e2e-webdav-target.webp
 assert_signature /tmp/e2e-webdav-target.webp webp
-webdav_orphan=$(docker exec app-webdav-1 find /var/lib/dav -type f -name "$webdav_source.png" -print)
+webdav_container=$("${COMPOSE[@]}" ps -q webdav)
+webdav_orphan=$(docker exec "$webdav_container" find /var/lib/dav -type f -name "$webdav_source.png" -print)
 [[ -z "$webdav_orphan" ]] || fail "deleted WebDAV source object remains"
 assert_no_webdav_temps
 echo "PASS WebDAV credential rejection/recovery, encrypted settings, output retrieval and source deletion"
@@ -381,7 +387,7 @@ assert_delete_sources "$s3_job" 1
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/photos/$s3_source/file")" = 404 ]]
 curl -fsS "$BASE/api/photos/$s3_target/file" -o /tmp/e2e-s3-target.jpg
 assert_signature /tmp/e2e-s3-target.jpg jpg
-s3_objects=$(docker run --rm --network app_default --entrypoint /bin/sh minio/mc:latest -c \
+s3_objects=$(docker run --rm --network "$NETWORK_NAME" --entrypoint /bin/sh minio/mc:latest -c \
   'mc alias set e2e http://minio:9000 e2e-minio-access e2e-minio-secret-change-me >/dev/null && mc find e2e/chronoframe-e2e/e2e')
 if printf '%s\n' "$s3_objects" | grep -Fq "$s3_source_key"; then fail "deleted S3 source object remains"; fi
 assert_no_s3_temps
@@ -433,8 +439,8 @@ cancel_job=$(start_job "$stress_album" webp)
 parallel_job=$(start_job "$stress_album" jpg)
 wait_for_running "$cancel_job" 30
 wait_for_running "$parallel_job" 30
-python3 "$ROOT/scripts/vps-load.py" --requests 1600 --concurrency 32 --timeout 30 --max-p95-ms 5000 \
-  --album-id "$read_album" --photo-id "$read_photo" --job-id "$cancel_job" >/tmp/e2e-mixed-load.json &
+python3 "$ROOT/scripts/vps-load.py" --base "$BASE" --requests 1600 --concurrency 32 --timeout 30 --max-p95-ms 5000 \
+  --album-id "$read_album" --photo-id "$read_photo" --job-id "$cancel_job" --admin-token "$TOKEN" >/tmp/e2e-mixed-load.json &
 LOAD_PID=$!
 write_album=$(make_album "E2E write during conversion")
 upload "$write_album" "concurrent-write.png" >/dev/null
