@@ -8,7 +8,7 @@ services:
       CF_COOKIE_SECURE: "auto"
       CF_TRUST_PROXY_HEADERS: "true"
     ports:
-      - "127.0.0.1:8188:8080"
+      - "127.0.0.1:${CF_E2E_PORT:-8188}:8080"
     volumes:
       - chronoframe-data:/app/data
     depends_on:
