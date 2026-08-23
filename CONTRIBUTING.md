@@ -4,9 +4,9 @@ ChronoFrame 由 Nuxt 4 + Vue 3 + TypeScript 前端和 Rust 后端组成。前端
 
 ## 开发约定
 
-源码可以在本地编辑，但本项目的编译和测试统一在隔离的 VPS 环境执行。不要在本地工作区运行 `pnpm build`、`cargo test` 或 Docker 构建。
+源码可以在本地编辑；提交到 `main` 后，由 GitHub Actions 在 amd64/arm64 runner 上完成正式容器编译和发布。不要在本地工作区运行 `pnpm build`、`cargo test` 或 Docker 构建。
 
-VPS 上的前端依赖和构建命令：
+需要排查编译问题时，前端检查命令为：
 
 ```bash
 corepack enable
@@ -15,7 +15,7 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-VPS 上的 Rust 检查命令：
+Rust 检查命令为：
 
 ```bash
 cargo fmt --check
@@ -23,14 +23,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-涉及存储、上传、转换或中断语义的修改，还要在 VPS 的隔离 Compose 项目中运行：
+Actions 镜像发布后，涉及存储、上传、转换或中断语义的修改还要在 VPS 的隔离 Compose 项目中运行：
 
 ```bash
 bash scripts/vps-e2e.sh
 bash scripts/vps-delete-interrupt.sh
 ```
 
-验收脚本会创建并清理自己的 Docker Compose 测试数据。不要把真实凭据、个人照片或生产数据库放进测试目录。
+通过 `CHRONOFRAME_IMAGE=ghcr.io/fengyuchen1314/chronoframe:sha-<commit>` 指定不可变镜像。验收脚本会创建并清理自己的 Docker Compose 测试数据；必须使用独立的 `PROJECT_NAME` 和端口，不要把真实凭据、个人照片或生产数据库放进测试目录。
 
 ## 产品约束
 
