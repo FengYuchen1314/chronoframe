@@ -1,9 +1,13 @@
 .git
+.env
 target
 data
-frontend/node_modules
-frontend/dist
-public
+node_modules
+**/node_modules
+.nuxt
+.output
+.pnpm-store
+frontend
 scripts
 .agents
 .github

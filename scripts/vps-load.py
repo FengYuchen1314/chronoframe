@@ -8,7 +8,8 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import quantiles
 from time import perf_counter
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 
 def read_json(url: str, timeout: float):
@@ -43,6 +44,7 @@ def main() -> None:
     parser.add_argument("--album-id")
     parser.add_argument("--photo-id")
     parser.add_argument("--job-id")
+    parser.add_argument("--admin-token")
     parser.add_argument("--max-failures", type=int, default=0)
     parser.add_argument("--max-p95-ms", type=float, default=1500)
     args = parser.parse_args()
@@ -78,10 +80,19 @@ def main() -> None:
     def fetch(entry: tuple[str, str]) -> float:
         kind, url = entry
         started = perf_counter()
-        with urlopen(url, timeout=args.timeout) as response:
-            if response.status != 200:
-                raise AssertionError(f"{url}: HTTP {response.status}")
-            data = response.read()
+        headers = (
+            {"X-Admin-Token": args.admin_token}
+            if kind == "job" and args.admin_token
+            else {}
+        )
+        try:
+            with urlopen(Request(url, headers=headers), timeout=args.timeout) as response:
+                if response.status != 200:
+                    raise AssertionError(f"{kind} {url}: HTTP {response.status}")
+                data = response.read()
+        except HTTPError as error:
+            body = error.read(512).decode("utf-8", errors="replace")
+            raise AssertionError(f"{kind} {url}: HTTP {error.code}: {body}") from error
         if kind == "file":
             if not image_signature(data):
                 raise AssertionError(f"{url}: invalid image signature")
