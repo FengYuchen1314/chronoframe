@@ -20,12 +20,22 @@ COPY backend backend
 RUN touch backend/src/main.rs && cargo build --release -p chronoframe-api
 
 FROM debian:bookworm-slim
-RUN useradd --system --create-home chronoframe
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 chronoframe \
+    && useradd --uid 10001 --gid chronoframe --create-home --shell /usr/sbin/nologin chronoframe
 WORKDIR /app
 COPY --from=api-builder /src/target/release/chronoframe-api /usr/local/bin/chronoframe-api
 COPY --from=web-builder /src/.output/public /app/web
-RUN mkdir -p /app/data/storage && chown -R chronoframe:chronoframe /app
-USER chronoframe
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /app/data/storage \
+    && chown -R chronoframe:chronoframe /app
 ENV CF_WEB_DIR=/app/web CF_DATABASE_URL=sqlite:///app/data/chronoframe.db?mode=rwc
+LABEL org.opencontainers.image.source="https://github.com/FengYuchen1314/chronoframe" \
+      org.opencontainers.image.description="Album-first self-hosted gallery with a Rust backend" \
+      org.opencontainers.image.licenses="MIT"
 EXPOSE 8080
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["chronoframe-api"]

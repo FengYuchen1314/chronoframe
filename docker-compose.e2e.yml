@@ -1,6 +1,7 @@
 services:
   chronoframe:
-    build: .
+    image: ${CHRONOFRAME_IMAGE:-ghcr.io/fengyuchen1314/chronoframe:latest}
+    pull_policy: always
     environment:
       CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
       CF_WEB_DIR: /app/web

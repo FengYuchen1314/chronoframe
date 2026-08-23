@@ -320,7 +320,7 @@ onBeforeUnmount(clearSensitiveInputs)
             <section v-if="form.backend === 'local'" class="space-y-4">
               <div>
                 <h3 class="font-semibold">本地存储</h3>
-                <p class="mt-1 text-sm text-muted">路径由 Rust 服务进程读写，在 Docker 中应指向已挂载的持久化目录。</p>
+                <p class="mt-1 text-sm text-muted">路径由 Rust 服务进程读写；单文件 Docker 部署请保持 ./data/storage，确保图片位于可打包的持久化目录。</p>
               </div>
               <UFormField label="本地存储路径" required>
                 <UInput
