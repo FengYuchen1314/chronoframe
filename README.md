@@ -18,6 +18,32 @@ curl -fsSLO https://raw.githubusercontent.com/FengYuchen1314/chronoframe/main/do
 docker compose up -d
 ```
 
+也可以手动新建 `docker-compose.yml`，复制下面的完整内容：
+
+```yaml
+name: chronoframe
+
+services:
+  chronoframe:
+    image: ghcr.io/fengyuchen1314/chronoframe:latest
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    ports:
+      - "${CHRONOFRAME_BIND:-0.0.0.0}:${CHRONOFRAME_PORT:-8188}:8080"
+    environment:
+      CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
+      CF_MASTER_KEY_FILE: /app/data/secret.key
+      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-4}"
+      CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-false}"
+      CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-false}"
+    volumes:
+      - ./data:/app/data
+```
+
+把文件保存到准备存放相簿数据的目录，在该目录执行 `docker compose up -d`。
+
 默认通过 `0.0.0.0:8188` 提供服务。数据库、主密钥和本地图片会自动写入 Compose 同目录的 `./data`；镜像升级或容器重建不会删除它们。更新只需：
 
 ```bash
