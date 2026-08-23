@@ -1,349 +1,52 @@
-# Contributing Guide
+# Contributing
 
-> This file **will not** be regularly updated to reflect minor changes. For the latest and most accurate information, please refer to the [official documentation](https://chronoframe.bh8.ga/guide/contributing.html).
+ChronoFrame 现在由 React + TypeScript 前端和 Rust 后端组成。提交修改前请安装 Node.js 20+、Rust 1.85+，可选安装 Docker。
 
-## Environment Requirements
+## 开发
 
-### Required Software
+```powershell
+Copy-Item .env.example .env
+cd frontend
+npm install
+npm run dev
+```
 
-- **Node.js**: 20.0+
-- **pnpm**: 9.0+ (preferred package manager)
-- **Git**: Latest version
-- **Docker**: Optional, for containerized development
+另开一个终端，在仓库根目录运行：
 
-## Clone and Install
+```powershell
+cargo run --manifest-path backend/Cargo.toml
+```
 
-### 1. Clone Repository
+Vite 开发服务监听 `http://localhost:5173` 并代理到 Rust API 的 `http://localhost:8080`。
+
+存储参数不得加入环境变量或源码。请用管理员令牌进入页面，在“存储设置”中配置本地磁盘、WebDAV 或 S3，并通过连接测试后保存。环境变量只用于管理员令牌、SQLite 地址、worker 数量、静态文件目录和监听地址。
+
+## 提交前检查
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cd frontend
+npm run build
+```
+
+涉及存储、上传、转换或中断语义的修改，还应在隔离环境运行：
 
 ```bash
-# Using HTTPS
-git clone https://github.com/HoshinoSuzumi/chronoframe.git
-
-# Or using SSH
-git clone git@github.com:HoshinoSuzumi/chronoframe.git
-
-# Enter project directory
-cd chronoframe
-
-# Set upstream remote repository
-git remote add upstream https://github.com/HoshinoSuzumi/chronoframe.git
+bash scripts/vps-e2e.sh
+bash scripts/vps-delete-interrupt.sh
 ```
 
-### 2. Install Dependencies
+验收脚本会创建并清理自己的 Docker Compose 测试数据。不要把真实凭据、个人照片或生产数据库放进测试目录。
 
-```bash
-# Install pnpm (if not already installed)
-npm install -g pnpm
+## 约束
 
-# Install project dependencies
-pnpm install
-```
+- 上传入口必须属于已存在的相簿，首页保持相簿优先。
+- 只接受 PNG、JPG/JPEG、WEBP；扩展名、文件签名和完整解码都必须一致。
+- 写入必须先进入临时对象，再原子提交；任何新增崩溃窗口都要进入持久化恢复账本。
+- 格式转换必须使用受限 worker，不能阻塞上传、读取或 HTTP 运行时。
+- 转换完成后默认保留原图；只有管理员明确确认后才可进入持久化删除 outbox。
+- 存储密钥不得由读取 API 返回明文，也不得写入日志。
 
-### 3. Configure Environment Variables
-
-```bash
-# Copy environment variable template
-cp .env.example .env
-
-# Edit environment variables
-nano .env  # Or use your preferred editor
-```
-
-#### Minimal Development Configuration
-
-```bash
-# === Admin Account ===
-CFRAME_ADMIN_EMAIL=dev@example.com
-CFRAME_ADMIN_NAME=Developer
-CFRAME_ADMIN_PASSWORD=dev123456
-
-# === Authentication Settings ===
-NUXT_OAUTH_GITHUB_CLIENT_ID=your-dev-github-client-id
-NUXT_OAUTH_GITHUB_CLIENT_SECRET=your-dev-github-client-secret
-NUXT_SESSION_PASSWORD=your-32-character-development-key
-
-# === Storage Settings (can use MinIO for development) ===
-NUXT_STORAGE_PROVIDER=s3
-NUXT_PROVIDER_S3_ENDPOINT=http://localhost:9000
-NUXT_PROVIDER_S3_BUCKET=chronoframe-dev
-NUXT_PROVIDER_S3_REGION=us-east-1
-NUXT_PROVIDER_S3_ACCESS_KEY_ID=minioadmin
-NUXT_PROVIDER_S3_SECRET_ACCESS_KEY=minioadmin
-
-# === Map Services (optional) ===
-NUXT_PUBLIC_MAPBOX_ACCESS_TOKEN=pk.your-development-token
-NUXT_MAPBOX_ACCESS_TOKEN=sk.your-development-token
-```
-
-## Project Architecture
-
-### Directory Structure
-
-```
-chronoframe/
-├── app/                    # Nuxt 4 application directory
-│   ├── components/         # Vue components
-│   │   ├── ui/            # Common UI components
-│   │   ├── photo/         # Photo-related components
-│   │   ├── masonry/       # Masonry layout components
-│   │   └── ...
-│   ├── pages/             # Route pages
-│   ├── composables/       # Vue composables
-│   ├── stores/            # Pinia state management
-│   ├── layouts/           # Layout templates
-│   ├── plugins/           # Nuxt plugins
-│   └── utils/             # Utility functions
-├── packages/
-│   └── webgl-image/       # WebGL image viewer package
-│       ├── src/
-│       │   ├── core/      # Core engine
-│       │   ├── components/ # Vue components
-│       │   └── types/     # Type definitions
-│       └── package.json
-├── server/                # Nitro server-side
-│   ├── api/              # API routes
-│   │   ├── photos/       # Photo management API
-│   │   ├── auth/         # Authentication API
-│   │   └── system/       # System API
-│   ├── database/         # Database related
-│   │   ├── schema.ts     # Database schema
-│   │   └── migrations/   # Migration files
-│   ├── services/         # Business logic services
-│   │   ├── storage/      # Storage services
-│   │   ├── image/        # Image processing
-│   │   ├── location/     # Geolocation
-│   │   └── pipeline-queue/ # Processing queue
-│   ├── tasks/            # Background tasks
-│   └── utils/            # Server-side utilities
-├── shared/               # Shared code between frontend and backend
-│   ├── types/           # TypeScript type definitions
-│   └── utils/           # Shared utilities
-├── docs/                # Project documentation
-├── scripts/             # Build and deployment scripts
-└── Configuration files...
-```
-
-### Technology Stack
-
-#### Frontend Technologies
-
-- **Nuxt 4**: Vue.js full-stack framework
-- **TypeScript**: Type-safe JavaScript
-- **TailwindCSS**: Utility-first CSS framework
-
-#### Backend Technologies
-
-- **Nitro**: Server-side framework
-- **SQLite**: Lightweight database
-- **Drizzle ORM**: Type-safe ORM
-- **Sharp**: High-performance image processing
-- **ExifTool**: EXIF data extraction
-
-## Development Workflow
-
-### Start Development Server
-
-```bash
-# Start complete development server
-pnpm dev
-
-# Or start step by step
-pnpm build:deps           # Build WebGL package
-pnpm dlx nuxi@latest dev  # Start Nuxt development server only
-```
-
-### Database Operations
-
-```bash
-# Generate migration files
-pnpm db:generate
-
-# Execute database migrations
-pnpm db:migrate
-```
-
-### Build Project
-
-```bash
-# Build WebGL dependency package
-pnpm build:deps
-
-# Build complete project
-pnpm build
-
-# Preview production build
-pnpm preview
-```
-
-## Testing Environment
-
-### Local MinIO Storage
-
-Run local MinIO service using Docker:
-
-```bash
-# Start MinIO
-docker run -d \
-  --name minio \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  -e "MINIO_ROOT_USER=minioadmin" \
-  -e "MINIO_ROOT_PASSWORD=minioadmin" \
-  minio/minio server /data --console-address ":9001"
-```
-
-Access MinIO console: http://localhost:9001
-
-### GitHub OAuth App
-
-1. Visit GitHub Settings > Developer settings > OAuth Apps
-2. Create new OAuth app
-3. Set callback URL: `http://localhost:3000/api/auth/github`
-4. Copy Client ID and Client Secret to `.env` file
-
-### Mapbox Development Tokens
-
-1. Register [Mapbox account](https://account.mapbox.com/)
-2. Create development access tokens
-3. Set URL restriction: `http://localhost:3000`
-4. Add tokens to `.env` file
-
-## Code Standards
-
-### TypeScript Standards
-
-```typescript
-// ✅ Good practice
-interface PhotoMetadata {
-  id: string
-  title?: string
-  width: number
-  height: number
-  createdAt: Date
-}
-
-// ❌ Avoid using any
-const processPhoto = (photo: any) => { ... }
-
-// ✅ Use specific types
-const processPhoto = (photo: PhotoMetadata) => { ... }
-```
-
-### Vue Component Standards
-
-```vue
-<!-- ✅ Recommended component structure -->
-<script setup lang="ts">
-// Imports
-import { ref, computed } from 'vue'
-import type { Photo } from '~/types'
-
-// Props and Emits
-interface Props {
-  photos: Photo[]
-  loading?: boolean
-}
-
-interface Emits {
-  select: [photo: Photo]
-  delete: [photoId: string]
-}
-
-const props = withDefaults(defineProps<Props>(), {
-  loading: false,
-})
-
-const emit = defineEmits<Emits>()
-
-// Reactive data
-const selectedPhoto = ref<Photo | null>(null)
-
-// Computed properties
-const photoCount = computed(() => props.photos.length)
-
-// Methods
-const handlePhotoClick = (photo: Photo) => {
-  selectedPhoto.value = photo
-  emit('select', photo)
-}
-</script>
-
-<template>
-  <div class="photo-grid">
-    <!-- Template content -->
-  </div>
-</template>
-
-<style scoped>
-/* Component styles */
-</style>
-```
-
-### Database Calls
-
-When using database operations in `server`, use `useDB()` to get the Drizzle instance. This composable is globally auto-imported on the server side:
-
-```typescript
-const db = useDB()
-
-const photos = await db.select().from(photosTable)
-```
-
-### Commit Message Standards
-
-Use [Conventional Commits](https://www.conventionalcommits.org/) standard:
-
-```
-feat: add photo batch delete functionality
-fix: fix WebGL viewer compatibility issue in Safari
-docs: update deployment documentation
-style: unify code formatting
-refactor: refactor storage service interface
-test: add unit tests for photo upload
-chore: update dependency versions
-```
-
-## Contribution Guidelines
-
-### Development Process
-
-1. **Fork Project**: Fork the project on GitHub
-2. **Create Branch**: `git checkout -b feature/new-feature`
-3. **Develop Feature**: Write code and tests
-4. **Commit Changes**: Use standard commit messages
-5. **Push Branch**: `git push origin feature/new-feature`
-6. **Create PR**: Create Pull Request on GitHub
-
-### Pull Request Checklist
-
-Before submitting PR, ensure:
-
-- Code passes all tests
-- Follows code standards
-- Updates relevant documentation
-- Adds appropriate test cases
-- PR description is clear with change explanations
-
-## Contribution Opportunities
-
-### Beginner-friendly Tasks
-
-Look for Issues labeled with:
-
-- `good first issue`: Tasks suitable for beginners
-- `help wanted`: Tasks needing community help
-- `documentation`: Documentation-related improvements
-
-## Useful Resources
-
-### Official Documentation
-
-- [Nuxt 4 Documentation](https://nuxt.com/)
-- [Vue 3 Documentation](https://vuejs.org/)
-- [Drizzle ORM Documentation](https://orm.drizzle.team/)
-- [TailwindCSS Documentation](https://tailwindcss.com/)
-
-### Community Resources
-
-- [GitHub Issues](https://github.com/HoshinoSuzumi/chronoframe/issues)
-- [GitHub Discussions](https://github.com/HoshinoSuzumi/chronoframe/discussions)
+提交信息建议遵循 Conventional Commits。Pull Request 请说明数据安全影响，并附上对应测试结果。

@@ -1,0 +1,40 @@
+services:
+  chronoframe:
+    build: .
+    environment:
+      CF_ADMIN_TOKEN: e2e-admin-token-change-before-real-use
+      CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
+      CF_WEB_DIR: /app/web
+      CF_CONVERSION_WORKERS: "4"
+    ports:
+      - "127.0.0.1:8188:8080"
+    volumes:
+      - chronoframe-data:/app/data
+    depends_on:
+      minio:
+        condition: service_started
+      webdav:
+        condition: service_started
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: e2e-minio-access
+      MINIO_ROOT_PASSWORD: e2e-minio-secret-change-me
+    command: server /data
+    volumes:
+      - minio-data:/data
+
+  webdav:
+    image: bytemark/webdav:latest
+    environment:
+      AUTH_TYPE: Basic
+      USERNAME: e2e-webdav-user
+      PASSWORD: e2e-webdav-password
+    volumes:
+      - webdav-data:/var/lib/dav
+
+volumes:
+  chronoframe-data:
+  minio-data:
+  webdav-data:

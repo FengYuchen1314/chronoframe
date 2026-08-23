@@ -1,26 +1,10 @@
 services:
   chronoframe:
-    image: ghcr.io/hoshinosuzumi/chronoframe:latest
+    build: .
     container_name: chronoframe
     restart: unless-stopped
     ports:
-      - '3000:3000'
+      - "8080:8080"
+    env_file: .env
     volumes:
       - ./data:/app/data
-    env_file:
-      - .env
-
-  # database:
-  #   image: postgres:15-alpine
-  #   container_name: chronoframe_db
-  #   environment:
-  #     POSTGRES_DB: chronoframe
-  #     POSTGRES_USER: chronoframe
-  #     POSTGRES_PASSWORD: your-password
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-
-# volumes:
-#   postgres_data:
