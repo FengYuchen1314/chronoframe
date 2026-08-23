@@ -1039,6 +1039,9 @@ struct Album {
     id: String,
     name: String,
     created_at: i64,
+    display_created_date: Option<String>,
+    photo_date_start: Option<String>,
+    photo_date_end: Option<String>,
     photo_count: i64,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -1093,6 +1096,9 @@ fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
         id: row.get("id"),
         name: row.get("name"),
         created_at: row.get("created_at"),
+        display_created_date: row.get("display_created_date"),
+        photo_date_start: row.get("photo_date_start"),
+        photo_date_end: row.get("photo_date_end"),
         photo_count: row.get("photo_count"),
     }
 }
@@ -1995,15 +2001,98 @@ async fn test_storage_settings(
 struct NewAlbum {
     name: String,
 }
+
+#[derive(Debug, Default)]
+enum PatchString {
+    #[default]
+    Missing,
+    Present(Option<String>),
+}
+
+impl<'de> Deserialize<'de> for PatchString {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlbumDatePatch {
+    #[serde(default)]
+    display_created_date: PatchString,
+    #[serde(default)]
+    photo_date_start: PatchString,
+    #[serde(default)]
+    photo_date_end: PatchString,
+}
+
+fn is_valid_album_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+
+    let year = value[..4].parse::<u32>().unwrap_or_default();
+    let month = value[5..7].parse::<u32>().unwrap_or_default();
+    let day = value[8..].parse::<u32>().unwrap_or_default();
+    if year == 0 || !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap_year = year % 400 == 0 || (year % 4 == 0 && year % 100 != 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    day <= days_in_month
+}
+
+fn normalize_album_date(value: Option<String>, label: &str) -> ApiResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() != value.len() || !is_valid_album_date(trimmed) {
+        return Err(AppError::bad(format!(
+            "{label}必须是有效的 YYYY-MM-DD 日期"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn validate_photo_date_range(start: &Option<String>, end: &Option<String>) -> ApiResult<()> {
+    match (start, end) {
+        (None, None) => Ok(()),
+        (Some(start), Some(end)) if start <= end => Ok(()),
+        (Some(_), Some(_)) => Err(AppError::bad("图片开始日期不得晚于结束日期")),
+        _ => Err(AppError::bad(
+            "图片开始日期和结束日期必须同时设置或同时清除",
+        )),
+    }
+}
+
 async fn list_albums(State(state): State<AppState>) -> ApiResult<Json<Vec<Album>>> {
-    let rows = sqlx::query("SELECT a.id,a.name,a.created_at,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.created_at DESC").fetch_all(&state.db).await.map_err(AppError::internal)?;
+    let rows = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.created_at DESC").fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(album_from).collect()))
 }
 async fn album_detail(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
 ) -> ApiResult<Json<AlbumDetail>> {
-    let row = sqlx::query("SELECT a.id,a.name,a.created_at,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
+    let row = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
         .bind(&album_id)
         .fetch_optional(&state.db)
         .await
@@ -2037,6 +2126,9 @@ async fn create_album(
         id: Uuid::new_v4().to_string(),
         name: name.into(),
         created_at: now(),
+        display_created_date: None,
+        photo_date_start: None,
+        photo_date_end: None,
         photo_count: 0,
     };
     sqlx::query("INSERT INTO albums(id,name,created_at) VALUES(?,?,?)")
@@ -2047,6 +2139,79 @@ async fn create_album(
         .await
         .map_err(AppError::internal)?;
     Ok((StatusCode::CREATED, Json(album)))
+}
+
+async fn patch_album_dates(
+    State(state): State<AppState>,
+    AxumPath(album_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(input): Json<AlbumDatePatch>,
+) -> ApiResult<Json<Album>> {
+    require_admin(&headers, &state, true).await?;
+
+    let display_created_date = match input.display_created_date {
+        PatchString::Missing => None,
+        PatchString::Present(value) => Some(normalize_album_date(value, "展示创建日期")?),
+    };
+    let photo_date_range = match (input.photo_date_start, input.photo_date_end) {
+        (PatchString::Missing, PatchString::Missing) => None,
+        (PatchString::Present(start), PatchString::Present(end)) => {
+            let start = normalize_album_date(start, "图片开始日期")?;
+            let end = normalize_album_date(end, "图片结束日期")?;
+            validate_photo_date_range(&start, &end)?;
+            Some((start, end))
+        }
+        _ => {
+            return Err(AppError::bad(
+                "图片开始日期和结束日期必须同时设置或同时清除",
+            ));
+        }
+    };
+
+    let result = match (display_created_date, photo_date_range) {
+        (Some(display_created_date), Some((photo_date_start, photo_date_end))) => {
+            sqlx::query("UPDATE albums SET display_created_date=?,photo_date_start=?,photo_date_end=? WHERE id=?")
+                .bind(display_created_date)
+                .bind(photo_date_start)
+                .bind(photo_date_end)
+                .bind(&album_id)
+                .execute(&state.db)
+                .await
+                .map_err(AppError::internal)?
+        }
+        (Some(display_created_date), None) => sqlx::query(
+            "UPDATE albums SET display_created_date=? WHERE id=?",
+        )
+        .bind(display_created_date)
+        .bind(&album_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?,
+        (None, Some((photo_date_start, photo_date_end))) => sqlx::query(
+            "UPDATE albums SET photo_date_start=?,photo_date_end=? WHERE id=?",
+        )
+        .bind(photo_date_start)
+        .bind(photo_date_end)
+        .bind(&album_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?,
+        (None, None) => return Err(AppError::bad("至少需要提供一个日期字段")),
+    };
+    if result.rows_affected() == 0 {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "相簿不存在".into(),
+            clear_auth_cookies: None,
+        });
+    }
+
+    let row = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
+        .bind(&album_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(album_from(&row)))
 }
 async fn album_photos(
     State(state): State<AppState>,
@@ -2755,7 +2920,31 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| row.get("name"))
+        .collect();
+    for (column, migration) in [
+        (
+            "display_created_date",
+            "ALTER TABLE albums ADD COLUMN display_created_date TEXT",
+        ),
+        (
+            "photo_date_start",
+            "ALTER TABLE albums ADD COLUMN photo_date_start TEXT",
+        ),
+        (
+            "photo_date_end",
+            "ALTER TABLE albums ADD COLUMN photo_date_end TEXT",
+        ),
+    ] {
+        if !album_columns.contains(column) {
+            sqlx::query(migration).execute(pool).await?;
+        }
+    }
     let photo_columns: HashSet<String> = sqlx::query("PRAGMA table_info(photos)")
         .fetch_all(pool)
         .await?
@@ -2930,7 +3119,10 @@ async fn main() -> Result<()> {
         )
         .route("/api/settings/storage/test", post(test_storage_settings))
         .route("/api/albums", get(list_albums).post(create_album))
-        .route("/api/albums/{album_id}", get(album_detail))
+        .route(
+            "/api/albums/{album_id}",
+            get(album_detail).patch(patch_album_dates),
+        )
         .route(
             "/api/albums/{album_id}/photos",
             get(album_photos)
@@ -3210,6 +3402,128 @@ mod tests {
         let mut trusted_state = state.clone();
         trusted_state.trust_proxy_headers = true;
         assert!(request_is_https(&headers, &trusted_state));
+    }
+
+    #[test]
+    fn album_dates_are_strict_real_calendar_dates() {
+        for value in ["0001-01-01", "2000-02-29", "2024-02-29", "9999-12-31"] {
+            assert!(is_valid_album_date(value), "expected valid date: {value}");
+            assert_eq!(
+                normalize_album_date(Some(value.into()), "日期")
+                    .unwrap()
+                    .as_deref(),
+                Some(value)
+            );
+        }
+        for value in [
+            "0000-01-01",
+            "1900-02-29",
+            "2023-02-29",
+            "2024-00-01",
+            "2024-13-01",
+            "2024-04-31",
+            "2024-2-29",
+            "2024-02-9",
+            "2024-02-29T00:00:00Z",
+            " 2024-02-29",
+            "2024-02-29 ",
+        ] {
+            assert!(
+                !is_valid_album_date(value),
+                "expected invalid date: {value}"
+            );
+            assert!(normalize_album_date(Some(value.into()), "日期").is_err());
+        }
+        assert_eq!(normalize_album_date(None, "日期").unwrap(), None);
+        assert_eq!(
+            normalize_album_date(Some(" \t\r\n ".into()), "日期").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn photo_date_range_requires_an_ordered_pair() {
+        let start = Some("2024-01-01".to_string());
+        let same = Some("2024-01-01".to_string());
+        let end = Some("2024-12-31".to_string());
+        assert!(validate_photo_date_range(&None, &None).is_ok());
+        assert!(validate_photo_date_range(&start, &same).is_ok());
+        assert!(validate_photo_date_range(&start, &end).is_ok());
+        assert!(validate_photo_date_range(&start, &None).is_err());
+        assert!(validate_photo_date_range(&None, &end).is_err());
+        assert!(validate_photo_date_range(&end, &start).is_err());
+    }
+
+    #[tokio::test]
+    async fn setup_database_adds_album_date_metadata_without_losing_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); INSERT INTO albums(id,name,created_at) VALUES('legacy-album','Legacy Album',12345);")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        setup_database(&pool).await.unwrap();
+
+        let legacy = sqlx::query("SELECT name,created_at,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id='legacy-album'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy.get::<String, _>("name"), "Legacy Album");
+        assert_eq!(legacy.get::<i64, _>("created_at"), 12345);
+        assert_eq!(
+            legacy.get::<Option<String>, _>("display_created_date"),
+            None
+        );
+        assert_eq!(legacy.get::<Option<String>, _>("photo_date_start"), None);
+        assert_eq!(legacy.get::<Option<String>, _>("photo_date_end"), None);
+
+        sqlx::query("UPDATE albums SET display_created_date='2020-01-02',photo_date_start='2019-01-01',photo_date_end='2020-01-01' WHERE id='legacy-album'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        setup_database(&pool).await.unwrap();
+
+        let migrated = sqlx::query("SELECT name,created_at,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id='legacy-album'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(migrated.get::<String, _>("name"), "Legacy Album");
+        assert_eq!(migrated.get::<i64, _>("created_at"), 12345);
+        assert_eq!(
+            migrated
+                .get::<Option<String>, _>("display_created_date")
+                .as_deref(),
+            Some("2020-01-02")
+        );
+        assert_eq!(
+            migrated
+                .get::<Option<String>, _>("photo_date_start")
+                .as_deref(),
+            Some("2019-01-01")
+        );
+        assert_eq!(
+            migrated
+                .get::<Option<String>, _>("photo_date_end")
+                .as_deref(),
+            Some("2020-01-01")
+        );
+        let date_columns = sqlx::query("PRAGMA table_info(albums)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|column| {
+                matches!(
+                    column.get::<String, _>("name").as_str(),
+                    "display_created_date" | "photo_date_start" | "photo_date_end"
+                )
+            })
+            .count();
+        assert_eq!(date_columns, 3);
     }
 
     #[tokio::test]

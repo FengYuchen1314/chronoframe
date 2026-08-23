@@ -21,9 +21,22 @@ const items = computed(() => (album.value?.photos || []).map((photo, index) => (
 const keyMapper = (item: { id: string }) => item.id
 const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
 const dateRange = computed(() => {
+  if (album.value?.photoDateStart && album.value.photoDateEnd) {
+    const start = formatGalleryCalendarDate(album.value.photoDateStart)
+    const end = formatGalleryCalendarDate(album.value.photoDateEnd)
+    return start === end ? start : `${start} – ${end}`
+  }
   const dates = (album.value?.photos || []).map(photo => new Date(photo.dateTaken)).filter(date => date.getTime() > 0).sort((a, b) => a.getTime() - b.getTime())
   if (!dates.length) return ''
-  return dates.length === 1 ? formatGalleryDate(dates[0]!.toISOString()) : `${formatGalleryDate(dates[0]!.toISOString())} – ${formatGalleryDate(dates.at(-1)!.toISOString())}`
+  const start = formatGalleryDate(dates[0]!.toISOString())
+  const end = formatGalleryDate(dates.at(-1)!.toISOString())
+  return start === end ? start : `${start} – ${end}`
+})
+const createdDate = computed(() => {
+  if (!album.value) return ''
+  return album.value.displayCreatedDate
+    ? formatGalleryCalendarDate(album.value.displayCreatedDate)
+    : formatGalleryDate(album.value.createdAt)
 })
 
 const openPhoto = (index: number) => {
@@ -59,7 +72,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
           <div class="flex flex-wrap items-center gap-4 text-sm text-neutral-600 dark:text-neutral-300">
             <span class="flex items-center gap-1"><Icon name="tabler:photo" class="size-4 text-neutral-400" />{{ t('album.photo', album.photoCount) }}</span>
             <span v-if="dateRange" class="flex items-center gap-1"><Icon name="tabler:calendar" class="size-4 text-neutral-400" />{{ dateRange }}</span>
-            <span class="flex items-center gap-1"><Icon name="tabler:clock-plus" class="size-4 text-neutral-400" />{{ formatGalleryDate(album.createdAt) }}</span>
+            <span class="flex items-center gap-1"><Icon name="tabler:clock-plus" class="size-4 text-neutral-400" />{{ createdDate }}</span>
           </div>
         </motion.div>
       </section>

@@ -6,6 +6,9 @@ export interface Album {
   id: string
   name: string
   createdAt: number
+  displayCreatedDate: string | null
+  photoDateStart: string | null
+  photoDateEnd: string | null
   photoCount: number
 }
 
