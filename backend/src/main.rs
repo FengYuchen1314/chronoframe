@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    io::Cursor,
+    io::{Cursor, ErrorKind},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -9,32 +9,44 @@ use std::{
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, AeadCore, OsRng},
+    aead::{Aead, AeadCore, OsRng as AeadOsRng},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use argon2::{
+    Algorithm, Argon2, Params, Version,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, config::Builder as S3ConfigBuilder};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
+    body::Bytes,
+    extract::{
+        DefaultBodyLimit, Multipart, Path as AxumPath, Query, State,
+        rejection::{BytesRejection, JsonRejection},
+    },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use dashmap::DashMap;
 use futures_util::stream::{self, StreamExt};
 use image::ImageFormat;
+use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
+use subtle::ConstantTimeEq;
 use tokio::{io::AsyncWriteExt, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tower_http::{
-    cors::CorsLayer,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -45,18 +57,24 @@ use uuid::Uuid;
 struct AppState {
     db: SqlitePool,
     storage: StorageService,
-    admin_token: Arc<String>,
+    secure_cookies: Option<bool>,
+    trust_proxy_headers: bool,
     workers: usize,
     jobs: Arc<DashMap<String, CancellationToken>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
     thumbnail_slots: Arc<tokio::sync::Semaphore>,
+    password_hash_slots: Arc<tokio::sync::Semaphore>,
     photo_graph_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 const STORAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UPLOAD_BATCH_BYTES: usize = 384 * 1024 * 1024;
 const MAX_UPLOAD_FILES: usize = 128;
+const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+const SESSION_COOKIE: &str = "cf_session";
+const CSRF_COOKIE: &str = "cf_csrf";
+const REQUESTED_WITH: &str = "ChronoFrame";
 
 fn staging_key(key: &str) -> String {
     format!("{key}.cf-pending")
@@ -86,7 +104,9 @@ fn validate_storage_prefix(prefix: &str) -> Result<()> {
 #[derive(Clone)]
 struct Config {
     database_url: String,
-    admin_token: String,
+    master_key_file: PathBuf,
+    secure_cookies: Option<bool>,
+    trust_proxy_headers: bool,
     workers: usize,
     web_dir: String,
 }
@@ -95,15 +115,151 @@ impl Config {
     fn from_env() -> Result<Self> {
         let get =
             |name: &str, default: &str| env::var(name).unwrap_or_else(|_| default.to_string());
+        let database_url = get("CF_DATABASE_URL", "sqlite://data/chronoframe.db?mode=rwc");
+        let default_master_key = database_path(&database_url)
+            .and_then(|path| path.parent().map(|parent| parent.join("secret.key")))
+            .unwrap_or_else(|| PathBuf::from("data/secret.key"));
         Ok(Self {
-            database_url: get("CF_DATABASE_URL", "sqlite://data/chronoframe.db?mode=rwc"),
-            admin_token: get("CF_ADMIN_TOKEN", "change-me"),
+            database_url,
+            master_key_file: env::var("CF_MASTER_KEY_FILE")
+                .map(PathBuf::from)
+                .unwrap_or(default_master_key),
+            secure_cookies: match get("CF_COOKIE_SECURE", "auto")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "auto" => None,
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => bail!("CF_COOKIE_SECURE must be auto, true, or false"),
+            },
+            trust_proxy_headers: match get("CF_TRUST_PROXY_HEADERS", "false")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => bail!("CF_TRUST_PROXY_HEADERS must be true or false"),
+            },
             workers: get("CF_CONVERSION_WORKERS", "4")
                 .parse::<usize>()
                 .unwrap_or(4)
                 .clamp(1, 16),
             web_dir: get("CF_WEB_DIR", "./.output/public"),
         })
+    }
+}
+
+fn database_path(database_url: &str) -> Option<PathBuf> {
+    let value = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))?
+        .split('?')
+        .next()?;
+    if value.is_empty() || value == ":memory:" {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+async fn restrict_secret_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn legacy_storage_key(seed: &str) -> [u8; 32] {
+    let digest = Sha256::digest(seed.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
+async fn read_master_key(path: &Path) -> Result<[u8; 32]> {
+    for attempt in 0..20 {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("无法读取主密钥 {}", path.display()))?;
+        if bytes.len() == 32 {
+            restrict_secret_permissions(path).await?;
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+        if attempt < 19 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    bail!("主密钥文件 {} 必须恰好为 32 字节", path.display())
+}
+
+async fn load_or_create_master_key(path: &Path) -> Result<[u8; 32]> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("无法创建主密钥目录 {}", parent.display()))?;
+    }
+
+    match tokio::fs::metadata(path).await {
+        Ok(_) => return read_master_key(path).await,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("无法检查主密钥 {}", path.display()));
+        }
+    }
+
+    // CF_ADMIN_TOKEN is consulted only while bootstrapping a missing key file, solely to preserve
+    // decryptability of credentials encrypted by pre-account releases. It is never authentication.
+    let legacy_admin_token = env::var("CF_ADMIN_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let generated = legacy_admin_token
+        .as_deref()
+        .map(legacy_storage_key)
+        .unwrap_or_else(|| {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            key
+        });
+    let create_path = path.to_owned();
+    let create_key = generated;
+    let created = tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(create_path)?;
+        std::io::Write::write_all(&mut file, &create_key)?;
+        file.sync_all()
+    })
+    .await
+    .context("主密钥创建任务异常退出")?;
+    match created {
+        Ok(()) => {
+            restrict_secret_permissions(path).await?;
+            if legacy_admin_token.is_some() {
+                info!(path = %path.display(), "migrated legacy storage encryption key to master key file");
+            } else {
+                info!(path = %path.display(), "created storage master key");
+            }
+            Ok(generated)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // Another process won create_new. Retry a briefly partial file until its sync completes.
+            read_master_key(path).await
+        }
+        Err(error) => Err(error).with_context(|| format!("无法创建主密钥 {}", path.display())),
     }
 }
 
@@ -548,10 +704,7 @@ struct StorageSettingsOutput {
 }
 
 impl StorageService {
-    fn new(db: SqlitePool, admin_token: &str) -> Self {
-        let digest = Sha256::digest(admin_token.as_bytes());
-        let mut encryption_key = [0; 32];
-        encryption_key.copy_from_slice(&digest);
+    fn new(db: SqlitePool, encryption_key: [u8; 32]) -> Self {
         Self {
             db,
             encryption_key,
@@ -697,7 +850,7 @@ impl StorageService {
                 String::new()
             } else {
                 self.decrypt(&get("storage_webdav_password"))
-                    .context("无法解密 WebDAV 密码；管理员令牌变更后请在后台重新保存密码")?
+                    .context("无法解密 WebDAV 密码；请确认 storage master key 未被替换")?
             },
             webdav_prefix: get("storage_webdav_prefix"),
             s3_endpoint: get("storage_s3_endpoint"),
@@ -708,7 +861,7 @@ impl StorageService {
                 String::new()
             } else {
                 self.decrypt(&get("storage_s3_secret_key"))
-                    .context("无法解密 S3 密钥；管理员令牌变更后请在后台重新保存密钥")?
+                    .context("无法解密 S3 密钥；请确认 storage master key 未被替换")?
             },
             s3_prefix: get("storage_s3_prefix"),
         };
@@ -859,7 +1012,7 @@ impl StorageService {
     }
     fn encrypt(&self, plaintext: &str) -> Result<String> {
         let cipher = Aes256Gcm::new_from_slice(&self.encryption_key)?;
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Aes256Gcm::generate_nonce(&mut AeadOsRng);
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|_| anyhow!("无法加密 WebDAV 密码"))?;
@@ -1150,12 +1303,14 @@ async fn drain_source_deletion_outbox(
 struct AppError {
     status: StatusCode,
     message: String,
+    clear_auth_cookies: Option<bool>,
 }
 impl AppError {
     fn bad(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            clear_auth_cookies: None,
         }
     }
     fn internal(e: impl Into<anyhow::Error>) -> Self {
@@ -1164,16 +1319,62 @@ impl AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "服务器处理请求时出错".into(),
+            clear_auth_cookies: None,
         }
+    }
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            clear_auth_cookies: None,
+        }
+    }
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            clear_auth_cookies: None,
+        }
+    }
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            clear_auth_cookies: None,
+        }
+    }
+    fn too_many(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            clear_auth_cookies: None,
+        }
+    }
+    fn clearing_auth_cookies(mut self, secure: bool) -> Self {
+        self.clear_auth_cookies = Some(secure);
+        self
     }
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({"error": self.message})),
-        )
-            .into_response()
+        let AppError {
+            status,
+            message,
+            clear_auth_cookies,
+        } = self;
+        let mut response = (status, Json(serde_json::json!({"error": message}))).into_response();
+        if let Some(secure) = clear_auth_cookies {
+            for cookie in [
+                expired_cookie(SESSION_COOKIE, true, secure),
+                expired_cookie(CSRF_COOKIE, false, secure),
+            ] {
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            no_store(&mut response);
+        }
+        response
     }
 }
 type ApiResult<T> = std::result::Result<T, AppError>;
@@ -1185,24 +1386,574 @@ async fn api_not_found() -> impl IntoResponse {
     )
 }
 
-fn admin(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
-    if headers.get("x-admin-token").and_then(|v| v.to_str().ok())
-        == Some(state.admin_token.as_str())
+#[derive(Deserialize)]
+struct CredentialsInput {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthStatus {
+    initialized: bool,
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+}
+
+struct SessionRecord {
+    token_hash: String,
+    csrf_hash: String,
+    username: String,
+}
+
+struct FreshSession {
+    token: String,
+    csrf: String,
+    token_hash: String,
+    csrf_hash: String,
+    created_at: i64,
+    expires_at: i64,
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|part| {
+            let (candidate, value) = part.trim().split_once('=')?;
+            (candidate == name).then(|| value.to_string())
+        })
+}
+
+fn digest_secret(secret: &str) -> String {
+    hex_digest(&Sha256::digest(secret.as_bytes()))
+}
+
+fn secrets_equal(left: &str, right: &str) -> bool {
+    let left_hash = Sha256::digest(left.as_bytes());
+    let right_hash = Sha256::digest(right.as_bytes());
+    bool::from(left_hash[..].ct_eq(&right_hash[..]))
+}
+
+fn random_secret() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn fresh_session() -> FreshSession {
+    let token = random_secret();
+    let csrf = random_secret();
+    let created_at = now();
+    FreshSession {
+        token_hash: digest_secret(&token),
+        csrf_hash: digest_secret(&csrf),
+        token,
+        csrf,
+        created_at,
+        expires_at: created_at + SESSION_TTL_SECONDS,
+    }
+}
+
+fn request_is_https(headers: &HeaderMap, state: &AppState) -> bool {
+    if !state.trust_proxy_headers {
+        return false;
+    }
+    let forwarded_https = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split([',', ';']).any(|part| {
+                part.trim().split_once('=').is_some_and(|(key, value)| {
+                    key.trim().eq_ignore_ascii_case("proto")
+                        && value.trim().trim_matches('"').eq_ignore_ascii_case("https")
+                })
+            })
+        });
+    let forwarded_proto_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    forwarded_https || forwarded_proto_https
+}
+
+fn use_secure_cookies(headers: &HeaderMap, state: &AppState) -> bool {
+    state
+        .secure_cookies
+        .unwrap_or_else(|| request_is_https(headers, state))
+}
+
+fn cookie_suffix(secure: bool) -> &'static str {
+    if secure { "; Secure" } else { "" }
+}
+
+fn session_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict{}",
+        cookie_suffix(secure)
+    )
+}
+
+fn csrf_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "{CSRF_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; SameSite=Strict{}",
+        cookie_suffix(secure)
+    )
+}
+
+fn expired_cookie(name: &str, http_only: bool, secure: bool) -> String {
+    format!(
+        "{name}=; Path=/; Max-Age=0; SameSite=Strict{}{}",
+        if http_only { "; HttpOnly" } else { "" },
+        cookie_suffix(secure)
+    )
+}
+
+fn append_cookie(headers: &mut HeaderMap, cookie: String) -> ApiResult<()> {
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(AppError::internal)?,
+    );
+    Ok(())
+}
+
+fn no_store(response: &mut Response) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+}
+
+fn require_same_origin(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    let forwarded_host = state.trust_proxy_headers.then(|| {
+        headers
+            .get("x-forwarded-host")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+    });
+    let host = forwarded_host
+        .flatten()
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .ok_or_else(|| AppError::forbidden("无法验证请求来源"))?;
+    let scheme = if request_is_https(headers, state) {
+        "https"
+    } else {
+        "http"
+    };
+    let supplied = url::Url::parse(origin).map_err(|_| AppError::forbidden("请求来源无效"))?;
+    let expected = url::Url::parse(&format!("{scheme}://{host}"))
+        .map_err(|_| AppError::forbidden("无法验证请求来源"))?;
+    if supplied.scheme() != expected.scheme()
+        || supplied.host_str() != expected.host_str()
+        || supplied.port_or_known_default() != expected.port_or_known_default()
+    {
+        return Err(AppError::forbidden("不允许跨站管理请求"));
+    }
+    Ok(())
+}
+
+fn require_requested_with(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
+    require_same_origin(headers, state)?;
+    if headers
+        .get("x-requested-with")
+        .and_then(|value| value.to_str().ok())
+        == Some(REQUESTED_WITH)
     {
         Ok(())
     } else {
-        Err(AppError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "需要管理员令牌".into(),
-        })
+        Err(AppError::forbidden("缺少有效的 X-Requested-With 请求头"))
     }
+}
+
+async fn admin_initialized(db: &SqlitePool) -> ApiResult<bool> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM administrators WHERE id=1)")
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)
+}
+
+async fn find_session(headers: &HeaderMap, state: &AppState) -> ApiResult<Option<SessionRecord>> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let token_hash = digest_secret(&token);
+    let row = sqlx::query("SELECT a.username,s.csrf_hash,s.expires_at FROM admin_sessions s JOIN administrators a ON a.id=s.administrator_id WHERE s.token_hash=?")
+        .bind(&token_hash)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.get::<i64, _>("expires_at") <= now() {
+        sqlx::query("DELETE FROM admin_sessions WHERE token_hash=?")
+            .bind(&token_hash)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        return Ok(None);
+    }
+    Ok(Some(SessionRecord {
+        token_hash,
+        csrf_hash: row.get("csrf_hash"),
+        username: row.get("username"),
+    }))
+}
+
+async fn require_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+    require_csrf: bool,
+) -> ApiResult<SessionRecord> {
+    let session = match find_session(headers, state).await? {
+        Some(session) => session,
+        None => {
+            let error = AppError::unauthorized("请先登录管理员账号");
+            return Err(if cookie_value(headers, SESSION_COOKIE).is_some() {
+                error.clearing_auth_cookies(use_secure_cookies(headers, state))
+            } else {
+                error
+            });
+        }
+    };
+    if require_csrf {
+        require_same_origin(headers, state)?;
+        let cookie = cookie_value(headers, CSRF_COOKIE)
+            .ok_or_else(|| AppError::forbidden("CSRF 校验失败"))?;
+        let supplied = headers
+            .get("x-csrf-token")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| AppError::forbidden("CSRF 校验失败"))?;
+        let supplied_hash = digest_secret(supplied);
+        if !secrets_equal(&cookie, supplied) || !secrets_equal(&session.csrf_hash, &supplied_hash) {
+            return Err(AppError::forbidden("CSRF 校验失败"));
+        }
+    }
+    Ok(session)
+}
+
+fn configured_argon2() -> Result<Argon2<'static>> {
+    let params = Params::new(19_456, 2, 1, None)
+        .map_err(|error| anyhow!("invalid Argon2 parameters: {error}"))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+fn hash_password(password: String) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    configured_argon2()?
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| anyhow!("failed to hash password: {error}"))
+}
+
+fn verify_password(password: String, encoded: String) -> Result<bool> {
+    let hash = PasswordHash::new(&encoded)
+        .map_err(|error| anyhow!("stored password hash is invalid: {error}"))?;
+    Ok(configured_argon2()?
+        .verify_password(password.as_bytes(), &hash)
+        .is_ok())
+}
+
+async fn verify_password_bounded(
+    state: &AppState,
+    password: String,
+    encoded: String,
+) -> ApiResult<bool> {
+    let _permit = timeout(Duration::from_secs(2), state.password_hash_slots.acquire())
+        .await
+        .map_err(|_| AppError::too_many("登录请求过多，请稍后重试"))?
+        .map_err(|_| AppError::internal(anyhow!("password hash queue closed")))?;
+    tokio::task::spawn_blocking(move || verify_password(password, encoded))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)
+}
+
+async fn create_session(state: &AppState) -> ApiResult<(String, String)> {
+    let session = fresh_session();
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query("DELETE FROM admin_sessions WHERE expires_at<=?")
+        .bind(session.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO admin_sessions(token_hash,administrator_id,csrf_hash,created_at,expires_at) VALUES(?,1,?,?,?)")
+        .bind(&session.token_hash)
+        .bind(&session.csrf_hash)
+        .bind(session.created_at)
+        .bind(session.expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("DELETE FROM admin_sessions WHERE administrator_id=1 AND token_hash NOT IN (SELECT token_hash FROM admin_sessions WHERE administrator_id=1 ORDER BY created_at DESC,rowid DESC LIMIT 16)")
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok((session.token, session.csrf))
+}
+
+fn validate_credentials(input: CredentialsInput) -> ApiResult<(String, String)> {
+    let username = input.username.trim().to_string();
+    if username.is_empty()
+        || username.chars().count() > 64
+        || username.chars().any(char::is_control)
+    {
+        return Err(AppError::bad(
+            "用户名不能为空、不得超过 64 个字符且不能包含控制字符",
+        ));
+    }
+    if input.password.chars().count() < 12 || input.password.len() > 1024 {
+        return Err(AppError::bad("密码至少需要 12 个字符且不得超过 1024 字节"));
+    }
+    Ok((username, input.password))
+}
+
+fn auth_json_error(error: JsonRejection) -> AppError {
+    AppError {
+        status: error.status(),
+        message: "认证请求 JSON 无效或超过 8KiB 限制".into(),
+        clear_auth_cookies: None,
+    }
+}
+
+fn auth_body_error(error: BytesRejection) -> AppError {
+    AppError {
+        status: error.status(),
+        message: "认证请求体超过 8KiB 限制".into(),
+        clear_auth_cookies: None,
+    }
+}
+
+async fn rotate_csrf_if_current(
+    db: &SqlitePool,
+    token_hash: &str,
+    expected_hash: &str,
+    replacement_hash: &str,
+) -> ApiResult<bool> {
+    let result =
+        sqlx::query("UPDATE admin_sessions SET csrf_hash=? WHERE token_hash=? AND csrf_hash=?")
+            .bind(replacement_hash)
+            .bind(token_hash)
+            .bind(expected_hash)
+            .execute(db)
+            .await
+            .map_err(AppError::internal)?;
+    Ok(result.rows_affected() == 1)
+}
+
+fn authenticated_response(
+    status: StatusCode,
+    username: String,
+    session: &str,
+    csrf: &str,
+    secure: bool,
+) -> ApiResult<Response> {
+    let mut response = (
+        status,
+        Json(AuthStatus {
+            initialized: true,
+            authenticated: true,
+            username: Some(username),
+        }),
+    )
+        .into_response();
+    append_cookie(response.headers_mut(), session_cookie(session, secure))?;
+    append_cookie(response.headers_mut(), csrf_cookie(csrf, secure))?;
+    no_store(&mut response);
+    Ok(response)
+}
+
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let initialized = admin_initialized(&state.db).await?;
+    let session = if initialized {
+        find_session(&headers, &state).await?
+    } else {
+        None
+    };
+    let authenticated = session.is_some();
+    let username = session.as_ref().map(|session| session.username.clone());
+    let mut response = Json(AuthStatus {
+        initialized,
+        authenticated,
+        username,
+    })
+    .into_response();
+    let secure = use_secure_cookies(&headers, &state);
+    if let Some(session) = session {
+        let csrf_matches = cookie_value(&headers, CSRF_COOKIE)
+            .is_some_and(|csrf| secrets_equal(&session.csrf_hash, &digest_secret(&csrf)));
+        if !csrf_matches {
+            let csrf = random_secret();
+            let replacement_hash = digest_secret(&csrf);
+            if rotate_csrf_if_current(
+                &state.db,
+                &session.token_hash,
+                &session.csrf_hash,
+                &replacement_hash,
+            )
+            .await?
+            {
+                append_cookie(response.headers_mut(), csrf_cookie(&csrf, secure))?;
+            }
+        }
+    } else if cookie_value(&headers, SESSION_COOKIE).is_some()
+        || cookie_value(&headers, CSRF_COOKIE).is_some()
+    {
+        append_cookie(
+            response.headers_mut(),
+            expired_cookie(SESSION_COOKIE, true, secure),
+        )?;
+        append_cookie(
+            response.headers_mut(),
+            expired_cookie(CSRF_COOKIE, false, secure),
+        )?;
+    }
+    no_store(&mut response);
+    Ok(response)
+}
+
+async fn register_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    input: std::result::Result<Json<CredentialsInput>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_requested_with(&headers, &state)?;
+    let Json(input) = input.map_err(auth_json_error)?;
+    if admin_initialized(&state.db).await? {
+        return Err(AppError::conflict("管理员账号已经注册"));
+    }
+    let (username, password) = validate_credentials(input)?;
+    // Keep the bounded permit through hashing and the transaction. On queue timeout, distinguish
+    // a completed competing registration (409) from genuine admission pressure (429).
+    let _permit = match timeout(Duration::from_secs(2), state.password_hash_slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return Err(AppError::internal(anyhow!("password hash queue closed")));
+        }
+        Err(_) => {
+            return Err(if admin_initialized(&state.db).await? {
+                AppError::conflict("管理员账号已经被其他请求注册")
+            } else {
+                AppError::too_many("注册请求过多，请稍后重试")
+            });
+        }
+    };
+    if admin_initialized(&state.db).await? {
+        return Err(AppError::conflict("管理员账号已经被其他请求注册"));
+    }
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(password))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
+    let session = fresh_session();
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    let result = sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,?,?,?) ON CONFLICT(id) DO NOTHING")
+        .bind(&username)
+        .bind(password_hash)
+        .bind(session.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    if result.rows_affected() != 1 {
+        tx.rollback().await.map_err(AppError::internal)?;
+        return Err(AppError::conflict("管理员账号已经被其他请求注册"));
+    }
+    sqlx::query("INSERT INTO admin_sessions(token_hash,administrator_id,csrf_hash,created_at,expires_at) VALUES(?,1,?,?,?)")
+        .bind(&session.token_hash)
+        .bind(&session.csrf_hash)
+        .bind(session.created_at)
+        .bind(session.expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    authenticated_response(
+        StatusCode::CREATED,
+        username,
+        &session.token,
+        &session.csrf,
+        use_secure_cookies(&headers, &state),
+    )
+}
+
+async fn login_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    input: std::result::Result<Json<CredentialsInput>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_requested_with(&headers, &state)?;
+    let Json(input) = input.map_err(auth_json_error)?;
+    if !admin_initialized(&state.db).await? {
+        return Err(AppError::conflict("尚未注册管理员账号"));
+    }
+    let (username, password) = validate_credentials(input)?;
+    let row = sqlx::query("SELECT username,password_hash FROM administrators WHERE id=1")
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let stored_username: String = row.get("username");
+    let password_hash: String = row.get("password_hash");
+    let password_valid = verify_password_bounded(&state, password, password_hash).await?;
+    if !password_valid || !secrets_equal(&username, &stored_username) {
+        return Err(AppError::unauthorized("用户名或密码错误"));
+    }
+    let (session, csrf) = create_session(&state).await?;
+    authenticated_response(
+        StatusCode::OK,
+        stored_username,
+        &session,
+        &csrf,
+        use_secure_cookies(&headers, &state),
+    )
+}
+
+async fn logout_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> ApiResult<Response> {
+    require_requested_with(&headers, &state)?;
+    let _body = body.map_err(auth_body_error)?;
+    let session = require_admin(&headers, &state, true).await?;
+    sqlx::query("DELETE FROM admin_sessions WHERE token_hash=?")
+        .bind(session.token_hash)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let secure = use_secure_cookies(&headers, &state);
+    let mut response = Json(serde_json::json!({"ok": true})).into_response();
+    append_cookie(
+        response.headers_mut(),
+        expired_cookie(SESSION_COOKIE, true, secure),
+    )?;
+    append_cookie(
+        response.headers_mut(),
+        expired_cookie(CSRF_COOKIE, false, secure),
+    )?;
+    no_store(&mut response);
+    Ok(response)
 }
 
 async fn get_storage_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<StorageSettingsOutput>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, false).await?;
     Ok(Json(
         state
             .storage
@@ -1216,7 +1967,7 @@ async fn save_storage_settings(
     headers: HeaderMap,
     Json(input): Json<StorageSettingsInput>,
 ) -> ApiResult<Json<StorageSettingsOutput>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     Ok(Json(
         state
             .storage
@@ -1230,7 +1981,7 @@ async fn test_storage_settings(
     headers: HeaderMap,
     Json(input): Json<StorageSettingsInput>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     let _guard = state.storage.gate.read().await;
     state
         .storage
@@ -1260,6 +2011,7 @@ async fn album_detail(
         .ok_or_else(|| AppError {
             status: StatusCode::NOT_FOUND,
             message: "相簿不存在".into(),
+            clear_auth_cookies: None,
         })?;
     let photos = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC")
         .bind(&album_id)
@@ -1276,7 +2028,7 @@ async fn create_album(
     headers: HeaderMap,
     Json(input): Json<NewAlbum>,
 ) -> ApiResult<(StatusCode, Json<Album>)> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     let name = input.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(AppError::bad("相簿名不能为空且不得超过 100 个字符"));
@@ -1316,7 +2068,7 @@ async fn upload_photos(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<Json<Vec<Photo>>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     let _upload_permit = state
         .upload_slots
         .acquire()
@@ -1332,6 +2084,7 @@ async fn upload_photos(
         return Err(AppError {
             status: StatusCode::NOT_FOUND,
             message: "相簿不存在；请先创建相簿".into(),
+            clear_auth_cookies: None,
         });
     }
     // Validate the complete multipart batch before writing anything. A bad file therefore cannot leave a half-visible upload.
@@ -1442,7 +2195,7 @@ async fn photo_file(
     AxumPath(photo_id): AxumPath<String>,
 ) -> ApiResult<Response> {
     let _storage_guard = state.storage.gate.read().await;
-    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE id=?").bind(photo_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "图片不存在".into() })?;
+    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE id=?").bind(photo_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "图片不存在".into(), clear_auth_cookies: None })?;
     let photo = photo_from(&row);
     let data = state
         .storage
@@ -1480,6 +2233,7 @@ async fn photo_thumbnail(
         .ok_or_else(|| AppError {
             status: StatusCode::NOT_FOUND,
             message: "图片不存在".into(),
+            clear_auth_cookies: None,
         })?;
     let data = {
         let _storage_guard = state.storage.gate.read().await;
@@ -1518,7 +2272,7 @@ async fn start_conversion(
     headers: HeaderMap,
     Json(input): Json<ConvertRequest>,
 ) -> ApiResult<(StatusCode, Json<ConversionJob>)> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     let _photo_graph_guard = state.photo_graph_lock.lock().await;
     let target = normalize_format(&input.target_format)
         .ok_or_else(|| AppError::bad("目标格式只能是 PNG、JPG/JPEG 或 WEBP"))?;
@@ -1611,7 +2365,7 @@ async fn list_conversions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<ConversionJob>>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, false).await?;
     let rows = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs ORDER BY created_at DESC LIMIT 100").fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(job_from).collect()))
 }
@@ -1625,8 +2379,8 @@ async fn get_conversion(
     Query(query): Query<JobQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    admin(&headers, &state)?;
-    let row = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs WHERE id=?").bind(&job_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "转换任务不存在".into() })?;
+    require_admin(&headers, &state, false).await?;
+    let row = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs WHERE id=?").bind(&job_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "转换任务不存在".into(), clear_auth_cookies: None })?;
     let items = if query.items.unwrap_or(true) {
         sqlx::query("SELECT i.id,i.source_photo_id,COALESCE(p.original_name,'已删除原图') source_name,i.status,i.target_photo_id,i.error FROM conversion_items i LEFT JOIN photos p ON p.id=i.source_photo_id WHERE i.job_id=? ORDER BY source_name").bind(&job_id).fetch_all(&state.db).await.map_err(AppError::internal)?.iter().map(|r| ConversionItem { id:r.get("id"), source_photo_id:r.get::<Option<String>, _>("source_photo_id").unwrap_or_default(), source_name:r.get("source_name"), status:r.get("status"), target_photo_id:r.get("target_photo_id"), error:r.get("error") }).collect::<Vec<_>>()
     } else {
@@ -1641,7 +2395,7 @@ async fn cancel_conversion(
     AxumPath(job_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     if let Some(token) = state.jobs.get(&job_id) {
         token.cancel();
     } else {
@@ -1654,7 +2408,7 @@ async fn confirm_delete_sources(
     AxumPath(job_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    admin(&headers, &state)?;
+    require_admin(&headers, &state, true).await?;
     let _photo_graph_guard = state.photo_graph_lock.lock().await;
     let _storage_guard = state.storage.gate.read().await;
     let job =
@@ -1666,6 +2420,7 @@ async fn confirm_delete_sources(
             .ok_or_else(|| AppError {
                 status: StatusCode::NOT_FOUND,
                 message: "转换任务不存在".into(),
+                clear_auth_cookies: None,
             })?;
     let status: String = job.get("status");
     let succeeded: i64 = job.get("succeeded");
@@ -2000,7 +2755,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
     let photo_columns: HashSet<String> = sqlx::query("PRAGMA table_info(photos)")
         .fetch_all(pool)
         .await?
@@ -2051,6 +2806,13 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         .await?;
     sqlx::query("UPDATE conversion_items SET status='cancelled',error='服务器重启，任务已安全中断' WHERE status IN ('queued','processing')").execute(pool).await?;
     sqlx::query("UPDATE conversion_jobs SET status='interrupted',completed=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status IN ('succeeded','failed','cancelled')),succeeded=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='succeeded'),failed=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='failed'),cancelled=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='cancelled'),updated_at=? WHERE status IN ('queued','running')").bind(now()).execute(pool).await?;
+    sqlx::query("DELETE FROM admin_sessions WHERE expires_at<=?")
+        .bind(now())
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM admin_sessions WHERE administrator_id=1 AND token_hash NOT IN (SELECT token_hash FROM admin_sessions WHERE administrator_id=1 ORDER BY created_at DESC,rowid DESC LIMIT 16)")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -2061,27 +2823,29 @@ async fn main() -> Result<()> {
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info,tower_http=info".into()))
         .init();
     let config = Config::from_env()?;
-    if config.admin_token == "change-me" || config.admin_token.contains("change-this") {
-        bail!("CF_ADMIN_TOKEN must be set to a strong non-default value before startup");
-    }
-    if let Some(parent) = Path::new(
-        &config
-            .database_url
-            .trim_start_matches("sqlite://")
-            .split('?')
-            .next()
-            .unwrap_or("."),
-    )
-    .parent()
+    if let Some(parent) =
+        database_path(&config.database_url).and_then(|path| path.parent().map(Path::to_path_buf))
     {
         tokio::fs::create_dir_all(parent).await?;
     }
     let db = SqlitePoolOptions::new()
         .max_connections(8)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&config.database_url)
         .await?;
     setup_database(&db).await?;
-    let storage = StorageService::new(db.clone(), &config.admin_token);
+    let master_key = load_or_create_master_key(&config.master_key_file).await?;
+    let storage = StorageService::new(db.clone(), master_key);
     let photo_graph_lock = Arc::new(tokio::sync::Mutex::new(()));
     match recover_pending_blobs(&storage, &db, true).await {
         Ok(count) if count > 0 => info!(count, "recovered pending storage objects"),
@@ -2108,6 +2872,13 @@ async fn main() -> Result<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
+            if let Err(error) = sqlx::query("DELETE FROM admin_sessions WHERE expires_at<=?")
+                .bind(now())
+                .execute(&janitor_db)
+                .await
+            {
+                warn!("expired session cleanup failed: {error:#}");
+            }
             match recover_pending_blobs(&janitor_storage, &janitor_db, false).await {
                 Ok(count) if count > 0 => info!(count, "cleaned pending storage objects"),
                 Ok(_) => {}
@@ -2129,15 +2900,30 @@ async fn main() -> Result<()> {
     let state = AppState {
         db,
         storage,
-        admin_token: Arc::new(config.admin_token),
+        secure_cookies: config.secure_cookies,
+        trust_proxy_headers: config.trust_proxy_headers,
         workers: config.workers,
         jobs: Arc::new(DashMap::new()),
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
     let api = Router::new()
+        .route("/api/auth/status", get(auth_status))
+        .route(
+            "/api/auth/register",
+            post(register_admin).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/auth/login",
+            post(login_admin).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/auth/logout",
+            post(logout_admin).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/settings/storage",
             get(get_storage_settings).put(save_storage_settings),
@@ -2147,7 +2933,9 @@ async fn main() -> Result<()> {
         .route("/api/albums/{album_id}", get(album_detail))
         .route(
             "/api/albums/{album_id}/photos",
-            get(album_photos).post(upload_photos),
+            get(album_photos)
+                .post(upload_photos)
+                .layer(DefaultBodyLimit::max(400 * 1024 * 1024)),
         )
         .route("/api/photos", get(list_photos))
         .route("/api/photos/{photo_id}/file", get(photo_file))
@@ -2163,15 +2951,13 @@ async fn main() -> Result<()> {
             delete(confirm_delete_sources),
         )
         .route("/api", any(api_not_found))
-        .route("/api/{*path}", any(api_not_found))
-        .layer(DefaultBodyLimit::max(400 * 1024 * 1024));
+        .route("/api/{*path}", any(api_not_found));
     let web_dir = PathBuf::from(&config.web_dir);
     let index = web_dir.join("index.html");
     let app = Router::new()
         .merge(api)
         .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")))
         .fallback_service(ServeDir::new(&config.web_dir).fallback(ServeFile::new(index)))
-        .layer(CorsLayer::very_permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let bind_addr = env::var("CF_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -2184,6 +2970,28 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_state() -> AppState {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_database(&db).await.unwrap();
+        AppState {
+            storage: StorageService::new(db.clone(), [7u8; 32]),
+            db,
+            secure_cookies: Some(false),
+            trust_proxy_headers: false,
+            workers: 2,
+            jobs: Arc::new(DashMap::new()),
+            conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            photo_graph_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 
     fn png_fixture(width: u32, height: u32) -> Vec<u8> {
         let image = image::DynamicImage::new_rgb8(width, height);
@@ -2213,6 +3021,195 @@ mod tests {
         assert_eq!((converted.width, converted.height), (321, 123));
         let decoded = image::load_from_memory(&converted.data).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (321, 123));
+    }
+
+    #[test]
+    fn passwords_use_explicit_argon2id_parameters_and_verify() {
+        let encoded = hash_password("a sufficiently long password".into()).unwrap();
+        assert!(encoded.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert!(verify_password("a sufficiently long password".into(), encoded.clone()).unwrap());
+        assert!(!verify_password("a different long password".into(), encoded).unwrap());
+    }
+
+    #[test]
+    fn legacy_master_key_matches_the_previous_token_derivation() {
+        let seed = "legacy-token-used-only-for-storage-migration";
+        let expected = Sha256::digest(seed.as_bytes());
+        assert_eq!(&legacy_storage_key(seed)[..], &expected[..]);
+    }
+
+    #[test]
+    fn administrator_username_rejects_control_characters() {
+        assert!(
+            validate_credentials(CredentialsInput {
+                username: "admin\nspoofed".into(),
+                password: "a sufficiently long password".into(),
+            })
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn administrator_schema_allows_exactly_one_concurrent_winner() {
+        let state = test_state().await;
+        let first = sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,?,?,?) ON CONFLICT(id) DO NOTHING")
+            .bind("first")
+            .bind("hash-one")
+            .bind(now())
+            .execute(&state.db);
+        let second = sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,?,?,?) ON CONFLICT(id) DO NOTHING")
+            .bind("second")
+            .bind("hash-two")
+            .bind(now())
+            .execute(&state.db);
+        let (first, second) = tokio::join!(first, second);
+        let affected = first.unwrap().rows_affected() + second.unwrap().rows_affected();
+        assert_eq!(affected, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM administrators")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(2,'forbidden','hash',?)")
+                .bind(now())
+                .execute(&state.db)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_rejected_and_removed() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,'admin','hash',?)")
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let token = "expired-session-token";
+        sqlx::query("INSERT INTO admin_sessions(token_hash,administrator_id,csrf_hash,created_at,expires_at) VALUES(?,1,?,?,?)")
+            .bind(digest_secret(token))
+            .bind(digest_secret("csrf"))
+            .bind(now() - 10)
+            .bind(now() - 1)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}")).unwrap(),
+        );
+        let error = match require_admin(&headers, &state, false).await {
+            Ok(_) => panic!("expired session was accepted"),
+            Err(error) => error,
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM admin_sessions")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_rotation_uses_compare_and_swap() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,'admin','hash',?)")
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let token_hash = digest_secret("active-session");
+        let old_hash = digest_secret("old-csrf");
+        let first_hash = digest_secret("first-csrf");
+        let second_hash = digest_secret("second-csrf");
+        sqlx::query("INSERT INTO admin_sessions(token_hash,administrator_id,csrf_hash,created_at,expires_at) VALUES(?,1,?,?,?)")
+            .bind(&token_hash)
+            .bind(&old_hash)
+            .bind(now())
+            .bind(now() + 60)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert!(
+            rotate_csrf_if_current(&state.db, &token_hash, &old_hash, &first_hash)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !rotate_csrf_if_current(&state.db, &token_hash, &old_hash, &second_hash)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT csrf_hash FROM admin_sessions WHERE token_hash=?",
+            )
+            .bind(token_hash)
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+            first_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_are_capped_at_the_sixteen_most_recent() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,'admin','hash',?)")
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut newest_token = String::new();
+        for _ in 0..20 {
+            let (token, _) = create_session(&state).await.unwrap();
+            newest_token = token;
+        }
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM admin_sessions")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            16
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM admin_sessions WHERE token_hash=?",)
+                .bind(digest_secret(&newest_token))
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_https_headers_are_ignored_unless_explicitly_trusted() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(!request_is_https(&headers, &state));
+
+        let mut trusted_state = state.clone();
+        trusted_state.trust_proxy_headers = true;
+        assert!(request_is_https(&headers, &trusted_state));
     }
 
     #[tokio::test]

@@ -452,7 +452,7 @@ onBeforeUnmount(clearSensitiveInputs)
           variant="subtle"
           icon="tabler:shield-lock"
           title="敏感字段不会回显"
-          description="后端只返回「是否已设置」；页面不会回填 WebDAV 密码或 S3 Secret Key，也不会将它们写入 sessionStorage 或 URL。"
+          description="后端只返回「是否已设置」；页面不会回填 WebDAV 密码或 S3 Secret Key，也不会将它们写入浏览器存储或 URL。"
         />
       </div>
     </template>
