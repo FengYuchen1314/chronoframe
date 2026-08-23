@@ -57,6 +57,9 @@ export const adaptRustAlbum = (album: RustAlbum, allPhotos: GalleryPhoto[] = [])
     title: album.name?.trim() || album.title?.trim() || `Album ${album.id}`,
     description: '',
     createdAt: asIsoDate(album.createdAt),
+    displayCreatedDate: album.displayCreatedDate?.trim() || null,
+    photoDateStart: album.photoDateStart?.trim() || null,
+    photoDateEnd: album.photoDateEnd?.trim() || null,
     photoCount: Number(album.photoCount) || photos.length,
     photos,
     photoIds: photos.map(photo => photo.id),
@@ -77,6 +80,22 @@ export const formatGalleryDate = (value: string, options: Intl.DateTimeFormatOpt
   const parsed = new Date(value)
   if (Number.isNaN(parsed.getTime()) || parsed.getTime() === 0) return '—'
   return new Intl.DateTimeFormat(undefined, options).format(parsed)
+}
+
+export const formatGalleryCalendarDate = (value: string, options: Intl.DateTimeFormatOptions = { dateStyle: 'medium' }) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!match) return '—'
+
+  const date = new Date(0)
+  date.setUTCHours(0, 0, 0, 0)
+  date.setUTCFullYear(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+  if (
+    date.getUTCFullYear() !== Number(match[1])
+    || date.getUTCMonth() !== Number(match[2]) - 1
+    || date.getUTCDate() !== Number(match[3])
+  ) return '—'
+
+  return new Intl.DateTimeFormat(undefined, { ...options, timeZone: 'UTC' }).format(date)
 }
 
 export const formatBytes = (size: number) => {

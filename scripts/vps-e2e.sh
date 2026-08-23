@@ -521,6 +521,109 @@ auth_curl -sS -D "$RUN_TMP_DIR/preflight.headers" -o /dev/null -X OPTIONS \
   "$BASE/api/albums"
 if grep -qi '^access-control-allow-origin:' "$RUN_TMP_DIR/preflight.headers"; then fail "cross-origin preflight was allowed"; fi
 
+# Album display dates are administrator-only metadata. They remain date-only strings and do not rewrite createdAt.
+date_album_response=$(api -H 'Content-Type: application/json' -d '{"name":"E2E album dates"}' "$BASE/api/albums")
+date_album=$(printf '%s' "$date_album_response" | json_value "['id']")
+date_album_created_at=$(printf '%s' "$date_album_response" | json_value "['createdAt']")
+printf '%s' "$date_album_response" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["displayCreatedDate"] is None and value["photoDateStart"] is None and value["photoDateEnd"] is None, value'
+
+unauthorized_album_patch=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-unauthorized.json" -w '%{http_code}' \
+  -X PATCH -H 'X-Requested-With: ChronoFrame' -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2020-02-29"}' "$BASE/api/albums/$date_album")
+[[ "$unauthorized_album_patch" = 401 ]] || fail "unauthenticated album date PATCH returned HTTP $unauthorized_album_patch"
+missing_csrf_album_patch=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-missing-csrf.json" -w '%{http_code}' \
+  -X PATCH -b "$COOKIE_JAR" -H 'X-Requested-With: ChronoFrame' -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2020-02-29"}' "$BASE/api/albums/$date_album")
+[[ "$missing_csrf_album_patch" = 403 ]] || fail "album date PATCH without CSRF returned HTTP $missing_csrf_album_patch"
+wrong_csrf_album_patch=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-wrong-csrf.json" -w '%{http_code}' \
+  -X PATCH -b "$COOKIE_JAR" -H 'X-Requested-With: ChronoFrame' -H 'X-CSRF-Token: wrong' \
+  -H 'Content-Type: application/json' -d '{"displayCreatedDate":"2020-02-29"}' "$BASE/api/albums/$date_album")
+[[ "$wrong_csrf_album_patch" = 403 ]] || fail "album date PATCH with wrong CSRF returned HTTP $wrong_csrf_album_patch"
+
+partial_album_range=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-partial.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' -d '{"photoDateStart":"2019-01-01"}' "$BASE/api/albums/$date_album")
+[[ "$partial_album_range" = 400 ]] || fail "one-sided album photo range returned HTTP $partial_album_range"
+invalid_album_date=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-invalid.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' -d '{"displayCreatedDate":"2023-02-29"}' "$BASE/api/albums/$date_album")
+[[ "$invalid_album_date" = 400 ]] || fail "invalid calendar date returned HTTP $invalid_album_date"
+reversed_album_range=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-reversed.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"photoDateStart":"2022-12-31","photoDateEnd":"2022-01-01"}' "$BASE/api/albums/$date_album")
+[[ "$reversed_album_range" = 400 ]] || fail "reversed album photo range returned HTTP $reversed_album_range"
+missing_album_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-not-found.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' -d '{"displayCreatedDate":"2020-02-29"}' "$BASE/api/albums/does-not-exist")
+[[ "$missing_album_patch" = 404 ]] || fail "unknown album date PATCH returned HTTP $missing_album_patch"
+
+empty_album_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-empty.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' -d '{}' "$BASE/api/albums/$date_album")
+[[ "$empty_album_patch" = 400 ]] || fail "empty album date PATCH returned HTTP $empty_album_patch"
+unknown_album_field=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-unknown-field.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' -d '{"unknownDate":"2020-01-01"}' "$BASE/api/albums/$date_album")
+[[ "$unknown_album_field" = 422 ]] || fail "unknown album date field returned HTTP $unknown_album_field"
+
+initial_album_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-initial.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2020-02-29","photoDateStart":"2018-03-04","photoDateEnd":"2020-01-02"}' "$BASE/api/albums/$date_album")
+[[ "$initial_album_patch" = 200 ]] || fail "initial valid album dates returned HTTP $initial_album_patch"
+display_only_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-display-only.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2011-12-30"}' "$BASE/api/albums/$date_album")
+[[ "$display_only_patch" = 200 ]] || fail "display-only album date PATCH returned HTTP $display_only_patch"
+range_only_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-range-only.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"photoDateStart":"2001-01-01","photoDateEnd":"2002-02-02"}' "$BASE/api/albums/$date_album")
+[[ "$range_only_patch" = 200 ]] || fail "range-only album date PATCH returned HTTP $range_only_patch"
+clear_display_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-display-cleared.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"   "}' "$BASE/api/albums/$date_album")
+[[ "$clear_display_patch" = 200 ]] || fail "display date clearing returned HTTP $clear_display_patch"
+restore_display_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-display-restored.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2011-12-30"}' "$BASE/api/albums/$date_album")
+[[ "$restore_display_patch" = 200 ]] || fail "display date restore returned HTTP $restore_display_patch"
+clear_range_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-range-cleared.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"photoDateStart":"","photoDateEnd":null}' "$BASE/api/albums/$date_album")
+[[ "$clear_range_patch" = 200 ]] || fail "photo date range clearing returned HTTP $clear_range_patch"
+valid_album_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-valid.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"displayCreatedDate":"2011-12-30","photoDateStart":"2010-01-02","photoDateEnd":"2012-03-04"}' "$BASE/api/albums/$date_album")
+[[ "$valid_album_patch" = 200 ]] || fail "final valid album dates returned HTTP $valid_album_patch"
+curl -fsS --connect-timeout 5 --max-time 30 "$BASE/api/albums" >"$RUN_TMP_DIR/album-date-list.json"
+curl -fsS --connect-timeout 5 --max-time 30 "$BASE/api/albums/$date_album" >"$RUN_TMP_DIR/album-date-detail.json"
+python3 - "$date_album" "$date_album_created_at" \
+  "$RUN_TMP_DIR/album-date-initial.json" "$RUN_TMP_DIR/album-date-display-only.json" \
+  "$RUN_TMP_DIR/album-date-range-only.json" "$RUN_TMP_DIR/album-date-display-cleared.json" \
+  "$RUN_TMP_DIR/album-date-display-restored.json" "$RUN_TMP_DIR/album-date-range-cleared.json" \
+  "$RUN_TMP_DIR/album-date-valid.json" "$RUN_TMP_DIR/album-date-list.json" "$RUN_TMP_DIR/album-date-detail.json" <<'PY'
+import json, sys
+album_id, created_at = sys.argv[1], int(sys.argv[2])
+states = [json.load(open(path)) for path in sys.argv[3:10]]
+expected = [
+    ("2020-02-29", "2018-03-04", "2020-01-02"),
+    ("2011-12-30", "2018-03-04", "2020-01-02"),
+    ("2011-12-30", "2001-01-01", "2002-02-02"),
+    (None, "2001-01-01", "2002-02-02"),
+    ("2011-12-30", "2001-01-01", "2002-02-02"),
+    ("2011-12-30", None, None),
+    ("2011-12-30", "2010-01-02", "2012-03-04"),
+]
+for value, dates in zip(states, expected, strict=True):
+    assert value["id"] == album_id, value
+    assert value["createdAt"] == created_at, value
+    assert (value["displayCreatedDate"], value["photoDateStart"], value["photoDateEnd"]) == dates, value
+listed = next(album for album in json.load(open(sys.argv[10])) if album["id"] == album_id)
+detail = json.load(open(sys.argv[11]))
+for value in (listed, detail):
+    assert value["id"] == album_id, value
+    assert value["createdAt"] == created_at, value
+    assert value["displayCreatedDate"] == "2011-12-30", value
+    assert value["photoDateStart"] == "2010-01-02", value
+    assert value["photoDateEnd"] == "2012-03-04", value
+assert detail["photos"] == [], detail
+PY
+echo "PASS album date authorization, strict validation, tri-state updates, clearing and list/detail persistence"
+
 logout_cookie=$(session_cookie_header)
 auth_cookie_curl -fsS -D "$RUN_TMP_DIR/logout.headers" -X POST "$BASE/api/auth/logout" >"$RUN_TMP_DIR/logout.json"
 python3 - "$RUN_TMP_DIR/logout.headers" <<'PY'

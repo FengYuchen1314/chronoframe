@@ -59,6 +59,9 @@ export interface RustAlbum {
   name?: string | null
   title?: string | null
   createdAt?: number | string | null
+  displayCreatedDate?: string | null
+  photoDateStart?: string | null
+  photoDateEnd?: string | null
   photoCount?: number | null
   photos?: RustPhoto[] | null
 }
@@ -70,6 +73,9 @@ export interface RustAlbumDetailPayload {
   name?: string | null
   title?: string | null
   createdAt?: number | string | null
+  displayCreatedDate?: string | null
+  photoDateStart?: string | null
+  photoDateEnd?: string | null
   photoCount?: number | null
 }
 
@@ -78,6 +84,9 @@ export interface GalleryAlbum {
   title: string
   description: string
   createdAt: string
+  displayCreatedDate: string | null
+  photoDateStart: string | null
+  photoDateEnd: string | null
   photoCount: number
   photos: GalleryPhoto[]
   photoIds: string[]
