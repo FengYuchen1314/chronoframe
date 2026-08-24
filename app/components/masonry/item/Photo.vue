@@ -3,19 +3,9 @@ import type { GalleryPhoto } from '~~/shared/types/photo'
 
 const props = defineProps<{ photo: GalleryPhoto; index: number }>()
 const emit = defineEmits<{ openViewer: [number] }>()
-const loaded = ref(false)
-const source = ref(props.photo.thumbnailUrl)
-
-watch(() => props.photo.thumbnailUrl, value => {
-  source.value = value
-  loaded.value = false
-})
 
 const aspectRatio = computed(() => props.photo.aspectRatio || 1.2)
 const camera = computed(() => [props.photo.exif?.Make, props.photo.exif?.Model].filter(Boolean).join(' '))
-const handleError = () => {
-  if (source.value !== props.photo.originalUrl) source.value = props.photo.originalUrl
-}
 </script>
 
 <template>
@@ -26,16 +16,13 @@ const handleError = () => {
     :aria-label="photo.title || $t('ui.photo.altFallback')"
     @click="emit('openViewer', index)"
   >
-    <div v-if="!loaded" class="absolute inset-0 animate-pulse bg-neutral-200 dark:bg-neutral-800" />
-    <img
-      :src="source"
+    <PhotoProgressiveImage
+      :src="photo.thumbnailUrl"
+      :fallback-src="photo.originalUrl"
       :alt="photo.title"
       loading="lazy"
-      decoding="async"
-      class="absolute inset-0 h-full w-full object-cover transition duration-500 group-hover:scale-[1.035]"
-      :class="loaded ? 'opacity-100' : 'opacity-0'"
-      @load="loaded = true"
-      @error="handleError"
+      fit="cover"
+      class="absolute inset-0 h-full w-full transition-transform duration-500 group-hover:scale-[1.035]"
     />
     <div class="absolute inset-0 bg-black/0 transition-colors duration-300 group-hover:bg-black/15" />
     <div class="absolute inset-x-0 bottom-0 translate-y-full bg-linear-to-t from-black/70 to-transparent p-3 pt-12 text-white opacity-0 transition duration-300 group-hover:translate-y-0 group-hover:opacity-100">

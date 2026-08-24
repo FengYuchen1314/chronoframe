@@ -44,11 +44,14 @@ useHead({ title: t('title.albums') })
         <div v-for="(column, columnIndex) in columns" :key="columnIndex" class="relative flex-1 overflow-hidden">
           <div class="flex flex-col" :class="columnIndex % 2 ? 'animate-scroll-up' : 'animate-scroll-down'" :style="{ animationDuration: `${72 + columnIndex * 7}s` }">
             <template v-for="copy in 3" :key="copy">
-              <img
+              <PhotoProgressiveImage
                 v-for="photo in column"
                 :key="`${copy}-${photo.id}`"
                 :src="photo.thumbnailUrl"
                 :alt="photo.title"
+                loading="lazy"
+                fetch-priority="low"
+                fit="cover"
                 class="w-full object-cover saturate-50"
                 :style="{ aspectRatio: photo.aspectRatio || 1 }"
               />
@@ -92,7 +95,7 @@ useHead({ title: t('title.albums') })
               :transition="{ type: 'spring', stiffness: 300, damping: 30, mass: 0.8 }"
               :style="{ zIndex: 3 - index }"
             >
-              <img :src="photo.thumbnailUrl" :alt="album.title" class="h-full w-full object-cover" loading="lazy" decoding="async" />
+              <PhotoProgressiveImage :src="photo.thumbnailUrl" :alt="album.title" class="h-full w-full" loading="lazy" fit="cover" />
               <motion.div v-if="index > 0" class="absolute inset-0 bg-black/15" :animate="{ opacity: hoveredAlbum === album.id ? 0 : 1 }" />
             </motion.div>
 

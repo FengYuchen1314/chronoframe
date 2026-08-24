@@ -47,7 +47,7 @@ onBeforeUnmount(() => container.value?.removeEventListener('wheel', onWheel))
         :aria-label="photo.title || $t('ui.photo.altFallback')"
         @click="emit('indexChange', index)"
       >
-        <img :src="photo.thumbnailUrl" :alt="photo.title || $t('ui.photo.altFallback')" class="absolute inset-0 h-full w-full object-cover" loading="lazy" />
+        <PhotoProgressiveImage :src="photo.thumbnailUrl" :alt="photo.title || $t('ui.photo.altFallback')" class="absolute inset-0 h-full w-full" loading="lazy" fit="cover" />
       </button>
     </div>
   </motion.div>
