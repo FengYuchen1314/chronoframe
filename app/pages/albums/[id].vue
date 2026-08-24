@@ -58,7 +58,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
 
     <template v-else-if="album">
       <div v-if="cover" class="absolute inset-x-0 top-0 -z-10 h-[320px] overflow-hidden sm:h-[500px]">
-        <img :src="cover.thumbnailUrl" :alt="album.title" class="h-full w-full scale-110 object-cover opacity-40 saturate-150 dark:opacity-20" />
+        <PhotoProgressiveImage :src="cover.thumbnailUrl" :alt="album.title" loading="eager" fetch-priority="high" fit="cover" class="h-full w-full scale-110 opacity-40 saturate-150 dark:opacity-20" />
         <div class="absolute -inset-1 bg-linear-to-b from-transparent via-white/50 to-white backdrop-blur-xl sm:backdrop-blur-2xl dark:via-neutral-900/50 dark:to-neutral-900" />
       </div>
 
