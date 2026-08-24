@@ -65,7 +65,7 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 
 <template>
   <div class="relative w-full">
-    <div class="p-1" :class="isMobile && 'pt-2'">
+    <div class="p-0.5 sm:p-1" :class="isMobile && 'pt-2'">
       <div
         ref="masonryWrapper"
         class="relative"
@@ -109,7 +109,7 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 
     <motion.div
       v-if="showTop"
-      class="fixed bottom-6 right-6 z-40"
+      class="masonry-back-to-top fixed right-4 z-40 sm:right-6"
       :initial="{ opacity: 0, scale: 0.8 }"
       :animate="{ opacity: 1, scale: 1 }"
     >
@@ -123,4 +123,5 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 .masonry-header-desktop { left: 0; position: absolute; top: 0; }
 .masonry-wall-with-header :deep(.masonry-column:first-child) { padding-top: var(--masonry-header-offset, 0px); }
 .masonry-wall-with-header :deep(.masonry-column:first-child .masonry-item:first-child) { margin-top: 0; }
+.masonry-back-to-top { bottom: max(1rem, env(safe-area-inset-bottom)); }
 </style>

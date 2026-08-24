@@ -18,19 +18,30 @@ const refresh = async () => { await refreshPhotos() }
 
 const viewer = useViewerState()
 const viewerPhotos = computed(() => viewer.scopedPhotos.value ?? photos.value)
+const viewerClosing = ref(false)
 
 const handleIndexChange = (index: number) => {
+  if (viewerClosing.value) return
   const photo = viewerPhotos.value[index]
   if (!photo) return
   viewer.switchToIndex(index)
   router.replace(`/${photo.id}`)
 }
 
-const handleClose = () => {
+const handleClose = async () => {
+  if (viewerClosing.value) return
+  viewerClosing.value = true
   const destination = viewer.returnRoute.value || '/photos'
-  viewer.closeViewer()
-  viewer.clearViewerContext()
-  router.replace(destination)
+  try {
+    // Keep the scoped photo list alive until the photo route has gone away.
+    // Clearing it first lets [photoId].vue observe a different list and reopen
+    // the viewer, which made the close button appear to require two clicks.
+    await router.replace(destination)
+  } finally {
+    viewer.closeViewer()
+    viewer.clearViewerContext()
+    viewerClosing.value = false
+  }
 }
 
 watch(
