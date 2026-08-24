@@ -21,7 +21,7 @@ const handleError = () => {
 <template>
   <button
     type="button"
-    class="group relative block w-full cursor-zoom-in overflow-hidden bg-neutral-200 text-left dark:bg-neutral-800"
+    class="group relative block w-full touch-manipulation cursor-zoom-in overflow-hidden bg-neutral-200 text-left transition-opacity active:opacity-80 dark:bg-neutral-800"
     :style="{ aspectRatio }"
     :aria-label="photo.title || $t('ui.photo.altFallback')"
     @click="emit('openViewer', index)"

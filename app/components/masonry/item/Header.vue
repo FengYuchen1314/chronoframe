@@ -24,11 +24,11 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
     />
     <div class="absolute inset-0 -z-10 bg-white/50 dark:bg-neutral-900/50" />
 
-    <div class="flex flex-col items-center gap-2 pb-0 pt-6">
-      <a href="/dashboard" class="group flex flex-col items-center gap-2" :aria-label="t('title.dashboard')">
-        <img :src="config.public.app.avatarUrl" class="size-16 rounded-full object-cover shadow-sm transition-transform group-hover:scale-105" :alt="t('ui.photo.avatarAlt')" />
+    <div class="flex flex-col items-center gap-2 pb-0 pt-4 sm:pt-6">
+      <NuxtLink to="/" class="group flex flex-col items-center gap-2" :aria-label="t('title.albums')">
+        <img :src="config.public.app.avatarUrl" class="size-14 rounded-full object-cover shadow-sm transition-transform group-hover:scale-105 sm:size-16" :alt="t('ui.photo.avatarAlt')" />
         <h1 class="mb-2 text-2xl font-bold text-neutral-900 dark:text-white/90">{{ config.public.app.title }}</h1>
-      </a>
+      </NuxtLink>
 
       <div class="space-y-1 text-center text-neutral-600 dark:text-white/35">
         <p class="text-xs font-medium">
@@ -38,15 +38,15 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
         <p v-if="config.public.app.slogan" class="font-[Pacifico]">{{ config.public.app.slogan }}</p>
       </div>
 
-      <nav class="flex items-center gap-0 rounded-full bg-white/35 p-1 dark:bg-neutral-900/50" :aria-label="t('title.gallery')">
+      <nav class="flex max-w-full items-center gap-0 rounded-full bg-white/35 p-1 dark:bg-neutral-900/50" :aria-label="t('title.gallery')">
         <UTooltip :text="t('title.albums')">
-          <UButton to="/" icon="tabler:photo" color="neutral" variant="soft" size="sm" class="cursor-pointer rounded-full bg-transparent" />
+          <UButton to="/" icon="tabler:photo" color="neutral" variant="soft" size="sm" class="min-h-11 min-w-11 cursor-pointer rounded-full bg-transparent sm:min-h-8 sm:min-w-8" />
         </UTooltip>
 
         <UPopover>
           <UTooltip :text="t('ui.action.filter.tooltip')">
             <UChip inset size="sm" color="info" :show="selectedFilterCount > 0">
-              <UButton icon="tabler:filter" :color="hasActiveFilters ? 'info' : 'neutral'" variant="soft" size="sm" class="cursor-pointer rounded-full bg-transparent" />
+              <UButton icon="tabler:filter" :color="hasActiveFilters ? 'info' : 'neutral'" variant="soft" size="sm" class="min-h-11 min-w-11 cursor-pointer rounded-full bg-transparent sm:min-h-8 sm:min-w-8" />
             </UChip>
           </UTooltip>
           <template #content>
@@ -58,7 +58,7 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
 
         <UPopover>
           <UTooltip :text="t('ui.action.sort.tooltip')">
-            <UButton :icon="currentSortIcon" :color="currentSortOption?.key === 'dateTaken-desc' ? 'neutral' : 'info'" variant="soft" size="sm" class="cursor-pointer rounded-full bg-transparent" />
+            <UButton :icon="currentSortIcon" :color="currentSortOption?.key === 'dateTaken-desc' ? 'neutral' : 'info'" variant="soft" size="sm" class="min-h-11 min-w-11 cursor-pointer rounded-full bg-transparent sm:min-h-8 sm:min-w-8" />
           </UTooltip>
           <template #content>
             <UCard variant="glassmorphism" class="w-64 border-white/40 bg-white/90 shadow-xl backdrop-blur-2xl dark:border-white/10 dark:bg-neutral-900/90">
@@ -79,14 +79,14 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
         </UPopover>
 
         <UTooltip :text="t('ui.action.theme.tooltip')">
-          <UButton :icon="isDark ? 'tabler:sun' : 'tabler:moon'" color="neutral" variant="soft" size="sm" class="cursor-pointer rounded-full bg-transparent" @click="isDark = !isDark" />
+          <UButton :icon="isDark ? 'tabler:sun' : 'tabler:moon'" color="neutral" variant="soft" size="sm" class="min-h-11 min-w-11 cursor-pointer rounded-full bg-transparent sm:min-h-8 sm:min-w-8" @click="isDark = !isDark" />
         </UTooltip>
         <UTooltip :text="t('ui.action.dashboard.tooltip')">
-          <UButton href="/dashboard" external icon="tabler:dashboard" color="info" variant="soft" size="sm" class="cursor-pointer rounded-full bg-transparent" />
+          <UButton href="/dashboard" external icon="tabler:dashboard" color="info" variant="soft" size="sm" class="min-h-11 min-w-11 cursor-pointer rounded-full bg-transparent sm:min-h-8 sm:min-w-8" />
         </UTooltip>
       </nav>
 
-      <footer class="mt-1 flex w-full items-center justify-between gap-2 bg-neutral-200/50 px-2 py-1.5 text-xs font-medium text-neutral-500 dark:bg-neutral-900/50">
+      <footer class="mt-1 flex w-full items-center justify-between gap-2 bg-neutral-200/50 px-3 py-2 text-xs font-medium text-neutral-500 sm:px-2 sm:py-1.5 dark:bg-neutral-900/50">
         <span class="truncate">© {{ new Date().getFullYear() }} {{ config.public.app.author || config.public.app.title }}</span>
         <a
           href="https://github.com/HoshinoSuzumi/chronoframe"

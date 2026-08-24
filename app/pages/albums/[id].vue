@@ -57,19 +57,19 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
     <div v-if="status === 'idle' || status === 'pending'" class="grid min-h-[60vh] place-items-center"><Icon name="tabler:loader-2" class="size-8 animate-spin text-primary" /></div>
 
     <template v-else-if="album">
-      <div v-if="cover" class="absolute inset-x-0 top-0 -z-10 h-[500px] overflow-hidden">
+      <div v-if="cover" class="absolute inset-x-0 top-0 -z-10 h-[320px] overflow-hidden sm:h-[500px]">
         <img :src="cover.thumbnailUrl" :alt="album.title" class="h-full w-full scale-110 object-cover opacity-40 saturate-150 dark:opacity-20" />
         <div class="absolute -inset-1 bg-linear-to-b from-transparent via-white/50 to-white backdrop-blur-xl sm:backdrop-blur-2xl dark:via-neutral-900/50 dark:to-neutral-900" />
       </div>
 
-      <div class="container mx-auto px-4 pt-4 sm:px-6 lg:px-8">
-        <UButton to="/albums" icon="tabler:arrow-left" color="neutral" variant="ghost" size="sm" />
+      <div class="album-detail-safe-top container mx-auto px-3 sm:px-6 lg:px-8">
+        <UButton to="/albums" icon="tabler:arrow-left" color="neutral" variant="ghost" size="md" class="min-h-11 min-w-11" />
       </div>
 
-      <section class="container mx-auto px-4 py-8 sm:px-6 lg:px-8">
+      <section class="container mx-auto px-4 pb-5 pt-6 sm:px-6 sm:py-8 lg:px-8">
         <motion.div :initial="{ opacity: 0, y: 10 }" :animate="{ opacity: 1, y: 0 }" :transition="{ duration: 0.4 }" class="flex flex-col gap-5">
-          <h1 class="text-3xl font-bold tracking-tight text-neutral-900 sm:text-4xl dark:text-white">{{ album.title }}</h1>
-          <div class="flex flex-wrap items-center gap-4 text-sm text-neutral-600 dark:text-neutral-300">
+          <h1 class="text-2xl font-bold tracking-tight text-neutral-900 sm:text-4xl dark:text-white">{{ album.title }}</h1>
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-neutral-600 dark:text-neutral-300">
             <span class="flex items-center gap-1"><Icon name="tabler:photo" class="size-4 text-neutral-400" />{{ t('album.photo', album.photoCount) }}</span>
             <span v-if="dateRange" class="flex items-center gap-1"><Icon name="tabler:calendar" class="size-4 text-neutral-400" />{{ dateRange }}</span>
             <span class="flex items-center gap-1"><Icon name="tabler:clock-plus" class="size-4 text-neutral-400" />{{ createdDate }}</span>
@@ -77,7 +77,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
         </motion.div>
       </section>
 
-      <section class="container mx-auto px-1 py-8 sm:px-4 lg:px-8">
+      <section class="container mx-auto px-0.5 pb-10 pt-5 sm:px-4 sm:py-8 lg:px-8">
         <div v-if="!items.length" class="grid min-h-64 place-items-center text-center text-neutral-500"><div><Icon name="tabler:library-photo" class="mx-auto mb-3 size-14" /><p>{{ t('album.emptyAlbumTitle') }}</p></div></div>
         <MasonryWall
           v-else
@@ -100,8 +100,13 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
       <div><Icon name="tabler:alert-circle" class="mx-auto mb-4 size-14 text-red-400" /><h1 class="text-2xl font-semibold">{{ t('album.failedToLoadTitle') }}</h1><UButton to="/albums" class="mt-6" :label="t('album.backToAlbums')" /></div>
     </div>
 
-    <motion.div v-if="showTop" class="fixed bottom-6 right-6 z-40" :initial="{ opacity: 0, scale: 0.8 }" :animate="{ opacity: 1, scale: 1 }">
+    <motion.div v-if="showTop" class="album-back-to-top fixed right-4 z-40 sm:right-6" :initial="{ opacity: 0, scale: 0.8 }" :animate="{ opacity: 1, scale: 1 }">
       <UButton icon="tabler:arrow-up" color="neutral" variant="soft" size="lg" class="rounded-full bg-white/80 shadow-lg backdrop-blur dark:bg-neutral-900/80" @click="scrollToTop" />
     </motion.div>
   </main>
 </template>
+
+<style scoped>
+.album-detail-safe-top { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+.album-back-to-top { bottom: max(1rem, env(safe-area-inset-bottom)); }
+</style>
