@@ -1038,10 +1038,12 @@ impl StorageService {
 struct Album {
     id: String,
     name: String,
+    description: String,
     created_at: i64,
     display_created_date: Option<String>,
     photo_date_start: Option<String>,
     photo_date_end: Option<String>,
+    position: i64,
     photo_count: i64,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -1095,10 +1097,12 @@ fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
     Album {
         id: row.get("id"),
         name: row.get("name"),
+        description: row.get("description"),
         created_at: row.get("created_at"),
         display_created_date: row.get("display_created_date"),
         photo_date_start: row.get("photo_date_start"),
         photo_date_end: row.get("photo_date_end"),
+        position: row.get("position"),
         photo_count: row.get("photo_count"),
     }
 }
@@ -1958,8 +1962,11 @@ async fn test_storage_settings(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NewAlbum {
     name: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1980,13 +1987,29 @@ impl<'de> Deserialize<'de> for PatchString {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AlbumDatePatch {
+struct AlbumPatch {
+    #[serde(default)]
+    description: PatchString,
     #[serde(default)]
     display_created_date: PatchString,
     #[serde(default)]
     photo_date_start: PatchString,
     #[serde(default)]
     photo_date_end: PatchString,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlbumOrderInput {
+    album_ids: Vec<String>,
+}
+
+fn normalize_album_description(value: Option<String>) -> ApiResult<String> {
+    let description = value.unwrap_or_default().trim().to_string();
+    if description.chars().count() > 1000 {
+        return Err(AppError::bad("相簿简介不得超过 1000 个字符"));
+    }
+    Ok(description)
 }
 
 fn is_valid_album_date(value: &str) -> bool {
@@ -2045,14 +2068,14 @@ fn validate_photo_date_range(start: &Option<String>, end: &Option<String>) -> Ap
 }
 
 async fn list_albums(State(state): State<AppState>) -> ApiResult<Json<Vec<Album>>> {
-    let rows = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.created_at DESC").fetch_all(&state.db).await.map_err(AppError::internal)?;
+    let rows = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.position ASC,a.created_at DESC,a.id ASC").fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(album_from).collect()))
 }
 async fn album_detail(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
 ) -> ApiResult<Json<AlbumDetail>> {
-    let row = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
+    let row = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
         .bind(&album_id)
         .fetch_optional(&state.db)
         .await
@@ -2082,44 +2105,79 @@ async fn create_album(
     if name.is_empty() || name.chars().count() > 100 {
         return Err(AppError::bad("相簿名不能为空且不得超过 100 个字符"));
     }
+    let description = normalize_album_description(input.description)?;
+    let position: i64 = sqlx::query_scalar("SELECT COALESCE(MIN(position),0)-1 FROM albums")
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
     let album = Album {
         id: Uuid::new_v4().to_string(),
         name: name.into(),
+        description,
         created_at: now(),
         display_created_date: None,
         photo_date_start: None,
         photo_date_end: None,
+        position,
         photo_count: 0,
     };
-    sqlx::query("INSERT INTO albums(id,name,created_at) VALUES(?,?,?)")
+    sqlx::query("INSERT INTO albums(id,name,description,created_at,position) VALUES(?,?,?,?,?)")
         .bind(&album.id)
         .bind(&album.name)
+        .bind(&album.description)
         .bind(album.created_at)
+        .bind(album.position)
         .execute(&state.db)
         .await
         .map_err(AppError::internal)?;
     Ok((StatusCode::CREATED, Json(album)))
 }
 
-async fn patch_album_dates(
+async fn patch_album(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
     headers: HeaderMap,
-    Json(input): Json<AlbumDatePatch>,
+    Json(input): Json<AlbumPatch>,
 ) -> ApiResult<Json<Album>> {
     require_admin(&headers, &state, true).await?;
 
-    let display_created_date = match input.display_created_date {
-        PatchString::Missing => None,
-        PatchString::Present(value) => Some(normalize_album_date(value, "展示创建日期")?),
+    let current = sqlx::query("SELECT description,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id=?")
+        .bind(&album_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "相簿不存在".into(),
+            clear_auth_cookies: None,
+        })?;
+
+    let mut changed = false;
+    let description = match input.description {
+        PatchString::Missing => current.get::<String, _>("description"),
+        PatchString::Present(value) => {
+            changed = true;
+            normalize_album_description(value)?
+        }
     };
-    let photo_date_range = match (input.photo_date_start, input.photo_date_end) {
-        (PatchString::Missing, PatchString::Missing) => None,
+    let display_created_date = match input.display_created_date {
+        PatchString::Missing => current.get::<Option<String>, _>("display_created_date"),
+        PatchString::Present(value) => {
+            changed = true;
+            normalize_album_date(value, "展示创建日期")?
+        }
+    };
+    let (photo_date_start, photo_date_end) = match (input.photo_date_start, input.photo_date_end) {
+        (PatchString::Missing, PatchString::Missing) => (
+            current.get::<Option<String>, _>("photo_date_start"),
+            current.get::<Option<String>, _>("photo_date_end"),
+        ),
         (PatchString::Present(start), PatchString::Present(end)) => {
             let start = normalize_album_date(start, "图片开始日期")?;
             let end = normalize_album_date(end, "图片结束日期")?;
             validate_photo_date_range(&start, &end)?;
-            Some((start, end))
+            changed = true;
+            (start, end)
         }
         _ => {
             return Err(AppError::bad(
@@ -2127,51 +2185,58 @@ async fn patch_album_dates(
             ));
         }
     };
+    if !changed {
+        return Err(AppError::bad("至少需要提供一个相簿字段"));
+    }
 
-    let result = match (display_created_date, photo_date_range) {
-        (Some(display_created_date), Some((photo_date_start, photo_date_end))) => {
-            sqlx::query("UPDATE albums SET display_created_date=?,photo_date_start=?,photo_date_end=? WHERE id=?")
-                .bind(display_created_date)
-                .bind(photo_date_start)
-                .bind(photo_date_end)
-                .bind(&album_id)
-                .execute(&state.db)
-                .await
-                .map_err(AppError::internal)?
-        }
-        (Some(display_created_date), None) => sqlx::query(
-            "UPDATE albums SET display_created_date=? WHERE id=?",
-        )
+    sqlx::query("UPDATE albums SET description=?,display_created_date=?,photo_date_start=?,photo_date_end=? WHERE id=?")
+        .bind(description)
         .bind(display_created_date)
-        .bind(&album_id)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::internal)?,
-        (None, Some((photo_date_start, photo_date_end))) => sqlx::query(
-            "UPDATE albums SET photo_date_start=?,photo_date_end=? WHERE id=?",
-        )
         .bind(photo_date_start)
         .bind(photo_date_end)
         .bind(&album_id)
         .execute(&state.db)
         .await
-        .map_err(AppError::internal)?,
-        (None, None) => return Err(AppError::bad("至少需要提供一个日期字段")),
-    };
-    if result.rows_affected() == 0 {
-        return Err(AppError {
-            status: StatusCode::NOT_FOUND,
-            message: "相簿不存在".into(),
-            clear_auth_cookies: None,
-        });
-    }
+        .map_err(AppError::internal)?;
 
-    let row = sqlx::query("SELECT a.id,a.name,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
+    let row = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
         .bind(&album_id)
         .fetch_one(&state.db)
         .await
         .map_err(AppError::internal)?;
     Ok(Json(album_from(&row)))
+}
+
+async fn reorder_albums(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AlbumOrderInput>,
+) -> ApiResult<Json<Vec<Album>>> {
+    require_admin(&headers, &state, true).await?;
+    let current_ids = sqlx::query_scalar::<_, String>("SELECT id FROM albums")
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let requested = input.album_ids.iter().cloned().collect::<HashSet<_>>();
+    let current = current_ids.iter().cloned().collect::<HashSet<_>>();
+    if requested.len() != input.album_ids.len()
+        || requested.len() != current.len()
+        || requested != current
+    {
+        return Err(AppError::bad("相簿顺序必须完整包含当前所有相簿且不得重复"));
+    }
+
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    for (position, album_id) in input.album_ids.iter().enumerate() {
+        sqlx::query("UPDATE albums SET position=? WHERE id=?")
+            .bind(position as i64)
+            .bind(album_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    list_albums(State(state)).await
 }
 async fn album_photos(
     State(state): State<AppState>,
@@ -2880,7 +2945,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -2888,6 +2953,10 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         .map(|row| row.get("name"))
         .collect();
     for (column, migration) in [
+        (
+            "description",
+            "ALTER TABLE albums ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        ),
         (
             "display_created_date",
             "ALTER TABLE albums ADD COLUMN display_created_date TEXT",
@@ -2900,10 +2969,19 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
             "photo_date_end",
             "ALTER TABLE albums ADD COLUMN photo_date_end TEXT",
         ),
+        (
+            "position",
+            "ALTER TABLE albums ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if !album_columns.contains(column) {
             sqlx::query(migration).execute(pool).await?;
         }
+    }
+    if !album_columns.contains("position") {
+        sqlx::query("WITH ranked AS (SELECT id,ROW_NUMBER() OVER (ORDER BY created_at DESC,id ASC)-1 AS new_position FROM albums) UPDATE albums SET position=(SELECT new_position FROM ranked WHERE ranked.id=albums.id)")
+            .execute(pool)
+            .await?;
     }
     let photo_columns: HashSet<String> = sqlx::query("PRAGMA table_info(photos)")
         .fetch_all(pool)
@@ -3079,9 +3157,10 @@ async fn main() -> Result<()> {
         )
         .route("/api/settings/storage/test", post(test_storage_settings))
         .route("/api/albums", get(list_albums).post(create_album))
+        .route("/api/albums/order", post(reorder_albums))
         .route(
             "/api/albums/{album_id}",
-            get(album_detail).patch(patch_album_dates),
+            get(album_detail).patch(patch_album),
         )
         .route(
             "/api/albums/{album_id}/photos",
@@ -3372,10 +3451,7 @@ mod tests {
             "https://another-proxy.example:8443",
         ] {
             let mut headers = HeaderMap::new();
-            headers.insert(
-                "x-requested-with",
-                HeaderValue::from_static(REQUESTED_WITH),
-            );
+            headers.insert("x-requested-with", HeaderValue::from_static(REQUESTED_WITH));
             headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
             headers.insert(header::HOST, HeaderValue::from_static("chronoframe:8080"));
             assert!(require_requested_with(&headers).is_ok(), "origin: {origin}");
@@ -3432,26 +3508,39 @@ mod tests {
         assert!(validate_photo_date_range(&end, &start).is_err());
     }
 
+    #[test]
+    fn album_description_is_trimmed_and_bounded() {
+        assert_eq!(normalize_album_description(None).unwrap(), "");
+        assert_eq!(
+            normalize_album_description(Some("  一段简介\n".into())).unwrap(),
+            "一段简介"
+        );
+        assert!(normalize_album_description(Some("介".repeat(1000))).is_ok());
+        assert!(normalize_album_description(Some("介".repeat(1001))).is_err());
+    }
+
     #[tokio::test]
-    async fn setup_database_adds_album_date_metadata_without_losing_rows() {
+    async fn setup_database_adds_album_metadata_without_losing_rows() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); INSERT INTO albums(id,name,created_at) VALUES('legacy-album','Legacy Album',12345);")
+        sqlx::query("CREATE TABLE albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL); INSERT INTO albums(id,name,created_at) VALUES('legacy-album','Legacy Album',12345),('newer-album','Newer Album',23456);")
             .execute(&pool)
             .await
             .unwrap();
 
         setup_database(&pool).await.unwrap();
 
-        let legacy = sqlx::query("SELECT name,created_at,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id='legacy-album'")
+        let legacy = sqlx::query("SELECT name,description,created_at,display_created_date,photo_date_start,photo_date_end,position FROM albums WHERE id='legacy-album'")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(legacy.get::<String, _>("name"), "Legacy Album");
+        assert_eq!(legacy.get::<String, _>("description"), "");
         assert_eq!(legacy.get::<i64, _>("created_at"), 12345);
+        assert_eq!(legacy.get::<i64, _>("position"), 1);
         assert_eq!(
             legacy.get::<Option<String>, _>("display_created_date"),
             None
@@ -3459,18 +3548,30 @@ mod tests {
         assert_eq!(legacy.get::<Option<String>, _>("photo_date_start"), None);
         assert_eq!(legacy.get::<Option<String>, _>("photo_date_end"), None);
 
-        sqlx::query("UPDATE albums SET display_created_date='2020-01-02',photo_date_start='2019-01-01',photo_date_end='2020-01-01' WHERE id='legacy-album'")
+        let newer_position: i64 =
+            sqlx::query_scalar("SELECT position FROM albums WHERE id='newer-album'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(newer_position, 0);
+
+        sqlx::query("UPDATE albums SET description='Legacy description',display_created_date='2020-01-02',photo_date_start='2019-01-01',photo_date_end='2020-01-01' WHERE id='legacy-album'")
             .execute(&pool)
             .await
             .unwrap();
         setup_database(&pool).await.unwrap();
 
-        let migrated = sqlx::query("SELECT name,created_at,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id='legacy-album'")
+        let migrated = sqlx::query("SELECT name,description,created_at,display_created_date,photo_date_start,photo_date_end,position FROM albums WHERE id='legacy-album'")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(migrated.get::<String, _>("name"), "Legacy Album");
+        assert_eq!(
+            migrated.get::<String, _>("description"),
+            "Legacy description"
+        );
         assert_eq!(migrated.get::<i64, _>("created_at"), 12345);
+        assert_eq!(migrated.get::<i64, _>("position"), 1);
         assert_eq!(
             migrated
                 .get::<Option<String>, _>("display_created_date")
@@ -3489,7 +3590,7 @@ mod tests {
                 .as_deref(),
             Some("2020-01-01")
         );
-        let date_columns = sqlx::query("PRAGMA table_info(albums)")
+        let metadata_columns = sqlx::query("PRAGMA table_info(albums)")
             .fetch_all(&pool)
             .await
             .unwrap()
@@ -3497,11 +3598,15 @@ mod tests {
             .filter(|column| {
                 matches!(
                     column.get::<String, _>("name").as_str(),
-                    "display_created_date" | "photo_date_start" | "photo_date_end"
+                    "description"
+                        | "display_created_date"
+                        | "photo_date_start"
+                        | "photo_date_end"
+                        | "position"
                 )
             })
             .count();
-        assert_eq!(date_columns, 3);
+        assert_eq!(metadata_columns, 5);
     }
 
     #[tokio::test]

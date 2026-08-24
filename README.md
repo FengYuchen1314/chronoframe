@@ -6,7 +6,7 @@
 - `backend/`：Rust + Axum + SQLite API
 - 存储：本地磁盘、WebDAV 或 S3 兼容对象存储
 
-公共端恢复原版的相簿动效主页、照片瀑布流、标签/相机/镜头/城市/评分筛选、排序、相簿详情和沉浸式查看器；地图、Globe 和地图管理功能不再存在。默认 `/` 直接展示相簿空间，全图瀑布流位于 `/photos`。上传严格遵循相簿优先的数据规则：管理员必须先创建相簿，之后才能向其中上传图片。
+公共端恢复原版的相簿动效主页、照片瀑布流、标签/相机/镜头/城市/评分筛选、排序、相簿详情和沉浸式查看器；地图、Globe 和地图管理功能不再存在。默认 `/` 直接展示相簿空间，全图瀑布流位于 `/photos`。上传严格遵循相簿优先的数据规则：管理员必须先创建相簿，之后才能向其中上传图片。管理员还可以维护公开相簿简介、显示日期和相簿前后顺序。
 
 ## 单文件部署
 
@@ -106,7 +106,8 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `GET/PUT /api/settings/storage` — 管理员读取或保存存储后端设置
 - `POST /api/settings/storage/test` — 在不保存的情况下测试候选存储
 - `GET/POST /api/albums`
-- `GET /api/albums/:album_id` — 相簿详情及其中的图片
+- `POST /api/albums/order` — 提交包含全部当前相簿 ID 的新顺序
+- `GET/PATCH /api/albums/:album_id` — 相簿详情及其中的图片，或修改简介和显示日期
 - `GET/POST /api/albums/:album_id/photos`
 - `GET /api/photos` — 按创建时间倒序列出图片
 - `GET /api/photos/:photo_id/file`、`GET /api/photos/:photo_id/thumbnail`
