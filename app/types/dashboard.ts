@@ -5,10 +5,12 @@ export type ImageTargetFormat = 'png' | 'jpg' | 'jpeg' | 'webp'
 export interface Album {
   id: string
   name: string
+  description: string
   createdAt: number
   displayCreatedDate: string | null
   photoDateStart: string | null
   photoDateEnd: string | null
+  position: number
   photoCount: number
 }
 

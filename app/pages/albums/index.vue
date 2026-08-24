@@ -107,7 +107,8 @@ useHead({ title: t('title.albums') })
               <h2 class="min-w-0 flex-1 truncate text-lg font-semibold text-neutral-800 transition-colors group-hover:text-primary-600 dark:text-neutral-200 dark:group-hover:text-primary-400">{{ album.title }}</h2>
               <span class="flex shrink-0 items-center gap-1 text-sm text-neutral-500"><Icon name="tabler:photo" class="size-4" />{{ t('album.photo', album.photoCount) }}</span>
             </div>
-            <p class="mt-1 text-sm text-neutral-500">{{ album.displayCreatedDate ? formatGalleryCalendarDate(album.displayCreatedDate) : formatGalleryDate(album.createdAt) }}</p>
+            <p v-if="album.description" class="mt-1 line-clamp-2 text-sm leading-relaxed text-neutral-600 dark:text-neutral-400">{{ album.description }}</p>
+            <p class="mt-1.5 text-sm text-neutral-500">{{ album.displayCreatedDate ? formatGalleryCalendarDate(album.displayCreatedDate) : formatGalleryDate(album.createdAt) }}</p>
           </div>
         </NuxtLink>
       </div>

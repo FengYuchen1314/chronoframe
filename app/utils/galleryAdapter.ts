@@ -55,11 +55,12 @@ export const adaptRustAlbum = (album: RustAlbum, allPhotos: GalleryPhoto[] = [])
   return {
     id: String(album.id),
     title: album.name?.trim() || album.title?.trim() || `Album ${album.id}`,
-    description: '',
+    description: album.description?.trim() || '',
     createdAt: asIsoDate(album.createdAt),
     displayCreatedDate: album.displayCreatedDate?.trim() || null,
     photoDateStart: album.photoDateStart?.trim() || null,
     photoDateEnd: album.photoDateEnd?.trim() || null,
+    position: Number(album.position) || 0,
     photoCount: Number(album.photoCount) || photos.length,
     photos,
     photoIds: photos.map(photo => photo.id),

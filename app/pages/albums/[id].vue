@@ -69,6 +69,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
       <section class="container mx-auto px-4 pb-5 pt-6 sm:px-6 sm:py-8 lg:px-8">
         <motion.div :initial="{ opacity: 0, y: 10 }" :animate="{ opacity: 1, y: 0 }" :transition="{ duration: 0.4 }" class="flex flex-col gap-5">
           <h1 class="text-2xl font-bold tracking-tight text-neutral-900 sm:text-4xl dark:text-white">{{ album.title }}</h1>
+          <p v-if="album.description" class="max-w-3xl whitespace-pre-line text-base leading-relaxed text-neutral-600 dark:text-neutral-300">{{ album.description }}</p>
           <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-neutral-600 dark:text-neutral-300">
             <span class="flex items-center gap-1"><Icon name="tabler:photo" class="size-4 text-neutral-400" />{{ t('album.photo', album.photoCount) }}</span>
             <span v-if="dateRange" class="flex items-center gap-1"><Icon name="tabler:calendar" class="size-4 text-neutral-400" />{{ dateRange }}</span>
