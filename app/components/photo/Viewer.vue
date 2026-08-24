@@ -32,6 +32,7 @@ let previousBodyOverflow = ''
 let desktopClickTimer: ReturnType<typeof setTimeout> | null = null
 let mobileTapTimer: ReturnType<typeof setTimeout> | null = null
 let motionTimer: ReturnType<typeof setTimeout> | null = null
+let gesturePointerId: number | null = null
 
 const currentPhoto = computed(() => props.photos[props.currentIndex])
 const previousPhoto = computed(() => props.currentIndex > 0 ? props.photos[props.currentIndex - 1] : null)
@@ -83,6 +84,7 @@ const resetTransform = () => {
   trackAnimating.value = false
   dismissAnimating.value = false
   gestureMode.value = 'idle'
+  gesturePointerId = null
 }
 const close = () => {
   if (!props.isOpen || closeRequested.value || isSliding.value) return
@@ -149,28 +151,26 @@ const clampZoomPan = (x: number, y: number) => {
   const maxY = Math.max(0, (fittedImageSize.value.height * scale.value - paneSize.height) / 2)
   return { x: clamp(x, -maxX, maxX), y: clamp(y, -maxY, maxY) }
 }
-const onTouchStart = (event: TouchEvent) => {
-  if (event.touches.length !== 1 || isSliding.value) {
+const onPointerStart = (event: PointerEvent) => {
+  if (event.button !== 0 || gesturePointerId !== null || isSliding.value) {
     gestureMode.value = 'blocked'
     return
   }
-  const touch = event.touches[0]
-  if (!touch) return
+  gesturePointerId = event.pointerId
+  ;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
   const now = performance.now()
-  if (now - lastTap.time < 320 && Math.hypot(touch.clientX - lastTap.x, touch.clientY - lastTap.y) < 32) {
+  if (now - lastTap.time < 320 && Math.hypot(event.clientX - lastTap.x, event.clientY - lastTap.y) < 32) {
     clearTimer(mobileTapTimer)
     mobileTapTimer = null
   }
   gestureMode.value = 'pending'
-  Object.assign(gestureStart, { x: touch.clientX, y: touch.clientY, time: now, panX: panX.value, panY: panY.value })
-  Object.assign(gestureLast, { x: touch.clientX, y: touch.clientY, time: now })
+  Object.assign(gestureStart, { x: event.clientX, y: event.clientY, time: now, panX: panX.value, panY: panY.value })
+  Object.assign(gestureLast, { x: event.clientX, y: event.clientY, time: now })
 }
-const onTouchMove = (event: TouchEvent) => {
-  if (event.touches.length !== 1 || gestureMode.value === 'blocked' || gestureMode.value === 'idle') return
-  const touch = event.touches[0]
-  if (!touch) return
-  const deltaX = touch.clientX - gestureStart.x
-  const deltaY = touch.clientY - gestureStart.y
+const onPointerMove = (event: PointerEvent) => {
+  if (event.pointerId !== gesturePointerId || gestureMode.value === 'blocked' || gestureMode.value === 'idle') return
+  const deltaX = event.clientX - gestureStart.x
+  const deltaY = event.clientY - gestureStart.y
   if (gestureMode.value === 'pending' && Math.hypot(deltaX, deltaY) > 7) {
     if (scale.value > 1) gestureMode.value = 'zoom-pan'
     else if (Math.abs(deltaX) > Math.abs(deltaY) * 1.05) gestureMode.value = 'horizontal'
@@ -191,7 +191,7 @@ const onTouchMove = (event: TouchEvent) => {
   if (gestureMode.value === 'horizontal' || gestureMode.value === 'vertical' || gestureMode.value === 'zoom-pan') {
     if (event.cancelable) event.preventDefault()
   }
-  Object.assign(gestureLast, { x: touch.clientX, y: touch.clientY, time: performance.now() })
+  Object.assign(gestureLast, { x: event.clientX, y: event.clientY, time: performance.now() })
 }
 const settleHorizontal = (direction: -1 | 1 | 0) => {
   trackAnimating.value = true
@@ -220,10 +220,10 @@ const settleVertical = () => {
     motionTimer = null
   }, 225)
 }
-const handleMobileTap = (touch: Touch) => {
+const handleMobileTap = (event: PointerEvent) => {
   const now = performance.now()
   const isDoubleTap = now - lastTap.time < 300
-    && Math.hypot(touch.clientX - lastTap.x, touch.clientY - lastTap.y) < 32
+    && Math.hypot(event.clientX - lastTap.x, event.clientY - lastTap.y) < 32
   if (isDoubleTap) {
     clearTimer(mobileTapTimer)
     mobileTapTimer = null
@@ -231,28 +231,29 @@ const handleMobileTap = (touch: Touch) => {
     toggleZoom()
     return
   }
-  Object.assign(lastTap, { x: touch.clientX, y: touch.clientY, time: now })
+  Object.assign(lastTap, { x: event.clientX, y: event.clientY, time: now })
   clearTimer(mobileTapTimer)
   mobileTapTimer = setTimeout(() => {
     mobileTapTimer = null
     if (scale.value === 1) close()
   }, 260)
 }
-const onTouchEnd = (event: TouchEvent) => {
-  const touch = event.changedTouches[0]
+const onPointerEnd = (event: PointerEvent) => {
+  if (event.pointerId !== gesturePointerId) return
+  gesturePointerId = null
   const mode = gestureMode.value
   gestureMode.value = 'idle'
-  if (!touch || mode === 'blocked' || mode === 'idle') return
+  if (mode === 'blocked' || mode === 'idle') return
   const now = performance.now()
   const elapsed = Math.max(now - gestureStart.time, 1)
-  const deltaX = touch.clientX - gestureStart.x
-  const deltaY = touch.clientY - gestureStart.y
+  const deltaX = event.clientX - gestureStart.x
+  const deltaY = event.clientY - gestureStart.y
   const recentElapsed = Math.max(now - gestureLast.time, 1)
-  const velocityX = (touch.clientX - gestureLast.x) / recentElapsed
-  const velocityY = (touch.clientY - gestureLast.y) / recentElapsed
+  const velocityX = (event.clientX - gestureLast.x) / recentElapsed
+  const velocityY = (event.clientY - gestureLast.y) / recentElapsed
 
   if (mode === 'pending') {
-    handleMobileTap(touch)
+    handleMobileTap(event)
   } else if (mode === 'horizontal') {
     const direction = deltaX < 0 ? 1 : -1
     const hasDestination = direction > 0 ? props.currentIndex < props.photos.length - 1 : props.currentIndex > 0
@@ -265,7 +266,9 @@ const onTouchEnd = (event: TouchEvent) => {
     else settleVertical()
   }
 }
-const onTouchCancel = () => {
+const onPointerCancel = (event: PointerEvent) => {
+  if (event.pointerId !== gesturePointerId) return
+  gesturePointerId = null
   gestureMode.value = 'idle'
   if (dragX.value) settleHorizontal(0)
   if (dragY.value) settleVertical()
@@ -345,10 +348,10 @@ onBeforeUnmount(() => {
             class="absolute inset-0 overflow-hidden md:hidden"
             style="touch-action: none"
             :style="mobileStageStyle"
-            @touchstart="onTouchStart"
-            @touchmove="onTouchMove"
-            @touchend.prevent="onTouchEnd"
-            @touchcancel="onTouchCancel"
+            @pointerdown="onPointerStart"
+            @pointermove="onPointerMove"
+            @pointerup.prevent="onPointerEnd"
+            @pointercancel="onPointerCancel"
           >
             <div class="flex h-full w-[300%] will-change-transform" :style="mobileTrackStyle">
               <div class="grid h-full w-1/3 shrink-0 place-items-center">
@@ -375,7 +378,7 @@ onBeforeUnmount(() => {
           <div class="viewer-top pointer-events-none absolute inset-x-0 top-0 z-40 bg-linear-to-b from-black/80 via-black/35 to-transparent px-3 pb-16 transition-opacity sm:px-6" :class="dragY ? 'opacity-30' : 'opacity-100'">
             <div class="flex items-start justify-between gap-4">
               <h2 class="min-w-0 truncate pt-2 text-sm font-semibold sm:text-lg">{{ currentPhoto.title || $t('ui.photo.untitled') }}</h2>
-              <div class="pointer-events-auto flex shrink-0 items-center gap-1 rounded-full bg-black/35 p-1 backdrop-blur-xl" @click.stop @dblclick.stop @touchstart.stop @touchend.stop>
+              <div class="pointer-events-auto flex shrink-0 items-center gap-1 rounded-full bg-black/35 p-1 backdrop-blur-xl" @click.stop @dblclick.stop @pointerdown.stop @pointerup.stop>
                 <a :href="currentPhoto.originalUrl" :download="currentPhoto.title" class="grid size-11 place-items-center rounded-full transition active:bg-white/20 md:size-10 md:hover:bg-white/15" :title="$t('ui.action.share.actions.downloadOriginal')"><Icon name="tabler:download" class="size-5" /></a>
                 <button class="grid size-11 place-items-center rounded-full transition active:bg-white/20 md:size-10 md:hover:bg-white/15" type="button" :aria-label="$t('viewer.navigation.close')" @click.stop="close"><Icon name="tabler:x" class="size-6" /></button>
               </div>
@@ -386,7 +389,7 @@ onBeforeUnmount(() => {
             v-if="currentIndex > 0"
             type="button"
             class="absolute inset-y-0 left-0 z-30 hidden w-16 place-items-center border-r text-white/80 transition focus-visible:text-white md:grid lg:w-24"
-            :class="hasBlackSideBars ? 'border-white/15 bg-neutral-500/45 backdrop-blur-xl hover:bg-neutral-400/55' : 'border-white/5 bg-linear-to-r from-black/35 to-transparent hover:from-black/70'"
+            :class="hasBlackSideBars ? 'viewer-nav-frosted border-white/15' : 'border-white/5 bg-linear-to-r from-black/35 to-transparent hover:from-black/70'"
             :aria-label="$t('viewer.navigation.previous')"
             @click.stop="move(-1)"
             @dblclick.stop
@@ -395,7 +398,7 @@ onBeforeUnmount(() => {
             v-if="currentIndex < photos.length - 1"
             type="button"
             class="absolute inset-y-0 right-0 z-30 hidden w-16 place-items-center border-l text-white/80 transition focus-visible:text-white md:grid lg:w-24"
-            :class="hasBlackSideBars ? 'border-white/15 bg-neutral-500/45 backdrop-blur-xl hover:bg-neutral-400/55' : 'border-white/5 bg-linear-to-l from-black/35 to-transparent hover:from-black/70'"
+            :class="hasBlackSideBars ? 'viewer-nav-frosted border-white/15' : 'border-white/5 bg-linear-to-l from-black/35 to-transparent hover:from-black/70'"
             :aria-label="$t('viewer.navigation.next')"
             @click.stop="move(1)"
             @dblclick.stop
@@ -418,4 +421,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .viewer-top { padding-top: max(0.75rem, env(safe-area-inset-top)); }
 .viewer-mobile-counter { bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+.viewer-nav-frosted {
+  background-color: rgb(82 82 91 / 62%);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+.viewer-nav-frosted:hover { background-color: rgb(113 113 122 / 72%); }
 </style>
