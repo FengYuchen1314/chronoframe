@@ -521,11 +521,11 @@ auth_curl -sS -D "$RUN_TMP_DIR/preflight.headers" -o /dev/null -X OPTIONS \
   "$BASE/api/albums"
 if grep -qi '^access-control-allow-origin:' "$RUN_TMP_DIR/preflight.headers"; then fail "cross-origin preflight was allowed"; fi
 
-# Album display dates are administrator-only metadata. They remain date-only strings and do not rewrite createdAt.
-date_album_response=$(api -H 'Content-Type: application/json' -d '{"name":"E2E album dates"}' "$BASE/api/albums")
+# Album metadata is administrator-only. Dates stay date-only strings and descriptions are trimmed.
+date_album_response=$(api -H 'Content-Type: application/json' -d '{"name":"E2E album metadata","description":"  Initial album story  "}' "$BASE/api/albums")
 date_album=$(printf '%s' "$date_album_response" | json_value "['id']")
 date_album_created_at=$(printf '%s' "$date_album_response" | json_value "['createdAt']")
-printf '%s' "$date_album_response" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["displayCreatedDate"] is None and value["photoDateStart"] is None and value["photoDateEnd"] is None, value'
+printf '%s' "$date_album_response" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["description"] == "Initial album story", value; assert value["displayCreatedDate"] is None and value["photoDateStart"] is None and value["photoDateEnd"] is None, value'
 
 unauthorized_album_patch=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-date-unauthorized.json" -w '%{http_code}' \
   -X PATCH -H 'X-Requested-With: ChronoFrame' -H 'Content-Type: application/json' \
@@ -589,6 +589,10 @@ valid_album_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP
   -X PATCH -H 'Content-Type: application/json' \
   -d '{"displayCreatedDate":"2011-12-30","photoDateStart":"2010-01-02","photoDateEnd":"2012-03-04"}' "$BASE/api/albums/$date_album")
 [[ "$valid_album_patch" = 200 ]] || fail "final valid album dates returned HTTP $valid_album_patch"
+description_patch=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-description-valid.json" -w '%{http_code}' \
+  -X PATCH -H 'Content-Type: application/json' \
+  -d '{"description":"  Updated album story\nSecond line  "}' "$BASE/api/albums/$date_album")
+[[ "$description_patch" = 200 ]] || fail "valid album description returned HTTP $description_patch"
 curl -fsS --connect-timeout 5 --max-time 30 "$BASE/api/albums" >"$RUN_TMP_DIR/album-date-list.json"
 curl -fsS --connect-timeout 5 --max-time 30 "$BASE/api/albums/$date_album" >"$RUN_TMP_DIR/album-date-detail.json"
 python3 - "$date_album" "$date_album_created_at" \
@@ -617,12 +621,27 @@ detail = json.load(open(sys.argv[11]))
 for value in (listed, detail):
     assert value["id"] == album_id, value
     assert value["createdAt"] == created_at, value
+    assert value["description"] == "Updated album story\nSecond line", value
     assert value["displayCreatedDate"] == "2011-12-30", value
     assert value["photoDateStart"] == "2010-01-02", value
     assert value["photoDateEnd"] == "2012-03-04", value
 assert detail["photos"] == [], detail
 PY
-echo "PASS album date authorization, strict validation, tri-state updates, clearing and list/detail persistence"
+
+order_album_response=$(api -H 'Content-Type: application/json' -d '{"name":"E2E reorder target","description":"Second album"}' "$BASE/api/albums")
+order_album=$(printf '%s' "$order_album_response" | json_value "['id']")
+api -H 'Content-Type: application/json' -d "{\"albumIds\":[\"$date_album\",\"$order_album\"]}" "$BASE/api/albums/order" >"$RUN_TMP_DIR/album-order.json"
+python3 - "$date_album" "$order_album" "$RUN_TMP_DIR/album-order.json" <<'PY'
+import json, sys
+album_ids = [sys.argv[1], sys.argv[2]]
+albums = json.load(open(sys.argv[3]))
+assert [album["id"] for album in albums] == album_ids, albums
+assert [album["position"] for album in albums] == [0, 1], albums
+PY
+duplicate_order=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/album-order-duplicate.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -d "{\"albumIds\":[\"$date_album\",\"$date_album\"]}" "$BASE/api/albums/order")
+[[ "$duplicate_order" = 400 ]] || fail "duplicate/incomplete album order returned HTTP $duplicate_order"
+echo "PASS album metadata authorization, validation, description persistence, date updates and exact reordering"
 
 logout_cookie=$(session_cookie_header)
 auth_cookie_curl -fsS -D "$RUN_TMP_DIR/logout.headers" -X POST "$BASE/api/auth/logout" >"$RUN_TMP_DIR/logout.json"
