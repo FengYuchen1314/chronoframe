@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'motion-v'
 
 defineProps<{ total: number; dateRangeText: string }>()
 const config = useRuntimeConfig()
+const { settings: siteSettings } = useSiteSettings()
 const colorMode = useColorMode()
 const { t } = useI18n()
 const { hasActiveFilters, selectedCounts } = usePhotoFilters()
@@ -20,14 +21,14 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
   <header class="relative w-full overflow-hidden">
     <div
       class="absolute inset-0 -z-10 scale-110 bg-cover bg-center opacity-35 blur-3xl"
-      :style="{ backgroundImage: `url(${config.public.app.avatarUrl})` }"
+      :style="{ backgroundImage: `url(${siteSettings.avatarUrl})` }"
     />
     <div class="absolute inset-0 -z-10 bg-white/50 dark:bg-neutral-900/50" />
 
     <div class="flex flex-col items-center gap-2 pb-0 pt-4 sm:pt-6">
       <NuxtLink to="/" class="group flex flex-col items-center gap-2" :aria-label="t('title.albums')">
-        <img :src="config.public.app.avatarUrl" class="size-14 rounded-full object-cover shadow-sm transition-transform group-hover:scale-105 sm:size-16" :alt="t('ui.photo.avatarAlt')" />
-        <h1 class="mb-2 text-2xl font-bold text-neutral-900 dark:text-white/90">{{ config.public.app.title }}</h1>
+        <img :src="siteSettings.avatarUrl" class="size-14 rounded-full object-cover shadow-sm transition-transform group-hover:scale-105 sm:size-16" :alt="t('ui.photo.avatarAlt')" />
+        <h1 class="mb-2 text-2xl font-bold text-neutral-900 dark:text-white/90">{{ siteSettings.title }}</h1>
       </NuxtLink>
 
       <div class="space-y-1 text-center text-neutral-600 dark:text-white/35">
@@ -35,7 +36,7 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
           <template v-if="total">{{ t('ui.stats.totalPhotosWithRange', { range: dateRangeText, count: total }) }}</template>
           <template v-else>{{ t('ui.stats.noPhotosTip') }}</template>
         </p>
-        <p v-if="config.public.app.slogan" class="font-[Pacifico]">{{ config.public.app.slogan }}</p>
+        <p v-if="siteSettings.slogan" class="font-[Pacifico]">{{ siteSettings.slogan }}</p>
       </div>
 
       <nav class="flex max-w-full items-center gap-0 rounded-full bg-white/35 p-1 dark:bg-neutral-900/50" :aria-label="t('title.gallery')">
@@ -87,7 +88,7 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
       </nav>
 
       <footer class="mt-1 flex w-full items-center justify-between gap-2 bg-neutral-200/50 px-3 py-2 text-xs font-medium text-neutral-500 sm:px-2 sm:py-1.5 dark:bg-neutral-900/50">
-        <span class="truncate">© {{ new Date().getFullYear() }} {{ config.public.app.author || config.public.app.title }}</span>
+        <span class="truncate">© {{ new Date().getFullYear() }} {{ siteSettings.author || siteSettings.title }}</span>
         <a
           href="https://github.com/HoshinoSuzumi/chronoframe"
           target="_blank"
