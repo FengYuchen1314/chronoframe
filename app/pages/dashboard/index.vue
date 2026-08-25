@@ -26,12 +26,13 @@ const loadError = ref('')
 const activeJobs = computed(() =>
   jobs.value.filter(job => ['queued', 'running'].includes(job.status)),
 )
-const terminalJobs = computed(() =>
-  jobs.value.filter(job =>
-    ['completed', 'failed', 'cancelled', 'interrupted'].includes(job.status),
-  ),
-)
 const recentJobs = computed(() => jobs.value.slice(0, 6))
+const failedJobs = computed(() =>
+  jobs.value.filter(job => ['failed', 'interrupted'].includes(job.status)),
+)
+const totalBytes = computed(() =>
+  photos.value.reduce((total, photo) => total + photo.byteSize, 0),
+)
 
 const storageLabels: Record<StorageBackend, string> = {
   local: '本地存储',
@@ -66,6 +67,13 @@ const progressOf = (job: ConversionJob) =>
 const formatTime = (timestamp: number) =>
   new Date(timestamp * 1000).toLocaleString('zh-CN', { hour12: false })
 
+const formatBytes = (bytes: number) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
+}
+
 const refreshAll = async () => {
   if (isLoading.value) return
   isLoading.value = true
@@ -94,9 +102,9 @@ onMounted(refreshAll)
 </script>
 
 <template>
-  <UDashboardPanel>
+  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="概览">
+      <UDashboardNavbar title="工作台">
         <template #right>
           <UButton
             icon="tabler:refresh"
@@ -112,7 +120,7 @@ onMounted(refreshAll)
     </template>
 
     <template #body>
-      <div class="flex flex-col gap-6">
+      <div class="dashboard-panel-body flex flex-col gap-6">
         <UAlert
           v-if="loadError"
           color="error"
@@ -122,83 +130,60 @@ onMounted(refreshAll)
           :description="loadError"
         />
 
-        <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <UCard class="cursor-pointer transition hover:ring-primary/40" @click="$router.push('/dashboard/albums')">
-            <div class="flex items-center justify-between gap-4">
-              <div>
-                <p class="text-sm text-muted">相簿空间</p>
-                <p class="mt-1 text-2xl font-semibold">{{ albums.length }}</p>
-              </div>
-              <span class="flex size-10 items-center justify-center rounded-lg bg-info/10 text-info">
-                <Icon name="tabler:album" class="size-6" />
-              </span>
+        <DashboardPageHero
+          eyebrow="ChronoFrame Studio"
+          title="今天想整理哪一组回忆？"
+          description="从相簿开始组织图片，转换和存储状态会在这里持续同步。"
+          icon="tabler:layout-dashboard"
+        >
+          <template #actions>
+            <UButton to="/dashboard/albums" size="lg" icon="tabler:plus">新建或管理相簿</UButton>
+            <UButton to="/dashboard/conversions" size="lg" color="neutral" variant="soft" icon="tabler:arrows-exchange">格式转换</UButton>
+          </template>
+          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
+              <p class="text-xs text-muted">相簿</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ albums.length }}</p>
             </div>
-          </UCard>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
+              <p class="text-xs text-muted">图片</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ photos.length }}</p>
+            </div>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
+              <p class="text-xs text-muted">占用空间</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ formatBytes(totalBytes) }}</p>
+            </div>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
+              <p class="text-xs text-muted">当前存储</p><p class="mt-1 truncate text-xl font-semibold text-highlighted">{{ storage ? storageLabels[storage.backend] : '—' }}</p>
+            </div>
+          </div>
+        </DashboardPageHero>
 
-          <UCard class="cursor-pointer transition hover:ring-primary/40" @click="$router.push('/dashboard/albums')">
-            <div class="flex items-center justify-between gap-4">
-              <div>
-                <p class="text-sm text-muted">相片总数</p>
-                <p class="mt-1 text-2xl font-semibold">{{ photos.length }}</p>
-              </div>
-              <span class="flex size-10 items-center justify-center rounded-lg bg-success/10 text-success">
-                <Icon name="tabler:photo" class="size-6" />
-              </span>
-            </div>
-          </UCard>
-
-          <UCard class="cursor-pointer transition hover:ring-primary/40" @click="$router.push('/dashboard/conversions')">
-            <div class="flex items-center justify-between gap-4">
-              <div>
-                <p class="text-sm text-muted">活动转换任务</p>
-                <p class="mt-1 text-2xl font-semibold">{{ activeJobs.length }}</p>
-              </div>
-              <span class="flex size-10 items-center justify-center rounded-lg bg-warning/10 text-warning">
-                <Icon name="tabler:loader-2" class="size-6" />
-              </span>
-            </div>
-          </UCard>
-
-          <UCard class="cursor-pointer transition hover:ring-primary/40" @click="$router.push('/dashboard/settings/storage')">
-            <div class="flex items-center justify-between gap-4">
-              <div class="min-w-0">
-                <p class="text-sm text-muted">当前存储</p>
-                <p class="mt-1 truncate text-lg font-semibold">
-                  {{ storage ? storageLabels[storage.backend] : '—' }}
-                </p>
-              </div>
-              <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <Icon name="tabler:database" class="size-6" />
-              </span>
-            </div>
-          </UCard>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <DashboardMetricCard label="相簿空间" :value="albums.length" icon="tabler:album" tone="info" hint="进入相簿工作台" to="/dashboard/albums" />
+          <DashboardMetricCard label="图片总数" :value="photos.length" icon="tabler:photo" tone="success" :hint="formatBytes(totalBytes)" to="/dashboard/albums" />
+          <DashboardMetricCard label="进行中任务" :value="activeJobs.length" icon="tabler:progress" tone="warning" hint="后台异步执行" to="/dashboard/conversions" />
+          <DashboardMetricCard label="异常任务" :value="failedJobs.length" icon="tabler:alert-triangle" :tone="failedJobs.length ? 'warning' : 'neutral'" hint="查看任务详情" to="/dashboard/conversions" />
         </div>
 
         <div class="grid grid-cols-1 gap-4 xl:grid-cols-5">
-          <UCard class="xl:col-span-3">
-            <template #header>
-              <div class="flex items-center justify-between gap-4">
-                <div>
-                  <h2 class="font-semibold">最近转换任务</h2>
-                  <p class="mt-1 text-sm text-muted">后台异步执行，关闭页面不会停止任务</p>
-                </div>
-                <UBadge color="neutral" variant="soft">
-                  {{ terminalJobs.length }} 个终态任务
-                </UBadge>
+          <section class="dashboard-section overflow-hidden xl:col-span-3">
+            <div class="flex items-center justify-between gap-4 border-b border-default px-5 py-4">
+              <div>
+                <h2 class="font-semibold text-highlighted">最近转换任务</h2>
+                <p class="mt-1 text-sm text-muted">任务在后端执行，离开页面也不会停止</p>
               </div>
-            </template>
+              <UButton to="/dashboard/conversions" color="neutral" variant="ghost" trailing-icon="tabler:arrow-right">全部任务</UButton>
+            </div>
 
-            <div v-if="recentJobs.length" class="divide-y divide-default">
+            <div v-if="recentJobs.length" class="divide-y divide-default px-5">
               <button
                 v-for="job in recentJobs"
                 :key="job.id"
                 type="button"
-                class="flex w-full items-center gap-4 py-3 text-left first:pt-0 last:pb-0"
+                class="group flex w-full items-center gap-4 py-4 text-left"
                 @click="$router.push('/dashboard/conversions')"
               >
                 <div class="min-w-0 flex-1">
                   <div class="flex items-center gap-2">
-                    <span class="font-medium">{{ job.targetFormat.toUpperCase() }}</span>
+                    <span class="font-medium text-highlighted">转为 {{ job.targetFormat.toUpperCase() }}</span>
                     <UBadge :color="statusColor(job.status)" variant="soft" size="sm">
                       {{ statusLabel(job.status) }}
                     </UBadge>
@@ -212,45 +197,44 @@ onMounted(refreshAll)
                   <p>{{ job.completed }} / {{ job.total }}</p>
                   <p class="mt-1">{{ formatTime(job.updatedAt) }}</p>
                 </div>
+                <Icon name="tabler:chevron-right" class="size-4 text-dimmed transition group-hover:translate-x-0.5 group-hover:text-primary" />
               </button>
             </div>
 
-            <div v-else class="flex min-h-40 flex-col items-center justify-center text-center">
+            <div v-else class="flex min-h-52 flex-col items-center justify-center px-5 text-center">
               <Icon name="tabler:arrows-exchange" class="size-9 text-muted" />
               <p class="mt-3 font-medium">还没有转换任务</p>
-              <p class="mt-1 text-sm text-muted">请先在相簿中上传图片</p>
+              <p class="mt-1 text-sm text-muted">上传图片后，可以批量转换一个或多个相簿</p>
             </div>
-          </UCard>
+          </section>
 
-          <UCard class="xl:col-span-2">
-            <template #header>
-              <h2 class="font-semibold">管理流程</h2>
-            </template>
-
-            <ol class="space-y-5">
-              <li class="flex gap-3">
-                <span class="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary">1</span>
-                <div>
-                  <p class="font-medium">创建相簿空间</p>
-                  <p class="mt-1 text-sm text-muted">没有相簿时不能上传图片。</p>
-                </div>
-              </li>
-              <li class="flex gap-3">
-                <span class="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary">2</span>
-                <div>
-                  <p class="font-medium">选中相簿并上传</p>
-                  <p class="mt-1 text-sm text-muted">仅接受 PNG、JPG/JPEG 和 WEBP。</p>
-                </div>
-              </li>
-              <li class="flex gap-3">
-                <span class="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary">3</span>
-                <div>
-                  <p class="font-medium">异步转换与人工确认</p>
-                  <p class="mt-1 text-sm text-muted">先验收转换结果，再由管理员确认是否删除旧格式原图。</p>
-                </div>
-              </li>
-            </ol>
-          </UCard>
+          <section class="dashboard-section overflow-hidden xl:col-span-2">
+            <div class="border-b border-default px-5 py-4">
+              <h2 class="font-semibold text-highlighted">快捷操作</h2>
+              <p class="mt-1 text-sm text-muted">按当前任务直接进入对应工作区</p>
+            </div>
+            <div class="space-y-2 p-3">
+              <NuxtLink to="/dashboard/albums" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated">
+                <span class="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:folder-plus" class="size-5" /></span>
+                <span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">创建相簿并上传</span><span class="mt-0.5 block text-xs text-muted">管理简介、日期、排序和内容</span></span>
+                <Icon name="tabler:chevron-right" class="size-4 text-dimmed group-hover:text-primary" />
+              </NuxtLink>
+              <NuxtLink to="/dashboard/conversions" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated">
+                <span class="flex size-10 items-center justify-center rounded-xl bg-warning/10 text-warning"><Icon name="tabler:arrows-exchange" class="size-5" /></span>
+                <span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">批量格式转换</span><span class="mt-0.5 block text-xs text-muted">查看进度并人工确认旧图</span></span>
+                <Icon name="tabler:chevron-right" class="size-4 text-dimmed group-hover:text-primary" />
+              </NuxtLink>
+              <NuxtLink to="/dashboard/settings/storage" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated">
+                <span class="flex size-10 items-center justify-center rounded-xl bg-info/10 text-info"><Icon name="tabler:database-cog" class="size-5" /></span>
+                <span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">检查存储连接</span><span class="mt-0.5 block text-xs text-muted">{{ storage ? storageLabels[storage.backend] : '读取中' }} · 配置保存在后台</span></span>
+                <Icon name="tabler:chevron-right" class="size-4 text-dimmed group-hover:text-primary" />
+              </NuxtLink>
+            </div>
+            <div class="mx-5 mb-5 flex items-center gap-2 rounded-xl bg-success/10 px-3 py-2.5 text-xs text-success">
+              <Icon name="tabler:shield-check" class="size-4 shrink-0" />
+              旧格式原图不会被自动删除
+            </div>
+          </section>
         </div>
       </div>
     </template>
