@@ -730,7 +730,9 @@ python3 - "$RUN_TMP_DIR/export-single.zip" "$RUN_TMP_DIR/export-single.headers" 
 import pathlib, sys, zipfile
 archive, headers = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text().lower()
 with zipfile.ZipFile(archive) as value:
-    assert sorted(value.namelist()) == ["local (2).png", "local.png", "local.webp"], value.namelist()
+    names = sorted(value.namelist())
+    assert names[:2] == ["local (2).png", "local.png"], names
+    assert len(names) == 3 and names[2].startswith("local.webp [") and names[2].endswith("]"), names
     assert all(not name.startswith(('/', '\\')) and '..' not in pathlib.PurePosixPath(name).parts for name in value.namelist())
 assert 'content-type: application/zip' in headers
 assert 'content-disposition: attachment;' in headers and "filename*=utf-8''e2e%20local%20webp.zip" in headers
@@ -816,7 +818,9 @@ api "$BASE/api/albums/export?albumIds=$webdav_album" -o "$RUN_TMP_DIR/webdav-exp
 python3 - "$RUN_TMP_DIR/webdav-export.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as value:
-    assert value.testzip() is None and value.namelist() == ["webdav.webp"], value.namelist()
+    names = value.namelist()
+    assert value.testzip() is None and len(names) == 1, names
+    assert names[0].startswith("webdav.webp [") and names[0].endswith("]"), names
 PY
 assert_no_export_temps
 webdav_container=$("${COMPOSE[@]}" ps -q webdav)
@@ -855,7 +859,9 @@ api "$BASE/api/albums/export?albumIds=$s3_album" -o "$RUN_TMP_DIR/s3-export.zip"
 python3 - "$RUN_TMP_DIR/s3-export.zip" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as value:
-    assert value.testzip() is None and value.namelist() == ["s3.jpg"], value.namelist()
+    names = value.namelist()
+    assert value.testzip() is None and len(names) == 1, names
+    assert names[0].startswith("s3.jpg [") and names[0].endswith("]"), names
 PY
 assert_no_export_temps
 s3_objects=$(docker run --rm --network "$NETWORK_NAME" --entrypoint /bin/sh minio/mc:latest -c \
