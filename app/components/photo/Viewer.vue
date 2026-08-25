@@ -183,6 +183,7 @@ const onDesktopPaneClick = (event: MouseEvent) => {
 const onDesktopDoubleClick = (event: MouseEvent) => {
   if (isMobile.value) return
   event.preventDefault()
+  window.getSelection()?.removeAllRanges()
   clearTimer(desktopClickTimer)
   desktopClickTimer = null
   toggleZoom()
@@ -494,14 +495,14 @@ onBeforeUnmount(() => {
     <AnimatePresence>
       <motion.div
         v-if="isOpen && currentPhoto"
-        class="fixed inset-0 z-[100] h-[100dvh] overflow-hidden bg-black text-white"
+        class="viewer-no-select fixed inset-0 z-[100] h-[100dvh] overflow-hidden bg-black text-white"
         :initial="{ opacity: 0 }"
         :animate="{ opacity: 1 }"
         :exit="{ opacity: 0 }"
         :transition="{ duration: 0.18 }"
         :style="{ backgroundColor: `rgb(0 0 0 / ${backdropOpacity})` }"
       >
-        <div ref="viewerPane" class="relative h-full w-full overflow-hidden" @click="onDesktopPaneClick" @dblclick="onDesktopDoubleClick" @wheel.prevent="onWheel">
+        <div ref="viewerPane" class="relative h-full w-full overflow-hidden" @click="onDesktopPaneClick" @dblclick="onDesktopDoubleClick" @selectstart.prevent @dragstart.prevent @wheel.prevent="onWheel">
           <motion.div
             :key="`desktop-${currentPhoto.id}`"
             data-viewer-current="true"
@@ -571,6 +572,8 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .viewer-top { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+.viewer-no-select, .viewer-no-select * { -webkit-user-select: none !important; user-select: none !important; }
+.viewer-no-select img { -webkit-user-drag: none; }
 .viewer-mobile-counter { bottom: max(0.75rem, env(safe-area-inset-bottom)); }
 .viewer-gesture-hint { padding-top: max(5.25rem, calc(env(safe-area-inset-top) + 4.5rem)); }
 .viewer-nav-frosted { background-color: rgb(82 82 91 / 62%); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); }
