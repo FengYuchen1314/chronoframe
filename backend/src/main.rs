@@ -67,6 +67,8 @@ struct AppState {
     trust_proxy_headers: bool,
     workers: usize,
     jobs: Arc<DashMap<String, CancellationToken>>,
+    storage_tasks: Arc<DashMap<String, CancellationToken>>,
+    storage_mutation_gate: Arc<tokio::sync::RwLock<()>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
     export_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
@@ -622,7 +624,7 @@ struct StorageSettingsInput {
     s3_prefix: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct StorageCandidate {
     backend: String,
     local_path: String,
@@ -690,6 +692,29 @@ impl StorageCandidate {
             _ => {}
         }
         Ok(())
+    }
+
+    fn location_key(&self) -> String {
+        match self.backend.as_str() {
+            "local" => {
+                let path = std::fs::canonicalize(&self.local_path)
+                    .unwrap_or_else(|_| PathBuf::from(&self.local_path));
+                format!("local:{}", path.to_string_lossy())
+            }
+            "webdav" => format!(
+                "webdav:{}:{}",
+                self.webdav_url.trim_end_matches('/'),
+                self.webdav_prefix.trim_matches('/')
+            ),
+            "s3" => format!(
+                "s3:{}:{}:{}:{}",
+                self.s3_endpoint.trim_end_matches('/'),
+                self.s3_region,
+                self.s3_bucket,
+                self.s3_prefix.trim_matches('/')
+            ),
+            _ => self.backend.clone(),
+        }
     }
 }
 
@@ -1026,7 +1051,7 @@ impl StorageService {
             };
         if target_changed {
             let stored_count: i64 = sqlx::query_scalar(
-                "SELECT (SELECT COUNT(*) FROM photos) + (SELECT COUNT(*) FROM pending_blobs)",
+                "SELECT (SELECT COUNT(*) FROM photos) + (SELECT COUNT(*) FROM pending_blobs) + (SELECT COUNT(*) FROM photo_deletion_outbox) + (SELECT COUNT(*) FROM source_deletion_outbox)",
             )
             .fetch_one(&self.db)
             .await?;
@@ -1065,6 +1090,60 @@ impl StorageService {
         tx.commit().await?;
         *self.cache.write().await = None;
         self.public_settings().await
+    }
+    async fn current_candidate(&self) -> Result<StorageCandidate> {
+        self.candidate_from_values(&self.values().await?)
+    }
+    async fn activate_migration_candidate(
+        &self,
+        job_id: &str,
+        candidate: &StorageCandidate,
+    ) -> Result<()> {
+        let _gate = self.gate.write().await;
+        let encrypted_webdav_password = if candidate.webdav_password.is_empty() {
+            String::new()
+        } else {
+            self.encrypt(&candidate.webdav_password)?
+        };
+        let encrypted_s3_secret = if candidate.s3_secret_key.is_empty() {
+            String::new()
+        } else {
+            self.encrypt(&candidate.s3_secret_key)?
+        };
+        let mut tx = self.db.begin().await?;
+        for (key, value) in [
+            ("storage_backend", candidate.backend.clone()),
+            ("storage_local_path", candidate.local_path.clone()),
+            ("storage_webdav_url", candidate.webdav_url.clone()),
+            ("storage_webdav_username", candidate.webdav_username.clone()),
+            ("storage_webdav_prefix", candidate.webdav_prefix.clone()),
+            ("storage_webdav_password", encrypted_webdav_password),
+            ("storage_s3_endpoint", candidate.s3_endpoint.clone()),
+            ("storage_s3_region", candidate.s3_region.clone()),
+            ("storage_s3_bucket", candidate.s3_bucket.clone()),
+            ("storage_s3_access_key", candidate.s3_access_key.clone()),
+            ("storage_s3_secret_key", encrypted_s3_secret),
+            ("storage_s3_prefix", candidate.s3_prefix.clone()),
+        ] {
+            sqlx::query("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let changed = sqlx::query("UPDATE storage_migration_jobs SET status='completed',cleanup_status='pending',activated_at=?,updated_at=?,error=NULL WHERE id=? AND status='running'")
+            .bind(now())
+            .bind(now())
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if changed != 1 {
+            bail!("迁移任务状态已经改变，拒绝切换存储");
+        }
+        tx.commit().await?;
+        *self.cache.write().await = None;
+        Ok(())
     }
     async fn store(&self) -> Result<Arc<dyn BlobStore>> {
         let candidate = self.candidate_from_values(&self.values().await?)?;
@@ -1167,6 +1246,27 @@ struct ConversionItem {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageMigrationJob {
+    id: String,
+    status: String,
+    source_backend: String,
+    target_backend: String,
+    total: i64,
+    completed: i64,
+    succeeded: i64,
+    failed: i64,
+    cancelled: i64,
+    cleanup_status: String,
+    cleanup_completed: i64,
+    cleanup_failed: i64,
+    created_at: i64,
+    updated_at: i64,
+    activated_at: Option<i64>,
+    error: Option<String>,
+}
+
 fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
     Album {
         id: row.get("id"),
@@ -1207,6 +1307,26 @@ fn job_from(row: &sqlx::sqlite::SqliteRow) -> ConversionJob {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         sources_deleted_at: row.get("sources_deleted_at"),
+    }
+}
+fn migration_job_from(row: &sqlx::sqlite::SqliteRow) -> StorageMigrationJob {
+    StorageMigrationJob {
+        id: row.get("id"),
+        status: row.get("status"),
+        source_backend: row.get("source_backend"),
+        target_backend: row.get("target_backend"),
+        total: row.get("total"),
+        completed: row.get("completed"),
+        succeeded: row.get("succeeded"),
+        failed: row.get("failed"),
+        cancelled: row.get("cancelled"),
+        cleanup_status: row.get("cleanup_status"),
+        cleanup_completed: row.get("cleanup_completed"),
+        cleanup_failed: row.get("cleanup_failed"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        activated_at: row.get("activated_at"),
+        error: row.get("error"),
     }
 }
 fn now() -> i64 {
@@ -1291,6 +1411,46 @@ async fn recover_pending_blobs(
         }
     }
     Ok(cleaned)
+}
+
+#[derive(Default)]
+struct PhotoDeletionDrain {
+    removed: usize,
+    failures: Vec<serde_json::Value>,
+}
+
+async fn drain_photo_deletion_outbox(
+    storage: &StorageService,
+    db: &SqlitePool,
+) -> Result<PhotoDeletionDrain> {
+    let rows = sqlx::query(
+        "SELECT photo_id,storage_key FROM photo_deletion_outbox ORDER BY created_at,photo_id",
+    )
+    .fetch_all(db)
+    .await?;
+    let store = if rows.is_empty() {
+        None
+    } else {
+        Some(storage.store().await?)
+    };
+    let mut result = PhotoDeletionDrain::default();
+    for row in rows {
+        let photo_id: String = row.get("photo_id");
+        let storage_key: String = row.get("storage_key");
+        let store = store.as_ref().expect("outbox rows require a store");
+        if let Err(error) = store.delete(&storage_key).await {
+            result
+                .failures
+                .push(serde_json::json!({"photoId": photo_id, "error": error.to_string()}));
+            continue;
+        }
+        sqlx::query("DELETE FROM photo_deletion_outbox WHERE photo_id=?")
+            .bind(&photo_id)
+            .execute(db)
+            .await?;
+        result.removed += 1;
+    }
+    Ok(result)
 }
 
 #[derive(Default)]
@@ -2012,6 +2172,11 @@ async fn save_storage_settings(
     Json(input): Json<StorageSettingsInput>,
 ) -> ApiResult<Json<StorageSettingsOutput>> {
     require_admin(&headers, &state, true).await?;
+    let _mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储迁移或旧存储清理正在运行，暂时不能修改配置"))?;
     Ok(Json(
         state
             .storage
@@ -2033,6 +2198,668 @@ async fn test_storage_settings(
         .await
         .map_err(|error| AppError::bad(format!("存储连接测试失败：{error:#}")))?;
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+const STORAGE_MIGRATION_JOB_COLUMNS: &str = "id,status,source_backend,target_backend,total,completed,succeeded,failed,cancelled,cleanup_status,cleanup_completed,cleanup_failed,created_at,updated_at,activated_at,error";
+
+async fn refresh_storage_migration_counts(db: &SqlitePool, job_id: &str) -> Result<()> {
+    sqlx::query("UPDATE storage_migration_jobs SET completed=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status IN ('succeeded','failed','cancelled')),succeeded=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status='succeeded'),failed=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status='failed'),cancelled=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status='cancelled'),updated_at=? WHERE id=?")
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(now())
+        .bind(job_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn migration_candidates(
+    state: &AppState,
+    job_id: &str,
+) -> Result<(StorageCandidate, StorageCandidate)> {
+    let row =
+        sqlx::query("SELECT source_config,target_config FROM storage_migration_jobs WHERE id=?")
+            .bind(job_id)
+            .fetch_one(&state.db)
+            .await?;
+    let source_json = state
+        .storage
+        .decrypt(&row.get::<String, _>("source_config"))?;
+    let target_json = state
+        .storage
+        .decrypt(&row.get::<String, _>("target_config"))?;
+    Ok((
+        serde_json::from_str(&source_json)?,
+        serde_json::from_str(&target_json)?,
+    ))
+}
+
+async fn copy_storage_migration_item(
+    state: &AppState,
+    job_id: &str,
+    item_id: &str,
+    storage_key: &str,
+    content_type: &str,
+    expected_size: i64,
+    source: &Arc<dyn BlobStore>,
+    target: &Arc<dyn BlobStore>,
+    token: &CancellationToken,
+) -> Result<()> {
+    let changed = sqlx::query("UPDATE storage_migration_items SET status='processing',error=NULL WHERE id=? AND job_id=? AND status='queued'")
+        .bind(item_id)
+        .bind(job_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        return Ok(());
+    }
+    if token.is_cancelled() {
+        sqlx::query("UPDATE storage_migration_items SET status='cancelled',error='管理员安全中断任务' WHERE id=?")
+            .bind(item_id)
+            .execute(&state.db)
+            .await?;
+        return Ok(());
+    }
+    let data = timeout(STORAGE_IO_TIMEOUT, source.get(storage_key))
+        .await
+        .context("读取源存储超时")??;
+    if data.len() as i64 != expected_size {
+        bail!("源对象大小与数据库记录不一致");
+    }
+    let digest = hex_digest(&Sha256::digest(&data));
+    if token.is_cancelled() {
+        sqlx::query("UPDATE storage_migration_items SET status='cancelled',error='管理员安全中断任务' WHERE id=?")
+            .bind(item_id)
+            .execute(&state.db)
+            .await?;
+        return Ok(());
+    }
+    if let Ok(Ok(existing)) = timeout(STORAGE_IO_TIMEOUT, target.get(storage_key)).await {
+        if existing.len() as i64 == expected_size
+            && hex_digest(&Sha256::digest(&existing)) == digest
+        {
+            sqlx::query("UPDATE storage_migration_items SET status='succeeded',sha256=?,error=NULL WHERE id=?")
+                .bind(digest)
+                .bind(item_id)
+                .execute(&state.db)
+                .await?;
+            return Ok(());
+        }
+        target
+            .delete(storage_key)
+            .await
+            .context("移除目标存储中的冲突对象失败")?;
+    }
+    target
+        .put_atomic(storage_key, content_type, data)
+        .await
+        .context("写入目标存储失败")?;
+    let verified = timeout(STORAGE_IO_TIMEOUT, target.get(storage_key))
+        .await
+        .context("读回目标对象超时")??;
+    if verified.len() as i64 != expected_size || hex_digest(&Sha256::digest(&verified)) != digest {
+        bail!("目标对象读回校验失败");
+    }
+    sqlx::query(
+        "UPDATE storage_migration_items SET status='succeeded',sha256=?,error=NULL WHERE id=?",
+    )
+    .bind(digest)
+    .bind(item_id)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+async fn run_storage_migration(
+    state: AppState,
+    job_id: String,
+    source_candidate: StorageCandidate,
+    target_candidate: StorageCandidate,
+    token: CancellationToken,
+    _mutation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> Result<()> {
+    let changed = sqlx::query("UPDATE storage_migration_jobs SET status='running',updated_at=?,error=NULL WHERE id=? AND status='queued'")
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        bail!("迁移任务不在可启动状态");
+    }
+    let source = StorageService::build_store(&source_candidate).await?;
+    let target = StorageService::build_store(&target_candidate).await?;
+    target.healthcheck().await.context("目标存储连接测试失败")?;
+    let rows = sqlx::query("SELECT id,storage_key,content_type,byte_size FROM storage_migration_items WHERE job_id=? AND status='queued' ORDER BY id")
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await?;
+    let items = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("storage_key"),
+                row.get::<String, _>("content_type"),
+                row.get::<i64, _>("byte_size"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let workers = state.workers.clamp(1, 8);
+    stream::iter(items)
+        .for_each_concurrent(workers, |(item_id, storage_key, content_type, byte_size)| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            let source = source.clone();
+            let target = target.clone();
+            let token = token.clone();
+            async move {
+                if token.is_cancelled() {
+                    let _ = sqlx::query("UPDATE storage_migration_items SET status='cancelled',error='管理员安全中断任务' WHERE id=? AND status='queued'")
+                        .bind(&item_id)
+                        .execute(&state.db)
+                        .await;
+                } else if let Err(error) = copy_storage_migration_item(
+                    &state,
+                    &job_id,
+                    &item_id,
+                    &storage_key,
+                    &content_type,
+                    byte_size,
+                    &source,
+                    &target,
+                    &token,
+                )
+                .await
+                {
+                    warn!(job_id, item_id, "storage migration item failed: {error:#}");
+                    let _ = sqlx::query("UPDATE storage_migration_items SET status='failed',error=? WHERE id=? AND status='processing'")
+                        .bind(format!("{error:#}"))
+                        .bind(&item_id)
+                        .execute(&state.db)
+                        .await;
+                }
+                let _ = refresh_storage_migration_counts(&state.db, &job_id).await;
+            }
+        })
+        .await;
+    if token.is_cancelled() {
+        sqlx::query("UPDATE storage_migration_items SET status='cancelled',error=COALESCE(error,'管理员安全中断任务') WHERE job_id=? AND status IN ('queued','processing')")
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    } else {
+        sqlx::query("UPDATE storage_migration_items SET status='failed',error=COALESCE(error,'迁移线程未生成终态') WHERE job_id=? AND status IN ('queued','processing')")
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    }
+    refresh_storage_migration_counts(&state.db, &job_id).await?;
+    let row = sqlx::query(
+        "SELECT total,succeeded,failed,cancelled FROM storage_migration_jobs WHERE id=?",
+    )
+    .bind(&job_id)
+    .fetch_one(&state.db)
+    .await?;
+    let total: i64 = row.get("total");
+    let succeeded: i64 = row.get("succeeded");
+    let failed: i64 = row.get("failed");
+    let cancelled: i64 = row.get("cancelled");
+    if token.is_cancelled() || cancelled > 0 {
+        sqlx::query("UPDATE storage_migration_jobs SET status='cancelled',updated_at=?,error='管理员安全中断任务' WHERE id=?")
+            .bind(now())
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    } else if failed > 0 || succeeded != total {
+        sqlx::query("UPDATE storage_migration_jobs SET status='failed',updated_at=?,error='部分对象迁移失败，可修复存储连接后继续任务' WHERE id=?")
+            .bind(now())
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    } else {
+        state
+            .storage
+            .activate_migration_candidate(&job_id, &target_candidate)
+            .await?;
+    }
+    Ok(())
+}
+
+fn spawn_storage_migration(
+    state: AppState,
+    job_id: String,
+    source: StorageCandidate,
+    target: StorageCandidate,
+    guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) {
+    let token = CancellationToken::new();
+    state.storage_tasks.insert(job_id.clone(), token.clone());
+    tokio::spawn(async move {
+        let inner_state = state.clone();
+        let inner_job_id = job_id.clone();
+        let outcome = tokio::spawn(async move {
+            run_storage_migration(inner_state, inner_job_id, source, target, token, guard).await
+        })
+        .await;
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("迁移执行器异常退出：{error}")),
+        };
+        if let Some(reason) = failure {
+            error!(job_id, "storage migration failed: {reason}");
+            let _ = sqlx::query("UPDATE storage_migration_jobs SET status='failed',updated_at=?,error=? WHERE id=? AND status IN ('queued','running')")
+                .bind(now())
+                .bind(reason)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await;
+            let _ = refresh_storage_migration_counts(&state.db, &job_id).await;
+        }
+        state.storage_tasks.remove(&job_id);
+    });
+}
+
+async fn list_storage_migrations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<StorageMigrationJob>>> {
+    require_admin(&headers, &state, false).await?;
+    let sql = format!(
+        "SELECT {STORAGE_MIGRATION_JOB_COLUMNS} FROM storage_migration_jobs ORDER BY created_at DESC LIMIT 50"
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(rows.iter().map(migration_job_from).collect()))
+}
+
+async fn start_storage_migration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<StorageSettingsInput>,
+) -> ApiResult<(StatusCode, Json<StorageMigrationJob>)> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let unresolved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_migration_jobs WHERE status IN ('queued','running','failed','cancelled','interrupted') OR (status='completed' AND cleanup_status NOT IN ('cleaned','retained')))")
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    if unresolved {
+        return Err(AppError::conflict(
+            "已有未收尾的存储迁移；请继续任务并选择清理或保留旧存储",
+        ));
+    }
+    let active_conversion: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversion_jobs WHERE status IN ('queued','running'))",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    let pending_objects: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM pending_blobs) + (SELECT COUNT(*) FROM photo_deletion_outbox) + (SELECT COUNT(*) FROM source_deletion_outbox)")
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    if active_conversion || pending_objects > 0 {
+        return Err(AppError::conflict(
+            "请先结束图片转换并等待对象清理队列完成，再开始迁移",
+        ));
+    }
+    let source = state
+        .storage
+        .current_candidate()
+        .await
+        .map_err(AppError::internal)?;
+    let target = state
+        .storage
+        .candidate_from_input(&input)
+        .await
+        .map_err(|error| AppError::bad(error.to_string()))?;
+    if source.location_key() == target.location_key() {
+        return Err(AppError::bad("源存储和目标存储位置相同，无需迁移"));
+    }
+    let target_store = StorageService::build_store(&target)
+        .await
+        .map_err(AppError::internal)?;
+    target_store
+        .healthcheck()
+        .await
+        .map_err(|error| AppError::bad(format!("目标存储连接测试失败：{error:#}")))?;
+    let photos =
+        sqlx::query("SELECT id,storage_key,content_type,byte_size FROM photos ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+    if photos.is_empty() {
+        return Err(AppError::bad("当前没有图片，请直接保存新的存储配置"));
+    }
+    let timestamp = now();
+    let job_id = Uuid::new_v4().to_string();
+    let source_config = state
+        .storage
+        .encrypt(&serde_json::to_string(&source).map_err(AppError::internal)?)
+        .map_err(AppError::internal)?;
+    let target_config = state
+        .storage
+        .encrypt(&serde_json::to_string(&target).map_err(AppError::internal)?)
+        .map_err(AppError::internal)?;
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO storage_migration_jobs(id,status,source_backend,target_backend,total,source_config,target_config,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+        .bind(&job_id)
+        .bind("queued")
+        .bind(&source.backend)
+        .bind(&target.backend)
+        .bind(photos.len() as i64)
+        .bind(source_config)
+        .bind(target_config)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    for photo in photos {
+        sqlx::query("INSERT INTO storage_migration_items(id,job_id,photo_id,storage_key,content_type,byte_size,status) VALUES(?,?,?,?,?,?,'queued')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&job_id)
+            .bind(photo.get::<String, _>("id"))
+            .bind(photo.get::<String, _>("storage_key"))
+            .bind(photo.get::<String, _>("content_type"))
+            .bind(photo.get::<i64, _>("byte_size"))
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    let sql =
+        format!("SELECT {STORAGE_MIGRATION_JOB_COLUMNS} FROM storage_migration_jobs WHERE id=?");
+    let row = sqlx::query(&sql)
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let job = migration_job_from(&row);
+    spawn_storage_migration(state, job_id, source, target, guard);
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn resume_storage_migration(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let status: String = sqlx::query_scalar("SELECT status FROM storage_migration_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad("迁移任务不存在"))?;
+    if !matches!(status.as_str(), "failed" | "cancelled" | "interrupted") {
+        return Err(AppError::bad("此任务当前不能继续"));
+    }
+    let (source, target) = migration_candidates(&state, &job_id)
+        .await
+        .map_err(AppError::internal)?;
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query("UPDATE storage_migration_items SET status='queued',error=NULL WHERE job_id=? AND status IN ('failed','cancelled','processing')")
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("UPDATE storage_migration_jobs SET status='queued',completed=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status='succeeded'),succeeded=(SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND status='succeeded'),failed=0,cancelled=0,updated_at=?,error=NULL WHERE id=?")
+        .bind(&job_id)
+        .bind(&job_id)
+        .bind(now())
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    spawn_storage_migration(state, job_id, source, target, guard);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn cancel_storage_task(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let token = state
+        .storage_tasks
+        .get(&job_id)
+        .ok_or_else(|| AppError::bad("任务不在运行中，无法中断"))?;
+    token.cancel();
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn run_storage_cleanup(
+    state: AppState,
+    job_id: String,
+    source_candidate: StorageCandidate,
+    target_candidate: StorageCandidate,
+    token: CancellationToken,
+    _mutation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> Result<()> {
+    let source = StorageService::build_store(&source_candidate).await?;
+    let target = StorageService::build_store(&target_candidate).await?;
+    let rows = sqlx::query("SELECT id,storage_key,sha256 FROM storage_migration_items WHERE job_id=? AND status='succeeded' AND source_deleted_at IS NULL ORDER BY id")
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await?;
+    let items = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("storage_key"),
+                row.get::<String, _>("sha256"),
+            )
+        })
+        .collect::<Vec<_>>();
+    stream::iter(items)
+        .for_each_concurrent(state.workers.clamp(1, 8), |(item_id, storage_key, digest)| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            let source = source.clone();
+            let target = target.clone();
+            let token = token.clone();
+            async move {
+                if token.is_cancelled() {
+                    return;
+                }
+                let result = async {
+                    let target_data = timeout(STORAGE_IO_TIMEOUT, target.get(&storage_key))
+                        .await
+                        .context("清理前读回当前存储对象超时")??;
+                    if hex_digest(&Sha256::digest(&target_data)) != digest {
+                        bail!("当前存储对象校验失败，拒绝删除旧对象");
+                    }
+                    if token.is_cancelled() {
+                        bail!("管理员安全中断任务");
+                    }
+                    source
+                        .delete(&storage_key)
+                        .await
+                        .context("删除旧存储对象失败")?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        let _ = sqlx::query("UPDATE storage_migration_items SET source_deleted_at=?,cleanup_error=NULL WHERE id=?")
+                            .bind(now())
+                            .bind(&item_id)
+                            .execute(&state.db)
+                            .await;
+                    }
+                    Err(error) if token.is_cancelled() => {}
+                    Err(error) => {
+                        warn!(job_id, item_id, "old storage cleanup failed: {error:#}");
+                        let _ = sqlx::query("UPDATE storage_migration_items SET cleanup_error=? WHERE id=? AND source_deleted_at IS NULL")
+                            .bind(format!("{error:#}"))
+                            .bind(&item_id)
+                            .execute(&state.db)
+                            .await;
+                    }
+                }
+            }
+        })
+        .await;
+    let cleanup_completed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND source_deleted_at IS NOT NULL")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let cleanup_failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_migration_items WHERE job_id=? AND source_deleted_at IS NULL AND cleanup_error IS NOT NULL")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let total: i64 = sqlx::query_scalar("SELECT total FROM storage_migration_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let (status, error) = if token.is_cancelled() {
+        ("interrupted", Some("管理员安全中断旧存储清理"))
+    } else if cleanup_completed == total {
+        ("cleaned", None)
+    } else {
+        ("failed", Some("部分旧存储对象清理失败，可检查连接后重试"))
+    };
+    sqlx::query("UPDATE storage_migration_jobs SET cleanup_status=?,cleanup_completed=?,cleanup_failed=?,updated_at=?,error=? WHERE id=?")
+        .bind(status)
+        .bind(cleanup_completed)
+        .bind(cleanup_failed)
+        .bind(now())
+        .bind(error)
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+fn spawn_storage_cleanup(
+    state: AppState,
+    job_id: String,
+    source: StorageCandidate,
+    target: StorageCandidate,
+    guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) {
+    let token = CancellationToken::new();
+    state.storage_tasks.insert(job_id.clone(), token.clone());
+    tokio::spawn(async move {
+        let inner_state = state.clone();
+        let inner_job_id = job_id.clone();
+        let outcome = tokio::spawn(async move {
+            run_storage_cleanup(inner_state, inner_job_id, source, target, token, guard).await
+        })
+        .await;
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("旧存储清理执行器异常退出：{error}")),
+        };
+        if let Some(reason) = failure {
+            error!(job_id, "old storage cleanup failed: {reason}");
+            let _ = sqlx::query("UPDATE storage_migration_jobs SET cleanup_status='failed',updated_at=?,error=? WHERE id=? AND cleanup_status='cleaning'")
+                .bind(now())
+                .bind(reason)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await;
+        }
+        state.storage_tasks.remove(&job_id);
+    });
+}
+
+async fn cleanup_old_storage(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let row = sqlx::query("SELECT status,cleanup_status FROM storage_migration_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad("迁移任务不存在"))?;
+    let status: String = row.get("status");
+    let cleanup_status: String = row.get("cleanup_status");
+    if status != "completed"
+        || !matches!(
+            cleanup_status.as_str(),
+            "pending" | "failed" | "interrupted"
+        )
+    {
+        return Err(AppError::bad("此任务当前不能清理旧存储"));
+    }
+    let (source, target_snapshot) = migration_candidates(&state, &job_id)
+        .await
+        .map_err(AppError::internal)?;
+    let active_target = state
+        .storage
+        .current_candidate()
+        .await
+        .map_err(AppError::internal)?;
+    if active_target.location_key() != target_snapshot.location_key() {
+        return Err(AppError::conflict(
+            "当前存储位置已改变，无法确认迁移目标，拒绝清理旧存储",
+        ));
+    }
+    if source.location_key() == active_target.location_key() {
+        return Err(AppError::conflict("旧存储与当前存储相同，拒绝删除"));
+    }
+    sqlx::query("UPDATE storage_migration_jobs SET cleanup_status='cleaning',cleanup_failed=0,updated_at=?,error=NULL WHERE id=?")
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    spawn_storage_cleanup(state, job_id, source, active_target, guard);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn retain_old_storage(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let _guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有存储任务正在运行"))?;
+    let changed = sqlx::query("UPDATE storage_migration_jobs SET cleanup_status='retained',updated_at=?,error=NULL WHERE id=? AND status='completed' AND cleanup_status IN ('pending','failed','interrupted')")
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .rows_affected();
+    if changed != 1 {
+        return Err(AppError::bad("此任务当前不能选择保留旧存储"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn read_site_settings(db: &SqlitePool) -> ApiResult<SiteSettings> {
@@ -2722,6 +3549,117 @@ async fn list_photos(State(state): State<AppState>) -> ApiResult<Json<Vec<Photo>
         .map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(photo_from).collect()))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletePhotosInput {
+    photo_ids: Vec<String>,
+}
+
+async fn delete_photo_records(
+    state: &AppState,
+    photo_ids: Vec<String>,
+) -> ApiResult<serde_json::Value> {
+    let unique = photo_ids.into_iter().collect::<HashSet<_>>();
+    if unique.is_empty() {
+        return Err(AppError::bad("请至少选择一张图片"));
+    }
+    if unique.len() > 500 {
+        return Err(AppError::bad("一次最多删除 500 张图片"));
+    }
+    let _mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再删除图片"))?;
+    let _photo_graph_guard = state.photo_graph_lock.lock().await;
+    let _storage_guard = state.storage.gate.read().await;
+    let mut query = QueryBuilder::<Sqlite>::new("SELECT id,storage_key FROM photos WHERE id IN (");
+    {
+        let mut separated = query.separated(",");
+        for id in &unique {
+            separated.push_bind(id);
+        }
+    }
+    query.push(")");
+    let rows = query
+        .build()
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    if rows.len() != unique.len() {
+        return Err(AppError::bad("部分图片已不存在，请刷新相簿后重试"));
+    }
+    for row in &rows {
+        let photo_id: String = row.get("id");
+        let storage_key: String = row.get("storage_key");
+        let conversion_reference: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversion_items WHERE status IN ('queued','processing') AND (source_photo_id=? OR target_photo_id=?))")
+            .bind(&photo_id)
+            .bind(&photo_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        let pending_source_cleanup: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM source_deletion_outbox WHERE source_photo_id=? OR target_key=?)")
+            .bind(&photo_id)
+            .bind(&storage_key)
+            .fetch_one(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        if conversion_reference || pending_source_cleanup {
+            return Err(AppError::conflict(
+                "所选图片正被转换任务或旧图清理任务使用，请先结束相关任务",
+            ));
+        }
+    }
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    for row in &rows {
+        let photo_id: String = row.get("id");
+        let storage_key: String = row.get("storage_key");
+        sqlx::query(
+            "INSERT INTO photo_deletion_outbox(photo_id,storage_key,created_at) VALUES(?,?,?)",
+        )
+        .bind(&photo_id)
+        .bind(&storage_key)
+        .bind(now())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+        sqlx::query("DELETE FROM photos WHERE id=?")
+            .bind(&photo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    let drain = drain_photo_deletion_outbox(&state.storage, &state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(serde_json::json!({
+        "deleted": rows.len(),
+        "objectsRemoved": drain.removed,
+        "cleanupPending": drain.failures.len(),
+        "failures": drain.failures
+    }))
+}
+
+async fn delete_photo(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&headers, &state, true).await?;
+    Ok(Json(delete_photo_records(&state, vec![photo_id]).await?))
+}
+
+async fn delete_photos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<DeletePhotosInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&headers, &state, true).await?;
+    Ok(Json(delete_photo_records(&state, input.photo_ids).await?))
+}
+
 async fn upload_photos(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
@@ -2729,6 +3667,11 @@ async fn upload_photos(
     mut multipart: Multipart,
 ) -> ApiResult<Json<Vec<Photo>>> {
     require_admin(&headers, &state, true).await?;
+    let _mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再上传"))?;
     let _upload_permit = state
         .upload_slots
         .acquire()
@@ -2933,6 +3876,11 @@ async fn start_conversion(
     Json(input): Json<ConvertRequest>,
 ) -> ApiResult<(StatusCode, Json<ConversionJob>)> {
     require_admin(&headers, &state, true).await?;
+    let mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再转换图片"))?;
     let _photo_graph_guard = state.photo_graph_lock.lock().await;
     let target = normalize_format(&input.target_format)
         .ok_or_else(|| AppError::bad("目标格式只能是 PNG、JPG/JPEG 或 WEBP"))?;
@@ -3002,6 +3950,7 @@ async fn start_conversion(
     let worker_state = state.clone();
     let job_id = job.id.clone();
     tokio::spawn(async move {
+        let _mutation_guard = mutation_guard;
         let inner_state = worker_state.clone();
         let inner_job_id = job_id.clone();
         let outcome =
@@ -3069,6 +4018,11 @@ async fn confirm_delete_sources(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&headers, &state, true).await?;
+    let _mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再删除旧格式图片"))?;
     let _photo_graph_guard = state.photo_graph_lock.lock().await;
     let _storage_guard = state.storage.gate.read().await;
     let job =
@@ -3415,7 +4369,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id));").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status);").execute(pool).await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -3508,6 +4462,17 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         .await?;
     sqlx::query("UPDATE conversion_items SET status='cancelled',error='服务器重启，任务已安全中断' WHERE status IN ('queued','processing')").execute(pool).await?;
     sqlx::query("UPDATE conversion_jobs SET status='interrupted',completed=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status IN ('succeeded','failed','cancelled')),succeeded=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='succeeded'),failed=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='failed'),cancelled=(SELECT COUNT(*) FROM conversion_items i WHERE i.job_id=conversion_jobs.id AND i.status='cancelled'),updated_at=? WHERE status IN ('queued','running')").bind(now()).execute(pool).await?;
+    sqlx::query("UPDATE storage_migration_items SET status='queued',error='服务器重启，复制任务已安全中断' WHERE status='processing'")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE storage_migration_jobs SET status='interrupted',completed=(SELECT COUNT(*) FROM storage_migration_items i WHERE i.job_id=storage_migration_jobs.id AND i.status IN ('succeeded','failed','cancelled')),succeeded=(SELECT COUNT(*) FROM storage_migration_items i WHERE i.job_id=storage_migration_jobs.id AND i.status='succeeded'),failed=(SELECT COUNT(*) FROM storage_migration_items i WHERE i.job_id=storage_migration_jobs.id AND i.status='failed'),cancelled=(SELECT COUNT(*) FROM storage_migration_items i WHERE i.job_id=storage_migration_jobs.id AND i.status='cancelled'),updated_at=?,error='服务器重启，迁移任务已安全中断' WHERE status IN ('queued','running')")
+        .bind(now())
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE storage_migration_jobs SET cleanup_status='interrupted',updated_at=?,error='服务器重启，旧存储清理已安全中断' WHERE cleanup_status='cleaning'")
+        .bind(now())
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at<=?")
         .bind(now())
         .execute(pool)
@@ -3549,6 +4514,7 @@ async fn main() -> Result<()> {
     let master_key = load_or_create_master_key(&config.master_key_file).await?;
     let storage = StorageService::new(db.clone(), master_key);
     let photo_graph_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let storage_mutation_gate = Arc::new(tokio::sync::RwLock::new(()));
     match recover_pending_blobs(&storage, &db, true).await {
         Ok(count) if count > 0 => info!(count, "recovered pending storage objects"),
         Ok(_) => {}
@@ -3556,6 +4522,15 @@ async fn main() -> Result<()> {
     }
     {
         let _storage_guard = storage.gate.write().await;
+        match drain_photo_deletion_outbox(&storage, &db).await {
+            Ok(result) if result.removed > 0 || !result.failures.is_empty() => info!(
+                removed = result.removed,
+                failures = result.failures.len(),
+                "replayed photo deletion outbox"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!("photo deletion recovery deferred: {error:#}"),
+        }
         match drain_source_deletion_outbox(&storage, &db, None).await {
             Ok(result) if result.removed > 0 || !result.failures.is_empty() => info!(
                 removed = result.removed,
@@ -3569,6 +4544,7 @@ async fn main() -> Result<()> {
     let janitor_storage = storage.clone();
     let janitor_db = db.clone();
     let janitor_photo_graph_lock = photo_graph_lock.clone();
+    let janitor_storage_mutation_gate = storage_mutation_gate.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await;
@@ -3586,8 +4562,20 @@ async fn main() -> Result<()> {
                 Ok(_) => {}
                 Err(error) => warn!("pending storage cleanup retry failed: {error:#}"),
             }
+            let Ok(_mutation_guard) = janitor_storage_mutation_gate.try_read() else {
+                continue;
+            };
             let _photo_graph_guard = janitor_photo_graph_lock.lock().await;
             let _storage_guard = janitor_storage.gate.write().await;
+            match drain_photo_deletion_outbox(&janitor_storage, &janitor_db).await {
+                Ok(result) if result.removed > 0 || !result.failures.is_empty() => info!(
+                    removed = result.removed,
+                    failures = result.failures.len(),
+                    "retried photo deletion outbox"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!("photo deletion retry failed: {error:#}"),
+            }
             match drain_source_deletion_outbox(&janitor_storage, &janitor_db, None).await {
                 Ok(result) if result.removed > 0 || !result.failures.is_empty() => info!(
                     removed = result.removed,
@@ -3606,6 +4594,8 @@ async fn main() -> Result<()> {
         trust_proxy_headers: config.trust_proxy_headers,
         workers: config.workers,
         jobs: Arc::new(DashMap::new()),
+        storage_tasks: Arc::new(DashMap::new()),
+        storage_mutation_gate,
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3633,6 +4623,26 @@ async fn main() -> Result<()> {
         )
         .route("/api/settings/storage/test", post(test_storage_settings))
         .route(
+            "/api/storage-migrations",
+            get(list_storage_migrations).post(start_storage_migration),
+        )
+        .route(
+            "/api/storage-migrations/{job_id}/resume",
+            post(resume_storage_migration),
+        )
+        .route(
+            "/api/storage-migrations/{job_id}/cancel",
+            post(cancel_storage_task),
+        )
+        .route(
+            "/api/storage-migrations/{job_id}/cleanup",
+            post(cleanup_old_storage),
+        )
+        .route(
+            "/api/storage-migrations/{job_id}/retain",
+            post(retain_old_storage),
+        )
+        .route(
             "/api/settings/site",
             get(get_site_settings).put(save_site_settings),
         )
@@ -3650,6 +4660,8 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::max(400 * 1024 * 1024)),
         )
         .route("/api/photos", get(list_photos))
+        .route("/api/photos/delete", post(delete_photos))
+        .route("/api/photos/{photo_id}", delete(delete_photo))
         .route("/api/photos/{photo_id}/file", get(photo_file))
         .route("/api/photos/{photo_id}/thumbnail", get(photo_thumbnail))
         .route(
@@ -3697,6 +4709,8 @@ mod tests {
             trust_proxy_headers: false,
             workers: 2,
             jobs: Arc::new(DashMap::new()),
+            storage_tasks: Arc::new(DashMap::new()),
+            storage_mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
