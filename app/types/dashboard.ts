@@ -98,3 +98,13 @@ export interface StorageSettingsInput {
   s3SecretKey?: string
   s3Prefix: string
 }
+
+export type SiteTheme = 'light' | 'dark' | 'system'
+
+export interface SiteSettings {
+  title: string
+  slogan: string
+  author: string
+  avatarUrl: string
+  theme: SiteTheme
+}

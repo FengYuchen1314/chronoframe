@@ -1,8 +1,8 @@
 <script lang="ts" setup>
 import type { NavigationMenuItem } from '@nuxt/ui'
 
-const config = useRuntimeConfig()
 const toast = useToast()
+const { settings: siteSettings, ensureSiteSettings } = useSiteSettings()
 const {
   authState,
   refreshAuthStatus,
@@ -17,7 +17,7 @@ const passwordConfirmation = ref('')
 const formError = ref('')
 const isSubmitting = ref(false)
 const isLoggingOut = ref(false)
-const appTitle = computed(() => String(config.public.app.title || 'ChronoFrame'))
+const appTitle = computed(() => siteSettings.value.title || 'ChronoFrame')
 const isRegistration = computed(() => !authState.value.initialized)
 
 const navItems = computed<NavigationMenuItem[][]>(() => [
@@ -36,6 +36,11 @@ const navItems = computed<NavigationMenuItem[][]>(() => [
       label: '格式转换',
       icon: 'tabler:arrows-exchange',
       to: '/dashboard/conversions',
+    },
+    {
+      label: '站点设置',
+      icon: 'tabler:settings',
+      to: '/dashboard/settings/general',
     },
     {
       label: '存储设置',
@@ -72,7 +77,10 @@ watch(isRegistration, () => {
   formError.value = ''
 })
 
-if (import.meta.client) void refreshAuthStatus()
+if (import.meta.client) {
+  void refreshAuthStatus()
+  void ensureSiteSettings().catch(() => undefined)
+}
 
 const clearFormError = () => {
   formError.value = ''
@@ -306,7 +314,7 @@ useHead({
 
       <template #header="{ collapsed }">
         <div v-if="!collapsed" class="flex items-center gap-2">
-          <img src="/favicon.svg" class="h-8 w-auto shrink-0" alt="" />
+          <img :src="siteSettings.avatarUrl" class="size-8 shrink-0 rounded-md object-cover" alt="" />
           <div class="flex min-w-0 flex-col">
             <NuxtLink to="/" class="line-clamp-1 text-lg font-medium">
               {{ appTitle }}
@@ -316,7 +324,7 @@ useHead({
             </span>
           </div>
         </div>
-        <img v-else src="/favicon.svg" class="mx-auto size-8" alt="" />
+        <img v-else :src="siteSettings.avatarUrl" class="mx-auto size-8 rounded-md object-cover" alt="" />
       </template>
 
       <template #default="{ collapsed }">

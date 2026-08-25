@@ -353,6 +353,17 @@ assert_no_s3_temps() {
   [[ -z "$found" ]] || fail "S3 temporary objects remain: $found"
 }
 
+assert_no_export_temps() {
+  local container found=""
+  container=$("${COMPOSE[@]}" ps -q chronoframe)
+  for _ in $(seq 1 40); do
+    found=$(docker exec "$container" find /tmp -maxdepth 1 -type d -name 'chronoframe-export-*' -print)
+    [[ -z "$found" ]] && return 0
+    sleep 0.1
+  done
+  fail "album export temporary directories remain: $found"
+}
+
 LOCAL_SETTINGS='{"backend":"local","localPath":"/app/data/e2e-local","webdavUrl":"","webdavUsername":"","webdavPrefix":"chronoframe","s3Endpoint":"","s3Region":"us-east-1","s3Bucket":"","s3AccessKey":"","s3Prefix":"chronoframe"}'
 WEBDAV_SETTINGS='{"backend":"webdav","localPath":"/app/data/e2e-local","webdavUrl":"http://webdav/","webdavUsername":"e2e-webdav-user","webdavPassword":"e2e-webdav-password","webdavPrefix":"e2e","s3Endpoint":"","s3Region":"us-east-1","s3Bucket":"","s3AccessKey":"","s3Prefix":"chronoframe"}'
 WEBDAV_BAD_SETTINGS='{"backend":"webdav","localPath":"/app/data/e2e-local","webdavUrl":"http://webdav/","webdavUsername":"e2e-webdav-user","webdavPassword":"definitely-wrong","webdavPrefix":"e2e","s3Endpoint":"","s3Region":"us-east-1","s3Bucket":"","s3AccessKey":"","s3Prefix":"chronoframe"}'
@@ -521,6 +532,28 @@ auth_curl -sS -D "$RUN_TMP_DIR/preflight.headers" -o /dev/null -X OPTIONS \
   "$BASE/api/albums"
 if grep -qi '^access-control-allow-origin:' "$RUN_TMP_DIR/preflight.headers"; then fail "cross-origin preflight was allowed"; fi
 
+# Original public site identity settings are database-backed and only administrators can change them.
+curl -fsS "$BASE/api/settings/site" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value == {"title":"ChronoFrame","slogan":"Frame the moments that matter.","author":"ChronoFrame","avatarUrl":"/web-app-manifest-192x192.png","theme":"system"}, value'
+unauthorized_site_settings=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/site-settings-unauthorized.json" -w '%{http_code}' \
+  -X PUT -H 'Content-Type: application/json' \
+  -d '{"title":"Forbidden","slogan":"","author":"","avatarUrl":"","theme":"system"}' "$BASE/api/settings/site")
+[[ "$unauthorized_site_settings" = 401 ]] || fail "unauthenticated site settings PUT returned HTTP $unauthorized_site_settings"
+invalid_site_settings=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/site-settings-invalid.json" -w '%{http_code}' \
+  -X PUT -H 'Content-Type: application/json' \
+  -d '{"title":"E2E Gallery","slogan":"Test slogan","author":"Test author","avatarUrl":"javascript:alert(1)","theme":"dark"}' "$BASE/api/settings/site")
+[[ "$invalid_site_settings" = 400 ]] || fail "unsafe site avatar URL returned HTTP $invalid_site_settings"
+api -X PUT -H 'Content-Type: application/json' \
+  -d '{"title":"  E2E Gallery  ","slogan":"  Test slogan  ","author":"  Test author  ","avatarUrl":"https://example.com/avatar.png","theme":"dark"}' \
+  "$BASE/api/settings/site" >"$RUN_TMP_DIR/site-settings.json"
+curl -fsS "$BASE/api/settings/site" >"$RUN_TMP_DIR/site-settings-public.json"
+python3 - "$RUN_TMP_DIR/site-settings.json" "$RUN_TMP_DIR/site-settings-public.json" <<'PY'
+import json, sys
+expected = {"title":"E2E Gallery","slogan":"Test slogan","author":"Test author","avatarUrl":"https://example.com/avatar.png","theme":"dark"}
+for path in sys.argv[1:]:
+    assert json.load(open(path)) == expected
+PY
+echo "PASS public site identity defaults, validation and administrator-only persistence"
+
 # Album metadata is administrator-only. Dates stay date-only strings and descriptions are trimmed.
 date_album_response=$(api -H 'Content-Type: application/json' -d '{"name":"E2E album metadata","description":"  Initial album story  "}' "$BASE/api/albums")
 date_album=$(printf '%s' "$date_album_response" | json_value "['id']")
@@ -688,6 +721,40 @@ local_webp_job=$(start_job "$local_webp_album" webp)
 assert_completed_job "$local_webp_job" 1 webp 'local.png'
 local_webp_target=$(first_job_target "$local_webp_job")
 cp "$RUN_TMP_DIR/output-$local_webp_job-0.webp" "$RUN_TMP_DIR/fixture.webp"
+upload "$local_webp_album" "local.png" >/dev/null
+
+unauthorized_export=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/export-unauthorized.json" -w '%{http_code}' "$BASE/api/albums/export?albumIds=$local_webp_album")
+[[ "$unauthorized_export" = 401 ]] || fail "unauthenticated album export returned HTTP $unauthorized_export"
+api -D "$RUN_TMP_DIR/export-single.headers" "$BASE/api/albums/export?albumIds=$local_webp_album" -o "$RUN_TMP_DIR/export-single.zip"
+python3 - "$RUN_TMP_DIR/export-single.zip" "$RUN_TMP_DIR/export-single.headers" <<'PY'
+import pathlib, sys, zipfile
+archive, headers = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text().lower()
+with zipfile.ZipFile(archive) as value:
+    assert sorted(value.namelist()) == ["local (2).png", "local.png", "local.webp"], value.namelist()
+    assert all(not name.startswith(('/', '\\')) and '..' not in pathlib.PurePosixPath(name).parts for name in value.namelist())
+assert 'content-type: application/zip' in headers
+assert 'content-disposition: attachment;' in headers and "filename*=utf-8''e2e%20local%20webp.zip" in headers
+PY
+(auth_curl -fsS --connect-timeout 5 --max-time 180 --limit-rate 1024 \
+  "$BASE/api/albums/export?albumIds=$local_webp_album" -o "$RUN_TMP_DIR/export-aborted.zip") &
+aborted_export_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$RUN_TMP_DIR/export-aborted.zip" ]] && break
+  kill -0 "$aborted_export_pid" 2>/dev/null || break
+  sleep 0.1
+done
+[[ -s "$RUN_TMP_DIR/export-aborted.zip" ]] || fail "throttled export did not start streaming before interruption test"
+kill "$aborted_export_pid" 2>/dev/null || true
+wait "$aborted_export_pid" 2>/dev/null || true
+assert_no_export_temps
+empty_export_album=$(make_album "E2E empty export")
+api "$BASE/api/albums/export?albumIds=$empty_export_album" -o "$RUN_TMP_DIR/export-empty.zip"
+python3 - "$RUN_TMP_DIR/export-empty.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as value:
+    assert value.namelist() == []
+PY
+assert_no_export_temps
 
 local_jpg_album=$(make_album "E2E local JPEG alias")
 local_jpg_upload=$(upload "$local_jpg_album" "alias-source.png")
@@ -702,12 +769,25 @@ deleted_code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/photos/$local_
 [[ "$deleted_code" = 404 ]] || fail "deleted local source still returned HTTP $deleted_code"
 curl -fsS "$BASE/api/photos/$local_jpg_target/file" -o "$RUN_TMP_DIR/local-survivor.jpg"
 assert_signature "$RUN_TMP_DIR/local-survivor.jpg" jpg
+api "$BASE/api/albums/export?albumIds=$local_webp_album,$local_jpg_album" -o "$RUN_TMP_DIR/export-multiple.zip"
+python3 - "$RUN_TMP_DIR/export-multiple.zip" <<'PY'
+import io, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as outer:
+    assert sorted(outer.namelist()) == ["E2E local JPEG alias.zip", "E2E local WEBP.zip"], outer.namelist()
+    for name in outer.namelist():
+        with zipfile.ZipFile(io.BytesIO(outer.read(name))) as inner:
+            assert inner.testzip() is None
+            assert inner.namelist(), (name, inner.namelist())
+PY
+duplicate_export=$(auth_curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/export-duplicate.json" -w '%{http_code}' "$BASE/api/albums/export?albumIds=$local_webp_album,$local_webp_album")
+[[ "$duplicate_export" = 400 ]] || fail "duplicate album export returned HTTP $duplicate_export"
+assert_no_export_temps
 repeat_delete=$(auth_curl -sS -o "$RUN_TMP_DIR/repeat-delete.json" -w '%{http_code}' -X DELETE "$BASE/api/conversions/$local_jpg_job/delete-sources")
 [[ "$repeat_delete" = 400 ]] || fail "repeat source deletion returned HTTP $repeat_delete"
 switch_code=$(auth_curl -sS -o "$RUN_TMP_DIR/switch.json" -w '%{http_code}' -H 'Content-Type: application/json' -X PUT -d "$WEBDAV_SETTINGS" "$BASE/api/settings/storage")
 [[ "$switch_code" = 400 ]] || fail "unsafe non-empty storage switch returned HTTP $switch_code"
 assert_no_local_temps
-echo "PASS local storage, strict conversions, explicit deletion and storage switch guard"
+echo "PASS local storage, single/multi nested ZIP export, strict conversions, explicit deletion and storage switch guard"
 
 # WebDAV rejects bad credentials before commit, then recovers and supports conversion/deletion.
 reset_stack
@@ -732,6 +812,13 @@ assert_delete_sources "$webdav_job" 1
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/photos/$webdav_source/file")" = 404 ]]
 curl -fsS "$BASE/api/photos/$webdav_target/file" -o "$RUN_TMP_DIR/webdav-target.webp"
 assert_signature "$RUN_TMP_DIR/webdav-target.webp" webp
+api "$BASE/api/albums/export?albumIds=$webdav_album" -o "$RUN_TMP_DIR/webdav-export.zip"
+python3 - "$RUN_TMP_DIR/webdav-export.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as value:
+    assert value.testzip() is None and value.namelist() == ["webdav.webp"], value.namelist()
+PY
+assert_no_export_temps
 webdav_container=$("${COMPOSE[@]}" ps -q webdav)
 webdav_orphan=$(docker exec "$webdav_container" find /var/lib/dav -type f -name "$webdav_source.png" -print)
 [[ -z "$webdav_orphan" ]] || fail "deleted WebDAV source object remains"
@@ -764,6 +851,13 @@ assert_delete_sources "$s3_job" 1
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/photos/$s3_source/file")" = 404 ]]
 curl -fsS "$BASE/api/photos/$s3_target/file" -o "$RUN_TMP_DIR/s3-target.jpg"
 assert_signature "$RUN_TMP_DIR/s3-target.jpg" jpg
+api "$BASE/api/albums/export?albumIds=$s3_album" -o "$RUN_TMP_DIR/s3-export.zip"
+python3 - "$RUN_TMP_DIR/s3-export.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as value:
+    assert value.testzip() is None and value.namelist() == ["s3.jpg"], value.namelist()
+PY
+assert_no_export_temps
 s3_objects=$(docker run --rm --network "$NETWORK_NAME" --entrypoint /bin/sh minio/mc:latest -c \
   'mc alias set e2e http://minio:9000 e2e-minio-access e2e-minio-secret-change-me >/dev/null && mc find e2e/chronoframe-e2e/e2e')
 if printf '%s\n' "$s3_objects" | grep -Fq "$s3_source_key"; then fail "deleted S3 source object remains"; fi

@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    io::{Cursor, ErrorKind},
+    io::{Cursor, ErrorKind, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
@@ -22,7 +24,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, config::Builder as S3ConfigBuilder};
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{
         DefaultBodyLimit, Multipart, Path as AxumPath, Query, State,
         rejection::{BytesRejection, JsonRejection},
@@ -36,7 +38,10 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use dashmap::DashMap;
-use futures_util::stream::{self, StreamExt};
+use futures_util::{
+    Stream,
+    stream::{self, StreamExt},
+};
 use image::ImageFormat;
 use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
@@ -45,13 +50,14 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use subtle::ConstantTimeEq;
 use tokio::{io::AsyncWriteExt, time::timeout};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 #[derive(Clone)]
 struct AppState {
@@ -62,6 +68,7 @@ struct AppState {
     workers: usize,
     jobs: Arc<DashMap<String, CancellationToken>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
+    export_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
     thumbnail_slots: Arc<tokio::sync::Semaphore>,
     password_hash_slots: Arc<tokio::sync::Semaphore>,
@@ -701,6 +708,73 @@ struct StorageSettingsOutput {
     s3_access_key: String,
     s3_secret_key_set: bool,
     s3_prefix: String,
+}
+
+const DEFAULT_SITE_TITLE: &str = "ChronoFrame";
+const DEFAULT_SITE_SLOGAN: &str = "Frame the moments that matter.";
+const DEFAULT_SITE_AUTHOR: &str = "ChronoFrame";
+const DEFAULT_SITE_AVATAR_URL: &str = "/web-app-manifest-192x192.png";
+const DEFAULT_SITE_THEME: &str = "system";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SiteSettings {
+    title: String,
+    slogan: String,
+    author: String,
+    avatar_url: String,
+    theme: String,
+}
+
+impl SiteSettings {
+    fn defaults() -> Self {
+        Self {
+            title: DEFAULT_SITE_TITLE.into(),
+            slogan: DEFAULT_SITE_SLOGAN.into(),
+            author: DEFAULT_SITE_AUTHOR.into(),
+            avatar_url: DEFAULT_SITE_AVATAR_URL.into(),
+            theme: DEFAULT_SITE_THEME.into(),
+        }
+    }
+
+    fn normalize(self) -> ApiResult<Self> {
+        let normalized = Self {
+            title: self.title.trim().to_string(),
+            slogan: self.slogan.trim().to_string(),
+            author: self.author.trim().to_string(),
+            avatar_url: self.avatar_url.trim().to_string(),
+            theme: self.theme.trim().to_ascii_lowercase(),
+        };
+        if normalized.title.is_empty() || normalized.title.chars().count() > 100 {
+            return Err(AppError::bad("网站名称不能为空且不得超过 100 个字符"));
+        }
+        if normalized.slogan.chars().count() > 200 {
+            return Err(AppError::bad("网站标语不得超过 200 个字符"));
+        }
+        if normalized.author.chars().count() > 100 {
+            return Err(AppError::bad("作者名称不得超过 100 个字符"));
+        }
+        if normalized.avatar_url.chars().count() > 2048 {
+            return Err(AppError::bad("头像 URL 不得超过 2048 个字符"));
+        }
+        if !normalized.avatar_url.is_empty() {
+            let valid_relative = normalized.avatar_url.starts_with('/')
+                && !normalized.avatar_url.starts_with("//")
+                && !normalized.avatar_url.chars().any(char::is_control);
+            let valid_absolute = url::Url::parse(&normalized.avatar_url)
+                .ok()
+                .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+            if !valid_relative && !valid_absolute {
+                return Err(AppError::bad(
+                    "头像 URL 必须是以 / 开头的站内路径，或完整的 HTTP(S) URL",
+                ));
+            }
+        }
+        if !matches!(normalized.theme.as_str(), "light" | "dark" | "system") {
+            return Err(AppError::bad("默认主题只能是 light、dark 或 system"));
+        }
+        Ok(normalized)
+    }
 }
 
 impl StorageService {
@@ -1961,6 +2035,64 @@ async fn test_storage_settings(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
+async fn read_site_settings(db: &SqlitePool) -> ApiResult<SiteSettings> {
+    let rows = sqlx::query("SELECT key,value FROM app_settings WHERE key LIKE 'site_%'")
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?;
+    let values = rows
+        .iter()
+        .map(|row| (row.get::<String, _>("key"), row.get::<String, _>("value")))
+        .collect::<HashMap<_, _>>();
+    let defaults = SiteSettings::defaults();
+    Ok(SiteSettings {
+        title: values.get("site_title").cloned().unwrap_or(defaults.title),
+        slogan: values
+            .get("site_slogan")
+            .cloned()
+            .unwrap_or(defaults.slogan),
+        author: values
+            .get("site_author")
+            .cloned()
+            .unwrap_or(defaults.author),
+        avatar_url: values
+            .get("site_avatar_url")
+            .cloned()
+            .unwrap_or(defaults.avatar_url),
+        theme: values.get("site_theme").cloned().unwrap_or(defaults.theme),
+    })
+}
+
+async fn get_site_settings(State(state): State<AppState>) -> ApiResult<Json<SiteSettings>> {
+    Ok(Json(read_site_settings(&state.db).await?))
+}
+
+async fn save_site_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SiteSettings>,
+) -> ApiResult<Json<SiteSettings>> {
+    require_admin(&headers, &state, true).await?;
+    let settings = input.normalize()?;
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    for (key, value) in [
+        ("site_title", settings.title.as_str()),
+        ("site_slogan", settings.slogan.as_str()),
+        ("site_author", settings.author.as_str()),
+        ("site_avatar_url", settings.avatar_url.as_str()),
+        ("site_theme", settings.theme.as_str()),
+    ] {
+        sqlx::query("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(Json(settings))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NewAlbum {
@@ -2245,6 +2377,344 @@ async fn album_photos(
     let rows = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC").bind(album_id).fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(photo_from).collect()))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlbumExportQuery {
+    album_ids: String,
+}
+
+struct AlbumExportSelection {
+    name: String,
+    photos: Vec<(String, String)>,
+}
+
+struct PreparedArchivePhoto {
+    source_path: PathBuf,
+    archive_name: String,
+}
+
+struct CleanupFileStream {
+    inner: ReaderStream<tokio::fs::File>,
+    cleanup_dir: Option<PathBuf>,
+}
+
+struct ExportTempGuard {
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl ExportTempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            cleanup_dir: Some(path),
+        }
+    }
+
+    fn take(&mut self) -> PathBuf {
+        self.cleanup_dir
+            .take()
+            .expect("export temporary directory can only be transferred once")
+    }
+}
+
+fn schedule_export_cleanup(path: PathBuf) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Err(error) = tokio::fs::remove_dir_all(&path).await
+                && error.kind() != ErrorKind::NotFound
+            {
+                warn!(path = %path.display(), "album export cleanup failed: {error:#}");
+            }
+        });
+    } else if let Err(error) = std::fs::remove_dir_all(&path)
+        && error.kind() != ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), "album export cleanup failed: {error:#}");
+    }
+}
+
+impl Drop for ExportTempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.cleanup_dir.take() {
+            schedule_export_cleanup(path);
+        }
+    }
+}
+
+impl Stream for CleanupFileStream {
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(context)
+    }
+}
+
+impl Drop for CleanupFileStream {
+    fn drop(&mut self) {
+        if let Some(path) = self.cleanup_dir.take() {
+            schedule_export_cleanup(path);
+        }
+    }
+}
+
+fn sanitize_export_name(value: &str, fallback: &str) -> String {
+    let candidate = value
+        .split(['/', '\\'])
+        .next_back()
+        .unwrap_or(value)
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(180)
+        .collect::<String>();
+    let trimmed = candidate.trim_matches(|character| matches!(character, '.' | ' '));
+    if trimmed.is_empty() || matches!(trimmed, "." | "..") {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn unique_export_name(desired: String, used: &mut HashSet<String>) -> String {
+    let mut candidate = desired.clone();
+    let mut suffix = 2;
+    while !used.insert(candidate.to_ascii_lowercase()) {
+        candidate = match desired.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() => {
+                format!("{stem} ({suffix}).{extension}")
+            }
+            _ => format!("{desired} ({suffix})"),
+        };
+        suffix += 1;
+    }
+    candidate
+}
+
+fn write_album_zip(path: &Path, photos: &[PreparedArchivePhoto]) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut archive = ZipWriter::new(std::io::BufWriter::new(file));
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(6))
+        .large_file(true)
+        .unix_permissions(0o644);
+    for photo in photos {
+        archive.start_file(&photo.archive_name, options)?;
+        let mut source = std::fs::File::open(&photo.source_path)?;
+        std::io::copy(&mut source, &mut archive)?;
+    }
+    let mut file = archive.finish()?;
+    file.flush()?;
+    Ok(())
+}
+
+fn write_nested_export_zip(path: &Path, albums: &[(PathBuf, String)]) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut archive = ZipWriter::new(std::io::BufWriter::new(file));
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .large_file(true)
+        .unix_permissions(0o644);
+    for (source_path, archive_name) in albums {
+        archive.start_file(archive_name, options)?;
+        let mut source = std::fs::File::open(source_path)?;
+        std::io::copy(&mut source, &mut archive)?;
+    }
+    let mut file = archive.finish()?;
+    file.flush()?;
+    Ok(())
+}
+
+async fn export_albums(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AlbumExportQuery>,
+) -> ApiResult<Response> {
+    require_admin(&headers, &state, false).await?;
+    let album_ids = query
+        .album_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if album_ids.is_empty() {
+        return Err(AppError::bad("请至少选择一个相簿"));
+    }
+    if album_ids.len() > 64 {
+        return Err(AppError::bad("一次最多打包 64 个相簿"));
+    }
+    let unique_ids = album_ids.iter().cloned().collect::<HashSet<_>>();
+    if unique_ids.len() != album_ids.len() {
+        return Err(AppError::bad("相簿选择中存在重复项"));
+    }
+
+    let mut selections = Vec::with_capacity(album_ids.len());
+    for album_id in &album_ids {
+        let name = sqlx::query_scalar::<_, String>("SELECT name FROM albums WHERE id=?")
+            .bind(album_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("相簿不存在：{album_id}"),
+                clear_auth_cookies: None,
+            })?;
+        let photo_rows = sqlx::query(
+            "SELECT storage_key,original_name FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC",
+        )
+        .bind(album_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+        selections.push(AlbumExportSelection {
+            name,
+            photos: photo_rows
+                .iter()
+                .map(|row| (row.get("storage_key"), row.get("original_name")))
+                .collect(),
+        });
+    }
+
+    let export_permit = timeout(
+        Duration::from_secs(5),
+        state.export_slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| AppError::too_many("当前打包任务较多，请稍后重试"))?
+    .map_err(|_| AppError::internal(anyhow!("album export queue closed")))?;
+    let temporary_dir = std::env::temp_dir().join(format!("chronoframe-export-{}", Uuid::new_v4()));
+    let mut temporary_guard = ExportTempGuard::new(temporary_dir.clone());
+    let build_result: Result<(PathBuf, String)> = async {
+        tokio::fs::create_dir(&temporary_dir).await?;
+        let _storage_guard = state.storage.gate.read().await;
+        let store = state.storage.store().await?;
+        let mut album_archives = Vec::with_capacity(selections.len());
+        let mut used_album_names = HashSet::new();
+
+        for (album_index, album) in selections.iter().enumerate() {
+            let source_dir = temporary_dir.join(format!("album-{album_index}-files"));
+            tokio::fs::create_dir(&source_dir).await?;
+            let mut prepared_photos = Vec::with_capacity(album.photos.len());
+            let mut used_photo_names = HashSet::new();
+            for (photo_index, (storage_key, original_name)) in album.photos.iter().enumerate() {
+                let data = timeout(STORAGE_IO_TIMEOUT, store.get(storage_key))
+                    .await
+                    .with_context(|| format!("读取图片超时：{original_name}"))??;
+                let source_path = source_dir.join(format!("{photo_index}.blob"));
+                tokio::fs::write(&source_path, data).await?;
+                let archive_name = unique_export_name(
+                    sanitize_export_name(original_name, "photo"),
+                    &mut used_photo_names,
+                );
+                prepared_photos.push(PreparedArchivePhoto {
+                    source_path,
+                    archive_name,
+                });
+            }
+
+            let archive_path = temporary_dir.join(format!("album-{album_index}.zip"));
+            tokio::task::spawn_blocking({
+                let archive_path = archive_path.clone();
+                move || write_album_zip(&archive_path, &prepared_photos)
+            })
+            .await
+            .context("相簿打包线程异常")??;
+            tokio::fs::remove_dir_all(&source_dir).await?;
+            let archive_name = unique_export_name(
+                format!("{}.zip", sanitize_export_name(&album.name, "album")),
+                &mut used_album_names,
+            );
+            album_archives.push((archive_path, archive_name));
+        }
+
+        if album_archives.len() == 1 {
+            let (path, filename) = album_archives
+                .into_iter()
+                .next()
+                .expect("single album export has an archive");
+            Ok((path, filename))
+        } else {
+            let path = temporary_dir.join("chronoframe-albums.zip");
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || write_nested_export_zip(&path, &album_archives)
+            })
+            .await
+            .context("多相簿打包线程异常")??;
+            Ok((path, "chronoframe-albums.zip".into()))
+        }
+    }
+    .await;
+    drop(export_permit);
+
+    let (archive_path, download_name) = match build_result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup_error) = tokio::fs::remove_dir_all(&temporary_dir).await
+                && cleanup_error.kind() != ErrorKind::NotFound
+            {
+                warn!(path = %temporary_dir.display(), "failed export cleanup after error: {cleanup_error:#}");
+            }
+            return Err(AppError::internal(error));
+        }
+    };
+    let archive_size = match tokio::fs::metadata(&archive_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
+            return Err(AppError::internal(error));
+        }
+    };
+    let archive = match tokio::fs::File::open(&archive_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&temporary_dir).await;
+            return Err(AppError::internal(error));
+        }
+    };
+    let stream = CleanupFileStream {
+        inner: ReaderStream::new(archive),
+        cleanup_dir: Some(temporary_guard.take()),
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&archive_size.to_string()).map_err(AppError::internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"chronoframe-albums.zip\"; filename*=UTF-8''{}",
+            urlencoding::encode(&download_name)
+        ))
+        .map_err(AppError::internal)?,
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    Ok(response)
+}
+
 async fn list_photos(State(state): State<AppState>) -> ApiResult<Json<Vec<Photo>>> {
     let rows = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos ORDER BY created_at DESC,id DESC")
         .fetch_all(&state.db)
@@ -3012,6 +3482,11 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         ("storage_s3_access_key", ""),
         ("storage_s3_secret_key", ""),
         ("storage_s3_prefix", "chronoframe"),
+        ("site_title", DEFAULT_SITE_TITLE),
+        ("site_slogan", DEFAULT_SITE_SLOGAN),
+        ("site_author", DEFAULT_SITE_AUTHOR),
+        ("site_avatar_url", DEFAULT_SITE_AVATAR_URL),
+        ("site_theme", DEFAULT_SITE_THEME),
     ] {
         sqlx::query("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING")
             .bind(key)
@@ -3132,6 +3607,7 @@ async fn main() -> Result<()> {
         workers: config.workers,
         jobs: Arc::new(DashMap::new()),
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3156,8 +3632,13 @@ async fn main() -> Result<()> {
             get(get_storage_settings).put(save_storage_settings),
         )
         .route("/api/settings/storage/test", post(test_storage_settings))
+        .route(
+            "/api/settings/site",
+            get(get_site_settings).put(save_site_settings),
+        )
         .route("/api/albums", get(list_albums).post(create_album))
         .route("/api/albums/order", post(reorder_albums))
+        .route("/api/albums/export", get(export_albums))
         .route(
             "/api/albums/{album_id}",
             get(album_detail).patch(patch_album),
@@ -3217,6 +3698,7 @@ mod tests {
             workers: 2,
             jobs: Arc::new(DashMap::new()),
             conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -3267,6 +3749,53 @@ mod tests {
         let seed = "legacy-token-used-only-for-storage-migration";
         let expected = Sha256::digest(seed.as_bytes());
         assert_eq!(&legacy_storage_key(seed)[..], &expected[..]);
+    }
+
+    #[test]
+    fn export_names_strip_paths_and_disambiguate_case_insensitively() {
+        assert_eq!(
+            sanitize_export_name("../../photo?.png", "photo"),
+            "photo_.png"
+        );
+        assert_eq!(
+            sanitize_export_name("..\\camera\\frame.jpg", "photo"),
+            "frame.jpg"
+        );
+        assert_eq!(sanitize_export_name("...", "album"), "album");
+        let mut used = HashSet::new();
+        assert_eq!(
+            unique_export_name("Photo.JPG".into(), &mut used),
+            "Photo.JPG"
+        );
+        assert_eq!(
+            unique_export_name("photo.jpg".into(), &mut used),
+            "photo (2).jpg"
+        );
+    }
+
+    #[test]
+    fn site_settings_trim_public_values_and_reject_unsafe_urls() {
+        let normalized = SiteSettings {
+            title: "  My Gallery  ".into(),
+            slogan: "  A slogan  ".into(),
+            author: "  Owner  ".into(),
+            avatar_url: "/avatar.png".into(),
+            theme: " DARK ".into(),
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(normalized.title, "My Gallery");
+        assert_eq!(normalized.slogan, "A slogan");
+        assert_eq!(normalized.author, "Owner");
+        assert_eq!(normalized.theme, "dark");
+        assert!(
+            SiteSettings {
+                avatar_url: "javascript:alert(1)".into(),
+                ..SiteSettings::defaults()
+            }
+            .normalize()
+            .is_err()
+        );
     }
 
     #[test]
