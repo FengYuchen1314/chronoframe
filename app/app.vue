@@ -4,10 +4,19 @@ import type { ViewerReturnTarget } from '~/composables/useViewerState'
 
 const router = useRouter()
 const route = useRoute()
-const config = useRuntimeConfig()
 const colorMode = useColorMode()
+const { settings: siteSettings, loaded: siteSettingsLoaded, ensureSiteSettings } = useSiteSettings()
 
 if (!colorMode.preference) colorMode.preference = 'system'
+if (import.meta.client) void ensureSiteSettings().catch(() => undefined)
+
+watch(
+  () => siteSettingsLoaded.value ? siteSettings.value.theme : null,
+  (theme) => {
+    if (theme) colorMode.preference = theme
+  },
+  { immediate: true },
+)
 
 const { data, refresh: refreshPhotos, status } = useFetch<RustPhoto[]>('/api/photos', {
   server: false,
@@ -207,7 +216,7 @@ watch(
 )
 
 useHead({
-  titleTemplate: title => `${title ? `${title} | ` : ''}${config.public.app.title}`,
+  titleTemplate: title => `${title ? `${title} | ` : ''}${siteSettings.value.title}`,
 })
 </script>
 
