@@ -51,6 +51,10 @@ const selectedJob = computed(() =>
 )
 const detailJob = computed(() => selectedDetail.value?.job || selectedJob.value)
 const hasActiveJobs = computed(() => jobs.value.some(job => isActive(job)))
+const activeJobCount = computed(() => jobs.value.filter(job => isActive(job)).length)
+const completedJobCount = computed(() => jobs.value.filter(job => job.status === 'completed').length)
+const attentionJobCount = computed(() => jobs.value.filter(job => ['failed', 'interrupted'].includes(job.status)).length)
+const convertedImageCount = computed(() => jobs.value.reduce((total, job) => total + job.succeeded, 0))
 const hasPendingRecovery = computed(() => jobs.value.some(job => job.sourcesDeletedAt === -2))
 const hasPollableWork = computed(() => hasActiveJobs.value || hasPendingRecovery.value)
 const allAlbumsSelected = computed(() =>
@@ -396,7 +400,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <UDashboardPanel>
+  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
       <UDashboardNavbar title="格式转换">
         <template #right>
@@ -418,14 +422,23 @@ onBeforeUnmount(() => {
     </template>
 
     <template #body>
-      <div class="space-y-6">
-        <UAlert
-          color="info"
-          variant="subtle"
-          icon="tabler:server-cog"
-          title="任务在 Rust 后台异步多线程执行"
-          description="页面只轮询服务端权威状态；刷新、切换页面或断网不会中断任务。要停止任务必须使用「安全中断」。"
-        />
+      <div class="dashboard-panel-body space-y-6">
+        <DashboardPageHero
+          eyebrow="Conversion queue"
+          title="批量转换，过程始终可控"
+          description="选择一个或多个相簿后交给 Rust 后台并行处理。关闭页面不会停止任务，旧格式原图只会在你检查结果并手动确认后删除。"
+          icon="tabler:arrows-exchange"
+        >
+          <template #actions>
+            <UButton to="/dashboard/albums" color="neutral" variant="soft" size="lg" icon="tabler:album">管理相簿</UButton>
+          </template>
+          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">进行中</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ activeJobCount }}</p></div>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">已完成任务</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ completedJobCount }}</p></div>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">成功转换图片</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ convertedImageCount }}</p></div>
+            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">需要关注</p><p class="mt-1 text-xl font-semibold" :class="attentionJobCount ? 'text-warning' : 'text-highlighted'">{{ attentionJobCount }}</p></div>
+          </div>
+        </DashboardPageHero>
 
         <UAlert
           v-if="pageError"
@@ -447,11 +460,14 @@ onBeforeUnmount(() => {
 
         <div class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(300px,390px)_minmax(0,1fr)]">
           <div class="space-y-4">
-            <UCard>
+            <UCard id="new-conversion" class="rounded-2xl shadow-sm">
               <template #header>
-                <div>
-                  <h2 class="font-semibold">新建转换任务</h2>
-                  <p class="mt-1 text-sm text-muted">可同时选择一个或多个相簿</p>
+                <div class="flex items-start gap-3">
+                  <span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:plus" class="size-5" /></span>
+                  <div>
+                    <h2 class="font-semibold text-highlighted">新建转换任务</h2>
+                    <p class="mt-1 text-sm text-muted">选择目标格式和相簿范围</p>
+                  </div>
                 </div>
               </template>
 
@@ -484,8 +500,8 @@ onBeforeUnmount(() => {
                       v-for="album in albums"
                       :key="album.id"
                       type="button"
-                      class="flex w-full items-center gap-3 rounded-md border px-3 py-3 text-left transition"
-                      :class="selectedAlbumIds.includes(album.id) ? 'border-primary bg-primary/5' : 'border-default hover:bg-elevated'"
+                      class="flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left transition"
+                      :class="selectedAlbumIds.includes(album.id) ? 'border-primary/30 bg-primary/10' : 'border-default hover:bg-elevated'"
                       @click="toggleAlbum(album.id)"
                     >
                       <input
@@ -503,13 +519,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <UAlert
-                  color="neutral"
-                  variant="subtle"
-                  icon="tabler:filter"
-                  title="后端会自动跳过已是目标格式的图片"
-                  :description="`已选 ${selectedAlbumIds.length} 个相簿；只处理 PNG、JPG/JPEG、WEBP 之间的转换。`"
-                />
+                <div class="rounded-xl bg-elevated px-3 py-3 text-sm text-muted"><p class="flex items-center gap-2 font-medium text-highlighted"><Icon name="tabler:filter" class="size-4 text-primary" />自动跳过已是目标格式的图片</p><p class="mt-1 text-xs">已选 {{ selectedAlbumIds.length }} 个相簿，只处理 PNG、JPG/JPEG、WEBP。</p></div>
 
                 <UButton
                   block
@@ -546,12 +556,12 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="min-w-0 space-y-4">
-            <UCard :ui="{ body: 'p-2 sm:p-2' }">
+            <UCard class="rounded-2xl shadow-sm" :ui="{ body: 'p-2 sm:p-2' }">
               <template #header>
                 <div class="flex items-center justify-between gap-3">
                   <div>
-                    <h2 class="font-semibold">任务历史</h2>
-                    <p class="mt-1 text-sm text-muted">最近 100 个任务</p>
+                    <h2 class="font-semibold text-highlighted">任务队列</h2>
+                    <p class="mt-1 text-sm text-muted">最近 100 个任务，选择后在下方查看详情</p>
                   </div>
                   <UBadge color="neutral" variant="soft">{{ jobs.length }}</UBadge>
                 </div>
@@ -561,8 +571,8 @@ onBeforeUnmount(() => {
                 <div
                   v-for="job in jobs"
                   :key="job.id"
-                  class="flex items-center gap-2 rounded-md p-2 transition"
-                  :class="selectedJobId === job.id ? 'bg-primary/10' : 'hover:bg-elevated'"
+                  class="flex items-center gap-2 rounded-xl border p-2 transition"
+                  :class="selectedJobId === job.id ? 'border-primary/20 bg-primary/10' : 'border-transparent hover:bg-elevated'"
                 >
                   <button type="button" class="min-w-0 flex-1 px-1 py-1 text-left" @click="selectJob(job.id)">
                     <div class="flex flex-wrap items-center gap-2">
@@ -599,7 +609,7 @@ onBeforeUnmount(() => {
               </div>
             </UCard>
 
-            <UCard v-if="detailJob">
+            <UCard v-if="detailJob" class="rounded-2xl shadow-sm">
               <template #header>
                 <div class="flex flex-wrap items-start justify-between gap-3">
                   <div class="min-w-0">

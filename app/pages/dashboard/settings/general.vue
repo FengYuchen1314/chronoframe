@@ -12,7 +12,7 @@ const colorMode = useColorMode()
 const { adminFetch } = useAdminApi()
 const { applySiteSettings } = useSiteSettings()
 
-const themeOptions = [
+const themeOptions: Array<{ label: string, value: SiteTheme, icon: string }> = [
   { label: '跟随系统', value: 'system', icon: 'tabler:device-desktop' },
   { label: '浅色', value: 'light', icon: 'tabler:sun' },
   { label: '深色', value: 'dark', icon: 'tabler:moon' },
@@ -68,6 +68,10 @@ const loadSettings = async () => {
 
 const resetForm = () => {
   void loadSettings()
+}
+
+const changeTheme = (theme: SiteTheme) => {
+  form.theme = theme
 }
 
 const saveSettings = async () => {
@@ -130,115 +134,71 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
 </script>
 
 <template>
-  <UDashboardPanel>
+  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="站点设置">
+      <UDashboardNavbar title="站点外观">
         <template #right>
-          <UButton
-            icon="tabler:refresh"
-            color="neutral"
-            variant="ghost"
-            :loading="isLoading"
-            :disabled="isSaving"
-            @click="loadSettings"
-          >
-            刷新
-          </UButton>
+          <UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading" :disabled="isSaving" @click="loadSettings">重新读取</UButton>
         </template>
       </UDashboardNavbar>
     </template>
 
     <template #body>
-      <div class="mx-auto w-full max-w-4xl space-y-6">
-        <UAlert
-          v-if="loadError"
-          color="error"
-          variant="subtle"
-          icon="tabler:alert-circle"
-          title="站点设置加载失败"
-          :description="loadError"
-        />
+      <div class="dashboard-panel-body space-y-6">
+        <DashboardPageHero eyebrow="Public site" title="让公开相簿带上你的名字" description="网站名称、标语、作者、头像和默认主题都保存在后台数据库中，保存后立即用于公开页面。" icon="tabler:palette">
+          <template #actions><UButton to="/" target="_blank" color="neutral" variant="soft" size="lg" icon="tabler:external-link">查看公开页面</UButton></template>
+        </DashboardPageHero>
 
-        <UCard>
-          <template #header>
-            <div>
-              <h2 class="font-semibold">公开站点信息</h2>
-              <p class="mt-1 text-sm text-muted">恢复原版的可自定义项目，配置保存在数据库中，不需要新增环境变量。</p>
-            </div>
-          </template>
+        <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="站点设置加载失败" :description="loadError" />
 
-          <form id="site-settings-form" class="space-y-5" @submit.prevent="saveSettings">
-            <UFormField label="网站名称" description="显示在照片页、浏览器标题和管理后台。" required>
-              <UInput v-model="form.title" maxlength="100" icon="tabler:world" class="w-full" :disabled="isLoading || isSaving" />
-            </UFormField>
+        <div class="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <form id="site-settings-form" class="dashboard-section overflow-hidden" @submit.prevent="saveSettings">
+            <header class="flex items-start gap-3 border-b border-default px-5 py-4 sm:px-6">
+              <span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:world-cog" class="size-5" /></span>
+              <div><h2 class="font-semibold text-highlighted">站点身份</h2><p class="mt-1 text-sm text-muted">访客在首页、相簿页和浏览器标题中看到的内容</p></div>
+            </header>
 
-            <UFormField label="网站标语" description="显示在相簿首页和照片页；留空可隐藏。">
-              <UInput v-model="form.slogan" maxlength="200" icon="tabler:quote" class="w-full" :disabled="isLoading || isSaving" />
-            </UFormField>
-
-            <UFormField label="作者名称" description="显示在照片页底部版权信息；留空时使用网站名称。">
-              <UInput v-model="form.author" maxlength="100" icon="tabler:user" class="w-full" :disabled="isLoading || isSaving" />
-            </UFormField>
-
-            <UFormField label="头像 URL" description="支持以 / 开头的站内路径，或完整 HTTP(S) URL；留空使用默认图标。">
-              <UInput v-model="form.avatarUrl" maxlength="2048" icon="tabler:photo" class="w-full" :disabled="isLoading || isSaving" @update:model-value="avatarPreviewFailed = false" />
-            </UFormField>
-
-            <div class="flex items-center gap-4 rounded-lg border border-default bg-elevated p-4">
-              <img
-                v-if="!avatarPreviewFailed"
-                :src="previewAvatarUrl"
-                alt="头像预览"
-                class="size-16 rounded-full bg-default object-cover shadow-sm"
-                @error="avatarPreviewFailed = true"
-              >
-              <span v-else class="flex size-16 items-center justify-center rounded-full bg-muted text-muted">
-                <Icon name="tabler:photo-off" class="size-7" />
-              </span>
-              <div class="min-w-0">
-                <p class="font-medium">头像预览</p>
-                <p class="mt-1 truncate text-sm text-muted">{{ previewAvatarUrl }}</p>
+            <div class="space-y-5 p-5 sm:p-6">
+              <UFormField label="网站名称" description="显示在公开页面、浏览器标题和管理后台。" required><UInput v-model="form.title" maxlength="100" icon="tabler:world" size="lg" class="w-full" :disabled="isLoading || isSaving" /></UFormField>
+              <UFormField label="网站标语" description="显示在相簿首页和照片页；留空可隐藏。"><UInput v-model="form.slogan" maxlength="200" icon="tabler:quote" size="lg" class="w-full" :disabled="isLoading || isSaving" /></UFormField>
+              <div class="grid gap-5 md:grid-cols-2">
+                <UFormField label="作者名称" description="用于照片页底部版权信息。"><UInput v-model="form.author" maxlength="100" icon="tabler:user" class="w-full" :disabled="isLoading || isSaving" /></UFormField>
+                <UFormField label="头像 URL" description="站内路径或完整 HTTP(S) URL。"><UInput v-model="form.avatarUrl" maxlength="2048" icon="tabler:photo" class="w-full" :disabled="isLoading || isSaving" @update:model-value="avatarPreviewFailed = false" /></UFormField>
               </div>
             </div>
+
+            <section class="border-t border-default p-5 sm:p-6">
+              <div class="mb-4"><h3 class="font-semibold text-highlighted">默认主题</h3><p class="mt-1 text-sm text-muted">访客首次打开网站时采用，仍可在照片页临时切换。</p></div>
+              <div class="grid gap-3 sm:grid-cols-3">
+                <button v-for="option in themeOptions" :key="option.value" type="button" class="flex items-center gap-3 rounded-xl border p-3 text-left transition" :class="form.theme === option.value ? 'border-primary/30 bg-primary/10 text-primary' : 'border-default hover:bg-elevated'" :disabled="isLoading || isSaving" @click="changeTheme(option.value)">
+                  <span class="flex size-9 items-center justify-center rounded-lg bg-elevated"><Icon :name="option.icon" class="size-4" /></span><span class="text-sm font-medium">{{ option.label }}</span><Icon v-if="form.theme === option.value" name="tabler:check" class="ml-auto size-4" />
+                </button>
+              </div>
+            </section>
           </form>
-        </UCard>
 
-        <UCard>
-          <template #header>
-            <div>
-              <h2 class="font-semibold">默认外观</h2>
-              <p class="mt-1 text-sm text-muted">访客首次打开网站时采用该主题，仍可在照片页临时切换。</p>
+          <aside class="dashboard-section overflow-hidden xl:sticky xl:top-4">
+            <div class="border-b border-default px-5 py-4"><h2 class="font-semibold text-highlighted">即时预览</h2><p class="mt-1 text-sm text-muted">保存前先确认公开站点身份</p></div>
+            <div class="p-5">
+              <div class="relative overflow-hidden rounded-2xl border border-primary/20 bg-gradient-to-br from-primary/10 via-default to-info/10 p-5">
+                <div class="pointer-events-none absolute -right-10 -top-10 size-32 rounded-full bg-primary/20 blur-2xl" />
+                <div class="relative">
+                  <img v-if="!avatarPreviewFailed" :src="previewAvatarUrl" alt="头像预览" class="size-16 rounded-2xl bg-default object-cover shadow-md ring-1 ring-default" @error="avatarPreviewFailed = true">
+                  <span v-else class="flex size-16 items-center justify-center rounded-2xl bg-elevated text-muted"><Icon name="tabler:photo-off" class="size-7" /></span>
+                  <h3 class="mt-5 break-words text-2xl font-semibold tracking-tight text-highlighted">{{ form.title.trim() || '网站名称' }}</h3>
+                  <p class="mt-2 break-words text-sm leading-6 text-muted">{{ form.slogan.trim() || '这里会显示网站标语' }}</p>
+                  <div class="mt-6 flex items-center gap-2 border-t border-default/60 pt-4 text-xs text-muted"><Icon name="tabler:copyright" class="size-4" /><span>{{ form.author.trim() || form.title.trim() || '作者' }}</span></div>
+                </div>
+              </div>
+              <div class="mt-4 flex items-center justify-between rounded-xl bg-elevated px-3 py-2.5 text-xs"><span class="text-muted">默认主题</span><span class="font-medium text-highlighted">{{ themeOptions.find(option => option.value === form.theme)?.label }}</span></div>
+              <p v-if="avatarPreviewFailed" class="mt-3 flex items-start gap-2 text-xs leading-5 text-warning"><Icon name="tabler:alert-circle" class="mt-0.5 size-4 shrink-0" />头像地址无法加载，保存前请检查 URL。</p>
             </div>
-          </template>
-          <UFormField label="默认主题">
-            <USelect
-              v-model="form.theme"
-              :items="themeOptions"
-              value-key="value"
-              label-key="label"
-              icon="tabler:palette"
-              class="w-full"
-              :disabled="isLoading || isSaving"
-            />
-          </UFormField>
-        </UCard>
+          </aside>
+        </div>
 
-        <UAlert
-          v-if="isDirty"
-          color="warning"
-          variant="subtle"
-          icon="tabler:edit"
-          title="有未保存的更改"
-          description="保存后公开页面会立即使用新设置。"
-        />
-
-        <div class="flex justify-end gap-2">
-          <UButton color="neutral" variant="outline" :disabled="!isDirty || isLoading || isSaving" @click="resetForm">
-            放弃修改
-          </UButton>
-          <UButton form="site-settings-form" type="submit" icon="tabler:device-floppy" :loading="isSaving" :disabled="!isDirty || isLoading">
-            保存站点设置
-          </UButton>
+        <div class="sticky bottom-3 z-10 flex flex-col gap-3 rounded-2xl border border-default bg-default/90 p-3 shadow-lg backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
+          <p class="flex items-center gap-2 text-sm" :class="isDirty ? 'text-warning' : 'text-muted'"><Icon :name="isDirty ? 'tabler:edit-circle' : 'tabler:circle-check'" class="size-5" />{{ isDirty ? '有未保存的更改，公开页面尚未更新' : '当前设置已保存' }}</p>
+          <div class="flex justify-end gap-2"><UButton color="neutral" variant="ghost" :disabled="!isDirty || isLoading || isSaving" @click="resetForm">放弃修改</UButton><UButton form="site-settings-form" type="submit" icon="tabler:device-floppy" :loading="isSaving" :disabled="!isDirty || isLoading">保存并发布</UButton></div>
         </div>
       </div>
     </template>
