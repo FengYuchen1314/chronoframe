@@ -22,12 +22,6 @@ export default defineNuxtConfig({
   runtimeConfig: {
     public: {
       VERSION: pkg.version,
-      app: {
-        title: 'ChronoFrame',
-        slogan: 'Frame the moments that matter.',
-        author: 'ChronoFrame',
-        avatarUrl: '/web-app-manifest-192x192.png',
-      },
     },
   },
 

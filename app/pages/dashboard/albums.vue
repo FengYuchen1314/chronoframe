@@ -16,6 +16,8 @@ const photos = ref<Photo[]>([])
 const newAlbumName = ref('')
 const newAlbumDescription = ref('')
 const selectedFiles = ref<File[]>([])
+const exportAlbumIds = ref<string[]>([])
+const isStartingExport = ref(false)
 const uploadInput = ref<HTMLInputElement | null>(null)
 const albumDateDraft = reactive({
   displayCreatedDate: '',
@@ -79,6 +81,41 @@ const isAlbumInteractionLocked = computed(() =>
 const selectedBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
 )
+const selectedExportAlbums = computed(() =>
+  albums.value.filter(album => exportAlbumIds.value.includes(album.id)),
+)
+
+const toggleExportAlbum = (albumId: string, checked: boolean) => {
+  exportAlbumIds.value = checked
+    ? [...new Set([...exportAlbumIds.value, albumId])]
+    : exportAlbumIds.value.filter(id => id !== albumId)
+}
+
+const handleExportAlbumToggle = (albumId: string, event: Event) => {
+  toggleExportAlbum(albumId, (event.target as HTMLInputElement | null)?.checked === true)
+}
+
+const startAlbumExport = () => {
+  if (!exportAlbumIds.value.length || isStartingExport.value) return
+  isStartingExport.value = true
+  const query = new URLSearchParams({ albumIds: exportAlbumIds.value.join(',') })
+  const link = document.createElement('a')
+  link.href = `/api/albums/export?${query.toString()}`
+  link.rel = 'noopener'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  toast.add({
+    title: '已开始准备相簿压缩包',
+    description: exportAlbumIds.value.length === 1
+      ? `将下载「${selectedExportAlbums.value[0]?.name || '相簿'}」的 ZIP。`
+      : `将下载一个外层 ZIP，其中包含 ${exportAlbumIds.value.length} 个相簿 ZIP。`,
+    color: 'success',
+  })
+  window.setTimeout(() => {
+    isStartingExport.value = false
+  }, 3000)
+}
 
 const formatBytes = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
@@ -201,6 +238,8 @@ const refreshAlbums = async (preferredAlbumId?: string): Promise<boolean> => {
   try {
     const nextAlbums = await adminFetch<Album[]>('/api/albums')
     albums.value = nextAlbums
+    const existingAlbumIds = new Set(nextAlbums.map(album => album.id))
+    exportAlbumIds.value = exportAlbumIds.value.filter(albumId => existingAlbumIds.has(albumId))
 
     const candidateId = preferredAlbumId || selectedAlbumId.value
     const nextSelectedId = nextAlbums.some(album => album.id === candidateId)
@@ -636,6 +675,62 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
               <div v-else class="px-3 py-8 text-center">
                 <Icon name="tabler:album-off" class="mx-auto size-8 text-muted" />
                 <p class="mt-2 text-sm text-muted">尚未创建相簿</p>
+              </div>
+            </UCard>
+
+            <UCard :ui="{ body: 'p-2 sm:p-2' }">
+              <template #header>
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 class="font-semibold">相簿打包下载</h2>
+                    <p class="mt-1 text-sm text-muted">单选直接生成 ZIP；多选生成包含多个相簿 ZIP 的压缩包。</p>
+                  </div>
+                  <UBadge color="primary" variant="soft">{{ exportAlbumIds.length }}</UBadge>
+                </div>
+              </template>
+
+              <div v-if="albums.length" class="space-y-3">
+                <div class="flex gap-2 px-1">
+                  <UButton size="xs" color="neutral" variant="soft" :disabled="exportAlbumIds.length === albums.length" @click="exportAlbumIds = albums.map(album => album.id)">
+                    全选
+                  </UButton>
+                  <UButton size="xs" color="neutral" variant="ghost" :disabled="!exportAlbumIds.length" @click="exportAlbumIds = []">
+                    清空
+                  </UButton>
+                </div>
+
+                <div class="max-h-64 space-y-1 overflow-y-auto">
+                  <label
+                    v-for="album in albums"
+                    :key="`export-${album.id}`"
+                    class="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2.5 hover:bg-elevated"
+                  >
+                    <input
+                      type="checkbox"
+                      class="size-4 accent-primary"
+                      :checked="exportAlbumIds.includes(album.id)"
+                      @change="handleExportAlbumToggle(album.id, $event)"
+                    >
+                    <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ album.name }}</span>
+                    <span class="shrink-0 text-xs text-muted">{{ album.photoCount }} 张</span>
+                  </label>
+                </div>
+
+                <UAlert
+                  color="neutral"
+                  variant="subtle"
+                  icon="tabler:archive"
+                  :description="exportAlbumIds.length === 1 ? '压缩包内直接放置该相簿的图片。' : exportAlbumIds.length > 1 ? `外层压缩包内会有 ${exportAlbumIds.length} 个独立相簿 ZIP。` : '请选择一个或多个相簿。'"
+                />
+
+                <UButton block icon="tabler:file-zip" :loading="isStartingExport" :disabled="!exportAlbumIds.length" @click="startAlbumExport">
+                  打包并下载
+                </UButton>
+              </div>
+
+              <div v-else class="px-3 py-8 text-center">
+                <Icon name="tabler:archive-off" class="mx-auto size-8 text-muted" />
+                <p class="mt-2 text-sm text-muted">创建相簿后才能打包下载</p>
               </div>
             </UCard>
           </div>

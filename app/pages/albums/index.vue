@@ -2,8 +2,8 @@
 import { motion } from 'motion-v'
 import type { RustAlbum } from '~~/shared/types/photo'
 
-const config = useRuntimeConfig()
 const { t } = useI18n()
+const { settings: siteSettings } = useSiteSettings()
 const { photos } = usePhotos()
 const { data, status } = useFetch<RustAlbum[]>('/api/albums', {
   server: false,
@@ -68,7 +68,7 @@ useHead({ title: t('title.albums') })
 
     <section class="flex flex-col items-center px-4 pb-10 pt-24 sm:pb-24 sm:pt-48">
       <h1 class="bg-linear-to-br from-neutral-800 to-neutral-400 bg-clip-text text-4xl font-black text-transparent drop-shadow-2xl sm:text-7xl dark:from-white dark:to-neutral-500">{{ t('title.albums').toUpperCase() }}</h1>
-      <p class="mt-2 max-w-full truncate text-base font-medium font-[Pacifico] text-neutral-600 sm:text-lg dark:text-neutral-400">{{ config.public.app.slogan }}</p>
+      <p v-if="siteSettings.slogan" class="mt-2 max-w-full truncate text-base font-medium font-[Pacifico] text-neutral-600 sm:text-lg dark:text-neutral-400">{{ siteSettings.slogan }}</p>
     </section>
 
     <section class="container mx-auto px-4 py-6 sm:px-6 sm:py-12 lg:px-8">
