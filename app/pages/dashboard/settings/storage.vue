@@ -1,6 +1,8 @@
 <script lang="ts" setup>
 import type {
+  Album,
   StorageBackend,
+  StorageMigrationJob,
   StorageSettings,
   StorageSettingsInput,
 } from '~/types/dashboard'
@@ -55,8 +57,13 @@ const savedTargetSignature = ref('')
 const isLoading = ref(false)
 const isTesting = ref(false)
 const isSaving = ref(false)
+const isLoadingMigrations = ref(false)
+const isStorageTaskAction = ref(false)
+const migrationJobs = ref<StorageMigrationJob[]>([])
+const storedPhotoCount = ref(0)
 const loadError = ref('')
 const lastTest = ref<{ backend: StorageBackend, at: Date } | null>(null)
+let migrationPoll: ReturnType<typeof setInterval> | null = null
 
 const formSignature = computed(() => JSON.stringify({
   backend: form.backend,
@@ -100,6 +107,16 @@ const targetSignature = computed(() => {
 const storageTargetChanged = computed(() =>
   targetSignature.value !== savedTargetSignature.value,
 )
+const latestMigration = computed(() => migrationJobs.value[0] || null)
+const activeStorageTask = computed(() => migrationJobs.value.find(job =>
+  ['queued', 'running'].includes(job.status) || job.cleanupStatus === 'cleaning',
+) || null)
+const migrationRequired = computed(() => storageTargetChanged.value && storedPhotoCount.value > 0)
+const migrationProgress = computed(() => {
+  const job = latestMigration.value
+  if (!job?.total) return 0
+  return Math.min(100, Math.round((job.completed / job.total) * 100))
+})
 
 const lastTestDescription = computed(() => {
   const result = lastTest.value
@@ -154,11 +171,77 @@ const loadSettings = async () => {
   lastTest.value = null
 
   try {
-    applySettings(await adminFetch<StorageSettings>('/api/settings/storage'))
+    const [settings, albums] = await Promise.all([
+      adminFetch<StorageSettings>('/api/settings/storage'),
+      adminFetch<Album[]>('/api/albums'),
+    ])
+    applySettings(settings)
+    storedPhotoCount.value = albums.reduce((total, album) => total + album.photoCount, 0)
   } catch (error) {
     loadError.value = getAdminApiErrorMessage(error)
   } finally {
     isLoading.value = false
+  }
+}
+
+const loadMigrations = async () => {
+  if (isLoadingMigrations.value) return
+  isLoadingMigrations.value = true
+  try {
+    migrationJobs.value = await adminFetch<StorageMigrationJob[]>('/api/storage-migrations')
+  } catch (error) {
+    if (!loadError.value) loadError.value = getAdminApiErrorMessage(error)
+  } finally {
+    isLoadingMigrations.value = false
+  }
+}
+
+const migrationStatusText = (job: StorageMigrationJob) => {
+  if (job.cleanupStatus === 'cleaning') return '正在清理旧存储'
+  if (job.status === 'completed') {
+    return {
+      pending: '等待处理旧存储',
+      cleaned: '旧存储已清理',
+      retained: '旧存储已保留',
+      failed: '旧存储清理失败',
+      interrupted: '旧存储清理已中断',
+    }[job.cleanupStatus] || '迁移完成'
+  }
+  return {
+    queued: '等待开始',
+    running: '正在迁移',
+    failed: '迁移失败',
+    cancelled: '迁移已中断',
+    interrupted: '迁移被重启中断',
+  }[job.status] || job.status
+}
+
+const migrationStatusColor = (job: StorageMigrationJob): 'success' | 'error' | 'warning' | 'primary' => {
+  if (job.cleanupStatus === 'cleaned' || job.cleanupStatus === 'retained') return 'success'
+  if (job.status === 'failed' || job.cleanupStatus === 'failed') return 'error'
+  if (job.status === 'cancelled' || job.status === 'interrupted' || job.cleanupStatus === 'interrupted') return 'warning'
+  return 'primary'
+}
+
+const runStorageTaskAction = async (
+  job: StorageMigrationJob,
+  action: 'resume' | 'cancel' | 'cleanup' | 'retain',
+) => {
+  if (isStorageTaskAction.value) return
+  if (action === 'cleanup' && !window.confirm(`确定删除迁移前 ${job.sourceBackend.toUpperCase()} 存储中的全部旧图片吗？\n\n系统会逐张校验当前存储中的副本后再删除，但删除动作不能撤销。`)) return
+  if (action === 'retain' && !window.confirm('确定保留旧存储中的图片吗？\n\n系统会结束本次迁移流程，不会删除旧副本。')) return
+  isStorageTaskAction.value = true
+  try {
+    await adminFetch(`/api/storage-migrations/${job.id}/${action}`, { method: 'POST' })
+    toast.add({
+      title: action === 'cleanup' ? '已开始清理旧存储' : action === 'retain' ? '已保留旧存储' : action === 'resume' ? '已继续迁移' : '已请求安全中断',
+      color: action === 'cancel' ? 'warning' : 'success',
+    })
+    await loadMigrations()
+  } catch (error) {
+    toast.add({ title: '存储任务操作失败', description: getAdminApiErrorMessage(error), color: 'error' })
+  } finally {
+    isStorageTaskAction.value = false
   }
 }
 
@@ -195,8 +278,8 @@ const testConnection = async () => {
 const saveSettings = async () => {
   if (isTesting.value || isSaving.value) return
   if (
-    storageTargetChanged.value
-    && !window.confirm('确认更改活动存储目标？\n\n系统始终只使用一个活动后端。如果已有图片，后端会拒绝直接更改类型、路径、Endpoint、桶或前缀，避免产生不完整的存储引用。')
+    migrationRequired.value
+    && !window.confirm(`确认将 ${storedPhotoCount.value} 张图片迁移到新的存储位置？\n\n迁移会在后台复制并读回校验；完成后才切换存储。旧存储不会自动删除。`)
   ) return
 
   const payload = buildPayload()
@@ -204,17 +287,27 @@ const saveSettings = async () => {
   isSaving.value = true
 
   try {
-    const saved = await adminFetch<StorageSettings>('/api/settings/storage', {
-      method: 'PUT',
-      body: payload,
-    })
-    applySettings(saved)
-    lastTest.value = { backend: saved.backend, at: new Date() }
-    toast.add({
-      title: '存储设置已保存',
-      description: '后端已验证连接并将该配置设为唯一活动存储。',
-      color: 'success',
-    })
+    if (migrationRequired.value) {
+      await adminFetch<StorageMigrationJob>('/api/storage-migrations', { method: 'POST', body: payload })
+      toast.add({
+        title: '存储迁移已开始',
+        description: '可以离开此页面；任务会持久化记录进度，服务重启后可手动继续。',
+        color: 'success',
+      })
+      await loadMigrations()
+    } else {
+      const saved = await adminFetch<StorageSettings>('/api/settings/storage', {
+        method: 'PUT',
+        body: payload,
+      })
+      applySettings(saved)
+      lastTest.value = { backend: saved.backend, at: new Date() }
+      toast.add({
+        title: '存储设置已保存',
+        description: '后端已验证连接并将该配置设为唯一活动存储。',
+        color: 'success',
+      })
+    }
   } catch (error) {
     toast.add({
       title: '存储设置保存失败',
@@ -233,15 +326,25 @@ const changeBackend = (backend: StorageBackend) => {
   form.backend = backend
 }
 
-onMounted(loadSettings)
-onBeforeUnmount(clearSensitiveInputs)
+onMounted(async () => {
+  await Promise.all([loadSettings(), loadMigrations()])
+  migrationPoll = window.setInterval(async () => {
+    const wasActive = Boolean(activeStorageTask.value)
+    await loadMigrations()
+    if (wasActive && !activeStorageTask.value) await loadSettings()
+  }, 2000)
+})
+onBeforeUnmount(() => {
+  clearSensitiveInputs()
+  if (migrationPoll !== null) window.clearInterval(migrationPoll)
+})
 </script>
 
 <template>
   <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
       <UDashboardNavbar title="存储中心">
-        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading" @click="loadSettings">重新读取</UButton></template>
+        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading || isLoadingMigrations" @click="loadSettings(); loadMigrations()">重新读取</UButton></template>
       </UDashboardNavbar>
     </template>
 
@@ -254,12 +357,43 @@ onBeforeUnmount(clearSensitiveInputs)
         <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="存储设置加载失败" :description="loadError" />
         <UAlert v-if="lastTest" color="success" variant="subtle" icon="tabler:circle-check" title="最近一次连接验证通过" :description="lastTestDescription" />
 
+        <section v-if="latestMigration" class="dashboard-section overflow-hidden">
+          <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
+            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:transfer" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">存储迁移</h2><p class="mt-1 text-sm text-muted">{{ latestMigration.sourceBackend.toUpperCase() }} → {{ latestMigration.targetBackend.toUpperCase() }} · {{ latestMigration.total }} 张图片</p></div></div>
+            <UBadge :color="migrationStatusColor(latestMigration)" variant="soft">{{ migrationStatusText(latestMigration) }}</UBadge>
+          </header>
+          <div class="space-y-4 p-5 sm:p-6">
+            <div v-if="latestMigration.cleanupStatus === 'cleaning' || ['cleaned', 'retained'].includes(latestMigration.cleanupStatus)">
+              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">旧存储处理进度</span><strong class="text-highlighted">{{ latestMigration.cleanupCompleted }} / {{ latestMigration.total }}</strong></div>
+              <UProgress :model-value="latestMigration.total ? Math.round(latestMigration.cleanupCompleted / latestMigration.total * 100) : 0" />
+            </div>
+            <div v-else>
+              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">复制并校验进度</span><strong class="text-highlighted">{{ latestMigration.completed }} / {{ latestMigration.total }}（{{ migrationProgress }}%）</strong></div>
+              <UProgress :model-value="migrationProgress" />
+              <p class="mt-2 text-xs text-muted">成功 {{ latestMigration.succeeded }} · 失败 {{ latestMigration.failed }} · 已中断 {{ latestMigration.cancelled }}</p>
+            </div>
+            <UAlert v-if="latestMigration.error" color="warning" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestMigration.error" />
+            <div v-if="latestMigration.status === 'completed' && ['pending', 'failed', 'interrupted'].includes(latestMigration.cleanupStatus)" class="rounded-xl border border-warning/20 bg-warning/10 p-4">
+              <p class="font-medium text-warning">新存储已启用，旧存储尚未处理</p>
+              <p class="mt-1 text-xs leading-5 text-muted">删除前会再次读回并校验新存储中的每张图片。也可以选择保留旧副本作为备份。</p>
+            </div>
+            <div class="flex flex-wrap justify-end gap-2">
+              <UButton v-if="['queued', 'running'].includes(latestMigration.status) || latestMigration.cleanupStatus === 'cleaning'" color="warning" variant="soft" icon="tabler:player-stop" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cancel')">安全中断</UButton>
+              <UButton v-if="['failed', 'cancelled', 'interrupted'].includes(latestMigration.status)" icon="tabler:player-play" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'resume')">继续迁移</UButton>
+              <template v-if="latestMigration.status === 'completed' && ['pending', 'failed', 'interrupted'].includes(latestMigration.cleanupStatus)">
+                <UButton color="neutral" variant="soft" icon="tabler:archive" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'retain')">保留旧存储</UButton>
+                <UButton color="error" icon="tabler:trash" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cleanup')">删除旧存储图片</UButton>
+              </template>
+            </div>
+          </div>
+        </section>
+
         <div class="grid items-start gap-5 xl:grid-cols-[300px_minmax(0,1fr)]">
           <aside class="space-y-4 xl:sticky xl:top-4">
             <section class="dashboard-section overflow-hidden">
               <div class="border-b border-default px-4 py-4"><h2 class="font-semibold text-highlighted">1. 选择存储类型</h2><p class="mt-1 text-sm text-muted">选择后只填写对应配置</p></div>
               <div class="space-y-2 p-2">
-                <button v-for="option in backendOptions" :key="option.value" type="button" class="flex w-full items-center gap-3 rounded-xl border p-3 text-left transition" :class="form.backend === option.value ? 'border-primary/30 bg-primary/10' : 'border-transparent hover:bg-elevated'" :disabled="isLoading || isTesting || isSaving" @click="changeBackend(option.value)">
+                <button v-for="option in backendOptions" :key="option.value" type="button" class="flex w-full items-center gap-3 rounded-xl border p-3 text-left transition" :class="form.backend === option.value ? 'border-primary/30 bg-primary/10' : 'border-transparent hover:bg-elevated'" :disabled="isLoading || isTesting || isSaving || Boolean(activeStorageTask)" @click="changeBackend(option.value)">
                   <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="form.backend === option.value ? 'bg-primary text-inverted' : 'bg-elevated text-muted'"><Icon :name="option.icon" class="size-5" /></span>
                   <span class="min-w-0 flex-1"><span class="block text-sm font-medium text-highlighted">{{ option.label }}</span><span class="mt-0.5 block text-xs leading-5 text-muted">{{ backendDescriptions[option.value] }}</span></span>
                   <Icon v-if="form.backend === option.value" name="tabler:check" class="size-4 shrink-0 text-primary" />
@@ -272,7 +406,7 @@ onBeforeUnmount(clearSensitiveInputs)
             </section>
 
             <section v-if="storageTargetChanged" class="rounded-2xl border border-warning/20 bg-warning/10 p-4 text-sm text-warning">
-              <p class="flex items-center gap-2 font-medium"><Icon name="tabler:alert-triangle" class="size-4" />存储目标发生变化</p><p class="mt-2 text-xs leading-5">已有图片时，后端会拒绝直接切换路径、Endpoint、桶或前缀，避免文件引用失效。</p>
+              <p class="flex items-center gap-2 font-medium"><Icon name="tabler:alert-triangle" class="size-4" />存储目标发生变化</p><p class="mt-2 text-xs leading-5">{{ storedPhotoCount ? `保存后会迁移 ${storedPhotoCount} 张图片，全部校验成功才切换。` : '当前没有图片，可以直接切换。' }}</p>
             </section>
           </aside>
 
@@ -315,7 +449,7 @@ onBeforeUnmount(clearSensitiveInputs)
             <footer class="border-t border-default bg-muted/50 p-4 sm:px-6">
               <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p class="flex items-center gap-2 text-sm" :class="isDirty ? 'text-warning' : 'text-muted'"><Icon :name="isDirty ? 'tabler:edit-circle' : 'tabler:circle-check'" class="size-5" />{{ isDirty ? '配置有未保存的更改' : '当前配置已保存' }}</p>
-                <div class="flex flex-wrap justify-end gap-2"><UButton color="neutral" variant="outline" icon="tabler:plug-connected" :loading="isTesting" :disabled="isSaving" @click="testConnection">只测试连接</UButton><UButton icon="tabler:device-floppy" :loading="isSaving" :disabled="isTesting || !isDirty" @click="saveSettings">验证、保存并启用</UButton></div>
+                <div class="flex flex-wrap justify-end gap-2"><UButton color="neutral" variant="outline" icon="tabler:plug-connected" :loading="isTesting" :disabled="isSaving || Boolean(activeStorageTask)" @click="testConnection">只测试连接</UButton><UButton :icon="migrationRequired ? 'tabler:transfer' : 'tabler:device-floppy'" :loading="isSaving" :disabled="isTesting || !isDirty || Boolean(activeStorageTask)" @click="saveSettings">{{ migrationRequired ? '开始安全迁移' : '验证、保存并启用' }}</UButton></div>
               </div>
               <p class="mt-3 text-xs leading-5 text-muted">测试或保存请求发出后，密码和 Secret Key 输入框会立即清空。</p>
             </footer>
