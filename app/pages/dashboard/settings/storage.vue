@@ -14,7 +14,7 @@ useHead({ title: '存储设置' })
 const toast = useToast()
 const { adminFetch } = useAdminApi()
 
-const backendOptions = [
+const backendOptions: Array<{ label: string, value: StorageBackend, icon: string }> = [
   { label: '本地存储', value: 'local', icon: 'tabler:server' },
   { label: 'WebDAV', value: 'webdav', icon: 'tabler:cloud-upload' },
   { label: 'S3 对象存储', value: 's3', icon: 'tabler:brand-aws' },
@@ -24,6 +24,12 @@ const backendIcons: Record<StorageBackend, string> = {
   local: 'tabler:server',
   webdav: 'tabler:cloud-upload',
   s3: 'tabler:brand-aws',
+}
+
+const backendDescriptions: Record<StorageBackend, string> = {
+  local: '随 Compose 数据目录一起备份迁移',
+  webdav: '连接支持 WebDAV 的网盘或服务器',
+  s3: '兼容 AWS S3、Cloudflare R2 等对象存储',
 }
 
 const form = reactive({
@@ -232,228 +238,89 @@ onBeforeUnmount(clearSensitiveInputs)
 </script>
 
 <template>
-  <UDashboardPanel>
+  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="存储设置">
-        <template #right>
-          <UButton
-            icon="tabler:refresh"
-            color="neutral"
-            variant="ghost"
-            :loading="isLoading"
-            @click="loadSettings"
-          >
-            重新读取
-          </UButton>
-        </template>
+      <UDashboardNavbar title="存储中心">
+        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading" @click="loadSettings">重新读取</UButton></template>
       </UDashboardNavbar>
     </template>
 
     <template #body>
-      <div class="mx-auto w-full max-w-5xl space-y-6">
-        <section class="space-y-2 border-b border-default pb-4">
-          <h1 class="text-xl font-semibold">存储设置</h1>
-          <p class="text-sm text-muted">
-            所有存储参数都在此后台设置并写入数据库，不使用环境变量配置。系统始终只有一个活动存储后端。
-          </p>
-        </section>
+      <div class="dashboard-panel-body space-y-6">
+        <DashboardPageHero eyebrow="Storage backend" title="选择图片实际存放的位置" description="本地、WebDAV 和 S3 配置全部写入后台数据库，不需要创建环境变量。系统始终只使用一个活动存储后端。" icon="tabler:database-cog">
+          <template #actions><UBadge color="success" variant="soft" size="lg"><Icon :name="backendIcons[savedBackend]" class="mr-1 size-4" />当前：{{ backendOptions.find(item => item.value === savedBackend)?.label }}</UBadge></template>
+        </DashboardPageHero>
 
-        <UAlert
-          v-if="loadError"
-          color="error"
-          variant="subtle"
-          icon="tabler:alert-circle"
-          title="存储设置加载失败"
-          :description="loadError"
-        />
+        <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="存储设置加载失败" :description="loadError" />
+        <UAlert v-if="lastTest" color="success" variant="subtle" icon="tabler:circle-check" title="最近一次连接验证通过" :description="lastTestDescription" />
 
-        <UAlert
-          v-if="lastTest"
-          color="success"
-          variant="subtle"
-          icon="tabler:circle-check"
-          title="最近一次连接验证通过"
-          :description="lastTestDescription"
-        />
-
-        <UCard>
-          <template #header>
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <h2 class="font-semibold">活动存储后端</h2>
-                <p class="mt-1 text-sm text-muted">上传、缩略图、转换和旧图删除都使用该后端</p>
+        <div class="grid items-start gap-5 xl:grid-cols-[300px_minmax(0,1fr)]">
+          <aside class="space-y-4 xl:sticky xl:top-4">
+            <section class="dashboard-section overflow-hidden">
+              <div class="border-b border-default px-4 py-4"><h2 class="font-semibold text-highlighted">1. 选择存储类型</h2><p class="mt-1 text-sm text-muted">选择后只填写对应配置</p></div>
+              <div class="space-y-2 p-2">
+                <button v-for="option in backendOptions" :key="option.value" type="button" class="flex w-full items-center gap-3 rounded-xl border p-3 text-left transition" :class="form.backend === option.value ? 'border-primary/30 bg-primary/10' : 'border-transparent hover:bg-elevated'" :disabled="isLoading || isTesting || isSaving" @click="changeBackend(option.value)">
+                  <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="form.backend === option.value ? 'bg-primary text-inverted' : 'bg-elevated text-muted'"><Icon :name="option.icon" class="size-5" /></span>
+                  <span class="min-w-0 flex-1"><span class="block text-sm font-medium text-highlighted">{{ option.label }}</span><span class="mt-0.5 block text-xs leading-5 text-muted">{{ backendDescriptions[option.value] }}</span></span>
+                  <Icon v-if="form.backend === option.value" name="tabler:check" class="size-4 shrink-0 text-primary" />
+                </button>
               </div>
-              <UBadge color="success" variant="soft">
-                <Icon :name="backendIcons[savedBackend]" class="mr-1 size-4" />
-                已保存：{{ backendOptions.find(item => item.value === savedBackend)?.label }}
-              </UBadge>
+            </section>
+
+            <section class="dashboard-section p-4">
+              <div class="flex items-start gap-3"><span class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-success/10 text-success"><Icon name="tabler:shield-lock" class="size-5" /></span><div><h3 class="text-sm font-semibold text-highlighted">密钥不会回显</h3><p class="mt-1 text-xs leading-5 text-muted">后端只返回是否已设置。密码和 Secret Key 不会写入浏览器存储或 URL。</p></div></div>
+            </section>
+
+            <section v-if="storageTargetChanged" class="rounded-2xl border border-warning/20 bg-warning/10 p-4 text-sm text-warning">
+              <p class="flex items-center gap-2 font-medium"><Icon name="tabler:alert-triangle" class="size-4" />存储目标发生变化</p><p class="mt-2 text-xs leading-5">已有图片时，后端会拒绝直接切换路径、Endpoint、桶或前缀，避免文件引用失效。</p>
+            </section>
+          </aside>
+
+          <section class="dashboard-section overflow-hidden">
+            <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
+              <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon :name="backendIcons[form.backend]" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">2. 配置 {{ backendOptions.find(item => item.value === form.backend)?.label }}</h2><p class="mt-1 text-sm text-muted">上传、缩略图、转换和旧图删除都会使用这里的配置</p></div></div>
+              <UBadge v-if="form.backend === savedBackend" color="success" variant="soft">当前已启用</UBadge>
+            </header>
+
+            <div v-if="isLoading" class="space-y-4 p-6"><USkeleton class="h-5 w-36" /><USkeleton class="h-11 w-full" /><USkeleton class="h-11 w-full" /><USkeleton class="h-11 w-full" /></div>
+
+            <div v-else class="p-5 sm:p-6">
+              <section v-if="form.backend === 'local'" class="space-y-5">
+                <div class="rounded-xl bg-elevated p-4 text-sm leading-6 text-muted"><p class="font-medium text-highlighted">适合单机 Compose 部署</p><p class="mt-1">建议保持 <code class="rounded bg-default px-1.5 py-0.5 text-xs">./data/storage</code>，图片会和数据库一起位于当前部署目录的持久化数据中。</p></div>
+                <UFormField label="本地存储路径" description="该路径由 Rust 服务进程读写。" required><UInput v-model="form.localPath" icon="tabler:folder" size="lg" placeholder="./data/storage" class="w-full" /></UFormField>
+              </section>
+
+              <section v-else-if="form.backend === 'webdav'" class="space-y-5">
+                <UFormField label="WebDAV 地址" description="必须是完整的 http:// 或 https:// URL。" required><UInput v-model="form.webdavUrl" type="url" icon="tabler:link" size="lg" placeholder="https://dav.example.com/remote.php/dav/files/user/" class="w-full" /></UFormField>
+                <div class="grid gap-5 sm:grid-cols-2">
+                  <UFormField label="用户名" required><UInput v-model="form.webdavUsername" autocomplete="username" icon="tabler:user" class="w-full" /></UFormField>
+                  <UFormField label="密码" :description="webdavPasswordSet ? '已安全保存；留空继续使用原密码。' : '首次启用时必须输入。'" :required="!webdavPasswordSet"><UInput v-model="webdavPassword" type="password" autocomplete="new-password" icon="tabler:key" :placeholder="webdavPasswordSet ? '留空沿用已保存密码' : '输入 WebDAV 密码'" class="w-full" /></UFormField>
+                </div>
+                <UFormField label="存储前缀" description="不要以 / 开头，用于隔离 ChronoFrame 对象。"><UInput v-model="form.webdavPrefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" /></UFormField>
+              </section>
+
+              <section v-else class="space-y-5">
+                <div class="rounded-xl border border-info/20 bg-info/10 p-4 text-sm leading-6 text-info"><p class="font-medium">Cloudflare R2 提示</p><p class="mt-1 text-xs">Endpoint 只填写到账户级 <code>/</code> 根地址，不要把桶名附在 URL 后；R2 区域通常填写 <code>auto</code>。</p></div>
+                <div class="grid gap-5 sm:grid-cols-2">
+                  <UFormField label="S3 Endpoint" description="完整 HTTP(S) URL，不包含桶名。" required><UInput v-model="form.s3Endpoint" type="url" icon="tabler:link" placeholder="https://account-id.r2.cloudflarestorage.com" class="w-full" /></UFormField>
+                  <UFormField label="区域" required><UInput v-model="form.s3Region" icon="tabler:world" placeholder="auto 或 us-east-1" class="w-full" /></UFormField>
+                  <UFormField label="桶名" required><UInput v-model="form.s3Bucket" icon="tabler:bucket" placeholder="chronoframe" class="w-full" /></UFormField>
+                  <UFormField label="存储前缀" description="不要以 / 开头。"><UInput v-model="form.s3Prefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" /></UFormField>
+                  <UFormField label="Access Key" required><UInput v-model="form.s3AccessKey" autocomplete="username" icon="tabler:id" class="w-full" /></UFormField>
+                  <UFormField label="Secret Key" :description="s3SecretKeySet ? '已安全保存；留空继续使用原密钥。' : '首次启用时必须输入。'" :required="!s3SecretKeySet"><UInput v-model="s3SecretKey" type="password" autocomplete="new-password" icon="tabler:key" :placeholder="s3SecretKeySet ? '留空沿用已保存密钥' : '输入 Secret Key'" class="w-full" /></UFormField>
+                </div>
+              </section>
             </div>
-          </template>
 
-          <div v-if="isLoading" class="space-y-4">
-            <USkeleton class="h-5 w-36" />
-            <USkeleton class="h-10 w-full" />
-            <USkeleton class="h-10 w-full" />
-            <USkeleton class="h-10 w-full" />
-          </div>
-
-          <div v-else class="space-y-6">
-            <UFormField
-              label="存储类型"
-              description="选择并保存后，它会成为唯一 active 后端。"
-              required
-            >
-              <USelectMenu
-                :model-value="form.backend"
-                :items="backendOptions"
-                value-key="value"
-                label-key="label"
-                :icon="backendIcons[form.backend]"
-                :search-input="false"
-                class="w-full sm:max-w-md"
-                @update:model-value="changeBackend($event as StorageBackend)"
-              />
-            </UFormField>
-
-            <USeparator />
-
-            <section v-if="form.backend === 'local'" class="space-y-4">
-              <div>
-                <h3 class="font-semibold">本地存储</h3>
-                <p class="mt-1 text-sm text-muted">路径由 Rust 服务进程读写；单文件 Docker 部署请保持 ./data/storage，确保图片位于可打包的持久化目录。</p>
+            <footer class="border-t border-default bg-muted/50 p-4 sm:px-6">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <p class="flex items-center gap-2 text-sm" :class="isDirty ? 'text-warning' : 'text-muted'"><Icon :name="isDirty ? 'tabler:edit-circle' : 'tabler:circle-check'" class="size-5" />{{ isDirty ? '配置有未保存的更改' : '当前配置已保存' }}</p>
+                <div class="flex flex-wrap justify-end gap-2"><UButton color="neutral" variant="outline" icon="tabler:plug-connected" :loading="isTesting" :disabled="isSaving" @click="testConnection">只测试连接</UButton><UButton icon="tabler:device-floppy" :loading="isSaving" :disabled="isTesting || !isDirty" @click="saveSettings">验证、保存并启用</UButton></div>
               </div>
-              <UFormField label="本地存储路径" required>
-                <UInput
-                  v-model="form.localPath"
-                  icon="tabler:folder"
-                  placeholder="./data/storage"
-                  class="w-full"
-                />
-              </UFormField>
-            </section>
-
-            <section v-else-if="form.backend === 'webdav'" class="space-y-4">
-              <div>
-                <h3 class="font-semibold">WebDAV</h3>
-                <p class="mt-1 text-sm text-muted">使用 HTTP(S) WebDAV 服务作为图片对象存储。</p>
-              </div>
-
-              <UFormField label="WebDAV 地址" description="必须是完整的 http:// 或 https:// URL。" required>
-                <UInput
-                  v-model="form.webdavUrl"
-                  type="url"
-                  icon="tabler:link"
-                  placeholder="https://dav.example.com/remote.php/dav/files/user/"
-                  class="w-full"
-                />
-              </UFormField>
-
-              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <UFormField label="用户名" required>
-                  <UInput v-model="form.webdavUsername" autocomplete="username" icon="tabler:user" class="w-full" />
-                </UFormField>
-                <UFormField
-                  label="密码"
-                  :description="webdavPasswordSet ? '已安全保存；留空表示继续使用原密码。' : '首次启用 WebDAV 时必须输入。'"
-                  :required="!webdavPasswordSet"
-                >
-                  <UInput
-                    v-model="webdavPassword"
-                    type="password"
-                    autocomplete="new-password"
-                    icon="tabler:key"
-                    :placeholder="webdavPasswordSet ? '留空沿用已保存密码' : '输入 WebDAV 密码'"
-                    class="w-full"
-                  />
-                </UFormField>
-              </div>
-
-              <UFormField label="存储前缀" description="不要以 / 开头；用于隔离 ChronoFrame 的对象。">
-                <UInput v-model="form.webdavPrefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" />
-              </UFormField>
-            </section>
-
-            <section v-else class="space-y-4">
-              <div>
-                <h3 class="font-semibold">S3 对象存储</h3>
-                <p class="mt-1 text-sm text-muted">支持 AWS S3 及兼容 S3 API 的自建对象存储。</p>
-              </div>
-
-              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <UFormField label="S3 Endpoint" description="必须是完整的 HTTP(S) URL。" required>
-                  <UInput v-model="form.s3Endpoint" type="url" icon="tabler:link" placeholder="https://s3.example.com" class="w-full" />
-                </UFormField>
-                <UFormField label="区域" required>
-                  <UInput v-model="form.s3Region" icon="tabler:world" placeholder="us-east-1" class="w-full" />
-                </UFormField>
-                <UFormField label="桶名" required>
-                  <UInput v-model="form.s3Bucket" icon="tabler:bucket" placeholder="chronoframe" class="w-full" />
-                </UFormField>
-                <UFormField label="存储前缀" description="不要以 / 开头。">
-                  <UInput v-model="form.s3Prefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" />
-                </UFormField>
-                <UFormField label="Access Key" required>
-                  <UInput v-model="form.s3AccessKey" autocomplete="username" icon="tabler:id" class="w-full" />
-                </UFormField>
-                <UFormField
-                  label="Secret Key"
-                  :description="s3SecretKeySet ? '已安全保存；留空表示继续使用原密钥。' : '首次启用 S3 时必须输入。'"
-                  :required="!s3SecretKeySet"
-                >
-                  <UInput
-                    v-model="s3SecretKey"
-                    type="password"
-                    autocomplete="new-password"
-                    icon="tabler:key"
-                    :placeholder="s3SecretKeySet ? '留空沿用已保存密钥' : '输入 Secret Key'"
-                    class="w-full"
-                  />
-                </UFormField>
-              </div>
-            </section>
-          </div>
-
-          <template #footer>
-            <div class="space-y-3">
-              <UAlert
-                v-if="isDirty"
-                color="warning"
-                variant="subtle"
-                icon="tabler:edit"
-                title="有未保存的更改"
-                description="「测试连接」不会保存；测试或保存请求发出后，密码和 Secret Key 输入框会立即清空。"
-              />
-              <div class="flex flex-wrap justify-end gap-2">
-                <UButton
-                  color="neutral"
-                  variant="outline"
-                  icon="tabler:plug-connected"
-                  :loading="isTesting"
-                  :disabled="isSaving"
-                  @click="testConnection"
-                >
-                  测试连接
-                </UButton>
-                <UButton
-                  icon="tabler:device-floppy"
-                  :loading="isSaving"
-                  :disabled="isTesting || !isDirty"
-                  @click="saveSettings"
-                >
-                  保存并设为 active
-                </UButton>
-              </div>
-            </div>
-          </template>
-        </UCard>
-
-        <UAlert
-          color="neutral"
-          variant="subtle"
-          icon="tabler:shield-lock"
-          title="敏感字段不会回显"
-          description="后端只返回「是否已设置」；页面不会回填 WebDAV 密码或 S3 Secret Key，也不会将它们写入浏览器存储或 URL。"
-        />
+              <p class="mt-3 text-xs leading-5 text-muted">测试或保存请求发出后，密码和 Secret Key 输入框会立即清空。</p>
+            </footer>
+          </section>
+        </div>
       </div>
     </template>
   </UDashboardPanel>

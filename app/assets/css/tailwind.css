@@ -50,3 +50,28 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
 .custom-scrollbar::-webkit-scrollbar-thumb { background: rgb(115 115 115 / 20%); border-radius: 10px; }
 .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 12%); }
+
+.dashboard-surface {
+  background:
+    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--ui-primary) 8%, transparent), transparent 28rem),
+    radial-gradient(circle at 0% 100%, color-mix(in srgb, var(--ui-info) 6%, transparent), transparent 30rem),
+    var(--ui-bg-muted);
+}
+
+.dashboard-panel-body {
+  margin-inline: auto;
+  width: 100%;
+  max-width: 96rem;
+  padding: 1rem;
+}
+
+@media (min-width: 640px) {
+  .dashboard-panel-body { padding: 1.5rem; }
+}
+
+.dashboard-section {
+  border: 1px solid var(--ui-border);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--ui-bg) 94%, transparent);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 4%);
+}
