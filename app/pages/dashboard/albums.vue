@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import type { Album, AlbumDetail, Photo } from '~/types/dashboard'
+import type { Album, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
 
 definePageMeta({
   layout: 'dashboard',
@@ -20,6 +20,8 @@ const isOrderMode = ref(false)
 const newAlbumName = ref('')
 const newAlbumDescription = ref('')
 const selectedFiles = ref<File[]>([])
+const selectedPhotoIds = ref<string[]>([])
+const isSelectingPhotos = ref(false)
 const exportAlbumIds = ref<string[]>([])
 const isStartingExport = ref(false)
 const uploadInput = ref<HTMLInputElement | null>(null)
@@ -42,6 +44,7 @@ const isLoadingAlbums = ref(false)
 const isLoadingPhotos = ref(false)
 const isCreating = ref(false)
 const isUploading = ref(false)
+const isDeletingPhotos = ref(false)
 const isSavingAlbumDates = ref(false)
 const isSavingAlbumDescription = ref(false)
 const isReorderingAlbums = ref(false)
@@ -82,6 +85,7 @@ const albumHasCustomDates = computed(() => Boolean(
 const hasActiveMutation = computed(() =>
   isCreating.value
   || isUploading.value
+  || isDeletingPhotos.value
   || isSavingAlbumDates.value
   || isSavingAlbumDescription.value
   || isReorderingAlbums.value,
@@ -92,6 +96,9 @@ const isAlbumInteractionLocked = computed(() =>
 
 const selectedBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
+)
+const allPhotosSelected = computed(() =>
+  photos.value.length > 0 && selectedPhotoIds.value.length === photos.value.length,
 )
 const selectedExportAlbums = computed(() =>
   albums.value.filter(album => exportAlbumIds.value.includes(album.id)),
@@ -229,6 +236,7 @@ const selectAlbum = (albumId: string) => {
 const loadAlbumDetail = async (albumId: string): Promise<boolean> => {
   const requestSerial = ++detailRequestSerial
   photos.value = []
+  selectedPhotoIds.value = []
   photoError.value = ''
   isAlbumDetailReady.value = false
 
@@ -493,6 +501,57 @@ const clearSelectedFiles = () => {
   if (uploadInput.value) uploadInput.value.value = ''
 }
 
+const togglePhotoSelection = (photoId: string) => {
+  selectedPhotoIds.value = selectedPhotoIds.value.includes(photoId)
+    ? selectedPhotoIds.value.filter(id => id !== photoId)
+    : [...selectedPhotoIds.value, photoId]
+}
+
+const toggleAllPhotos = () => {
+  selectedPhotoIds.value = allPhotosSelected.value ? [] : photos.value.map(photo => photo.id)
+}
+
+const leavePhotoSelection = () => {
+  if (isDeletingPhotos.value) return
+  isSelectingPhotos.value = false
+  selectedPhotoIds.value = []
+}
+
+const deleteSelectedPhotos = async () => {
+  if (isDeletingPhotos.value || !selectedPhotoIds.value.length) return
+  const count = selectedPhotoIds.value.length
+  if (!window.confirm(`确定永久删除选中的 ${count} 张图片吗？\n\n图片会从当前存储（包括 S3/R2 或 WebDAV）删除，不能撤销。`)) return
+  const albumId = selectedAlbumId.value
+  isDeletingPhotos.value = true
+  isAlbumDetailReady.value = false
+  try {
+    const result = await adminFetch<PhotoDeletionResult>('/api/photos/delete', {
+      method: 'POST',
+      body: { photoIds: selectedPhotoIds.value },
+    })
+    selectedPhotoIds.value = []
+    isSelectingPhotos.value = false
+    const refreshed = await refreshAlbums(albumId)
+    toast.add({
+      title: `已删除 ${result.deleted} 张图片`,
+      description: result.cleanupPending
+        ? `${result.cleanupPending} 个存储对象暂未清理成功，后台会自动重试。`
+        : '数据库记录和存储对象均已清理。',
+      color: result.cleanupPending ? 'warning' : 'success',
+    })
+    if (!refreshed) photoError.value ||= '删除成功，但列表刷新失败，请手动刷新。'
+  } catch (error) {
+    toast.add({
+      title: '删除图片失败',
+      description: getAdminApiErrorMessage(error),
+      color: 'error',
+    })
+    await refreshAlbums(albumId)
+  } finally {
+    isDeletingPhotos.value = false
+  }
+}
+
 const uploadPhotos = async () => {
   if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
   if (albumMetadataDirty.value) {
@@ -552,6 +611,8 @@ const uploadPhotos = async () => {
 
 watch(selectedAlbumId, (albumId) => {
   clearSelectedFiles()
+  selectedPhotoIds.value = []
+  isSelectingPhotos.value = false
   isAlbumDetailReady.value = false
   dateDraftAlbumId.value = albumId
   albumDateDraft.displayCreatedDate = ''
@@ -728,18 +789,34 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                 <UAlert v-if="photoError" color="error" variant="subtle" icon="tabler:alert-circle" title="相簿内容加载失败" :description="photoError" />
 
                 <section>
-                  <div class="mb-4 flex items-center justify-between gap-3">
-                    <div><h3 class="font-semibold text-highlighted">相簿内容</h3><p class="mt-1 text-sm text-muted">点击图片可在新窗口查看原文件</p></div>
-                    <UBadge color="neutral" variant="soft">{{ photos.length }} 张</UBadge>
+                  <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+                    <div><h3 class="font-semibold text-highlighted">相簿内容</h3><p class="mt-1 text-sm text-muted">{{ isSelectingPhotos ? '选择一张或多张图片后统一删除' : '点击图片可在新窗口查看原文件' }}</p></div>
+                    <div class="flex items-center gap-2">
+                      <UBadge color="neutral" variant="soft">{{ photos.length }} 张</UBadge>
+                      <UButton v-if="photos.length && !isSelectingPhotos" size="sm" color="neutral" variant="soft" icon="tabler:select" :disabled="isAlbumInteractionLocked" @click="isSelectingPhotos = true">管理图片</UButton>
+                      <UButton v-else-if="isSelectingPhotos" size="sm" color="neutral" variant="ghost" :disabled="isDeletingPhotos" @click="leavePhotoSelection">退出管理</UButton>
+                    </div>
+                  </div>
+                  <div v-if="isSelectingPhotos" class="mb-4 flex flex-col gap-3 rounded-xl border border-primary/15 bg-primary/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <p class="text-sm text-highlighted">已选择 <strong>{{ selectedPhotoIds.length }}</strong> / {{ photos.length }} 张</p>
+                    <div class="flex flex-wrap gap-2">
+                      <UButton size="sm" color="neutral" variant="soft" :icon="allPhotosSelected ? 'tabler:square' : 'tabler:checkbox'" @click="toggleAllPhotos">{{ allPhotosSelected ? '取消全选' : '全选' }}</UButton>
+                      <UButton size="sm" color="error" icon="tabler:trash" :loading="isDeletingPhotos" :disabled="!selectedPhotoIds.length" @click="deleteSelectedPhotos">永久删除</UButton>
+                    </div>
                   </div>
                   <div v-if="isLoadingPhotos" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
                     <USkeleton v-for="index in 10" :key="index" class="aspect-square w-full rounded-xl" />
                   </div>
                   <div v-else-if="photos.length" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-                    <a v-for="photo in photos" :key="photo.id" :href="`/api/photos/${photo.id}/file`" target="_blank" rel="noopener noreferrer" class="group min-w-0 overflow-hidden rounded-xl border border-default bg-elevated transition hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md">
-                      <div class="aspect-square overflow-hidden bg-muted"><img :src="`/api/photos/${photo.id}/thumbnail`" :alt="photo.originalName" loading="lazy" class="size-full object-cover transition duration-300 group-hover:scale-105" /></div>
-                      <div class="p-2.5"><p class="truncate text-sm font-medium text-highlighted" :title="photo.originalName">{{ photo.originalName }}</p><p class="mt-1 flex items-center justify-between gap-2 text-xs text-muted"><span>{{ photo.format.toUpperCase() }}</span><span>{{ formatBytes(photo.byteSize) }}</span></p></div>
-                    </a>
+                    <div v-for="photo in photos" :key="photo.id" class="group relative min-w-0 overflow-hidden rounded-xl border bg-elevated transition" :class="selectedPhotoIds.includes(photo.id) ? 'border-primary ring-2 ring-primary/20' : 'border-default hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md'">
+                      <a :href="`/api/photos/${photo.id}/file`" target="_blank" rel="noopener noreferrer" :class="isSelectingPhotos ? 'pointer-events-none' : ''">
+                        <div class="aspect-square overflow-hidden bg-muted"><img :src="`/api/photos/${photo.id}/thumbnail`" :alt="photo.originalName" loading="lazy" class="size-full object-cover transition duration-300 group-hover:scale-105" /></div>
+                        <div class="p-2.5"><p class="truncate text-sm font-medium text-highlighted" :title="photo.originalName">{{ photo.originalName }}</p><p class="mt-1 flex items-center justify-between gap-2 text-xs text-muted"><span>{{ photo.format.toUpperCase() }}</span><span>{{ formatBytes(photo.byteSize) }}</span></p></div>
+                      </a>
+                      <button v-if="isSelectingPhotos" type="button" class="absolute inset-0 cursor-pointer text-left" :aria-label="`${selectedPhotoIds.includes(photo.id) ? '取消选择' : '选择'} ${photo.originalName}`" @click="togglePhotoSelection(photo.id)">
+                        <span class="absolute right-2 top-2 flex size-7 items-center justify-center rounded-full border shadow-sm backdrop-blur" :class="selectedPhotoIds.includes(photo.id) ? 'border-primary bg-primary text-inverted' : 'border-white/60 bg-black/45 text-white'"><Icon :name="selectedPhotoIds.includes(photo.id) ? 'tabler:check' : 'tabler:circle'" class="size-4" /></span>
+                      </button>
+                    </div>
                   </div>
                   <div v-else class="flex min-h-64 flex-col items-center justify-center rounded-2xl border border-dashed border-default text-center">
                     <span class="flex size-12 items-center justify-center rounded-2xl bg-elevated text-muted"><Icon name="tabler:photo-plus" class="size-6" /></span>

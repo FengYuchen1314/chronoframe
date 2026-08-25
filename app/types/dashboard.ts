@@ -69,6 +69,32 @@ export interface SourceDeletionResult {
   failures: SourceDeletionFailure[]
 }
 
+export interface PhotoDeletionResult {
+  deleted: number
+  objectsRemoved: number
+  cleanupPending: number
+  failures: SourceDeletionFailure[]
+}
+
+export interface StorageMigrationJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  sourceBackend: StorageBackend
+  targetBackend: StorageBackend
+  total: number
+  completed: number
+  succeeded: number
+  failed: number
+  cancelled: number
+  cleanupStatus: 'not_ready' | 'pending' | 'cleaning' | 'cleaned' | 'retained' | 'failed' | 'interrupted'
+  cleanupCompleted: number
+  cleanupFailed: number
+  createdAt: number
+  updatedAt: number
+  activatedAt: number | null
+  error: string | null
+}
+
 export interface StorageSettings {
   backend: StorageBackend
   localPath: string
