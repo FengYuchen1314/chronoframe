@@ -17,7 +17,6 @@ const headerColumnWidth = ref(280)
 const gap = 4
 
 const displayPhotos = computed(() => hasActiveFilters.value ? filteredPhotos.value : sortedPhotos.value)
-const { isOriginalReady, markThumbnailSettled, pauseBackgroundOriginals } = useGalleryImagePipeline(displayPhotos)
 const items = computed(() => displayPhotos.value.map((photo, index) => ({ photo, index, id: photo.id })))
 const keyMapper = (item: { id: string }) => item.id
 const columnWidth = computed(() => 280)
@@ -26,6 +25,63 @@ const headerOffset = computed(() => isMobile.value ? 0 : headerHeight.value + ga
 const headerStyle = computed(() => isMobile.value
   ? { width: '100%', marginBottom: `${gap}px` }
   : { width: `${headerColumnWidth.value}px` })
+const selectionMode = ref(false)
+const selectedIds = ref(new Set<string>())
+const selectionAnchor = ref<number | null>(null)
+const actionMenu = reactive<{ open: boolean; x: number; y: number; photo: GalleryPhoto | null }>({
+  open: false,
+  x: 0,
+  y: 0,
+  photo: null,
+})
+const selectedPhotos = computed(() => displayPhotos.value.filter(photo => selectedIds.value.has(photo.id)))
+
+const replaceSelection = (ids: Iterable<string>) => { selectedIds.value = new Set(ids) }
+const cancelSelection = () => {
+  selectionMode.value = false
+  selectedIds.value = new Set()
+  selectionAnchor.value = null
+}
+const toggleSelection = (index: number, event?: MouseEvent | KeyboardEvent) => {
+  const photo = displayPhotos.value[index]
+  if (!photo) return
+  selectionMode.value = true
+  const next = new Set(selectedIds.value)
+  if (event?.shiftKey && selectionAnchor.value !== null && !isMobile.value) {
+    const start = Math.min(selectionAnchor.value, index)
+    const end = Math.max(selectionAnchor.value, index)
+    for (let current = start; current <= end; current += 1) {
+      const item = displayPhotos.value[current]
+      if (item) next.add(item.id)
+    }
+  } else if (next.has(photo.id)) next.delete(photo.id)
+  else next.add(photo.id)
+  selectionAnchor.value = index
+  replaceSelection(next)
+  if (!next.size) cancelSelection()
+}
+const openActionMenu = (photo: GalleryPhoto | null, x: number, y: number) => {
+  Object.assign(actionMenu, { open: true, photo, x, y })
+}
+const enterSelection = (photo: GalleryPhoto | null) => {
+  selectionMode.value = true
+  if (!photo) return
+  const index = displayPhotos.value.findIndex(item => item.id === photo.id)
+  if (index >= 0 && !selectedIds.value.has(photo.id)) toggleSelection(index)
+}
+const handleActivate = (index: number, event: MouseEvent | KeyboardEvent) => {
+  if (selectionMode.value) toggleSelection(index, event)
+  else openPhoto(index)
+}
+const onEmptyContextMenu = (event: MouseEvent) => {
+  if ((event.target as Element).closest('[data-photo-id]')) return
+  event.preventDefault()
+  openActionMenu(null, event.clientX, event.clientY)
+}
+const selectAll = () => {
+  selectionMode.value = true
+  replaceSelection(displayPhotos.value.map(photo => photo.id))
+}
 
 const updateHeaderWidth = () => {
   if (isMobile.value) return
@@ -53,7 +109,6 @@ const dateRangeText = computed(() => {
 const openPhoto = (index: number) => {
   const photo = displayPhotos.value[index]
   if (!photo) return
-  pauseBackgroundOriginals()
   viewer.openViewer(index, '/photos', displayPhotos.value)
   router.push(`/${photo.id}`)
 }
@@ -63,6 +118,14 @@ const scrollToTop = () => window.scrollTo({ top: 0, behavior: 'smooth' })
 onMounted(() => window.addEventListener('scroll', onScroll, { passive: true }))
 onMounted(() => nextTick(updateHeaderWidth))
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
+useEventListener('keydown', (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && selectionMode.value) cancelSelection()
+})
+watch(() => displayPhotos.value.map(photo => photo.id).join('\u0000'), () => {
+  const available = new Set(displayPhotos.value.map(photo => photo.id))
+  replaceSelection([...selectedIds.value].filter(id => available.has(id)))
+  if (!selectedIds.value.size) selectionMode.value = false
+})
 </script>
 
 <template>
@@ -72,6 +135,7 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
         ref="masonryWrapper"
         class="relative"
         :style="{ '--masonry-header-offset': `${headerOffset}px` }"
+        @contextmenu="onEmptyContextMenu"
       >
         <div
           ref="headerRef"
@@ -106,9 +170,11 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
             <MasonryItem
               :photo="item.photo"
               :index="item.index"
-              :show-original="isOriginalReady(item.photo.id)"
-              @thumbnail-settled="markThumbnailSettled"
-              @open-viewer="openPhoto"
+              :selected="selectedIds.has(item.photo.id)"
+              :selection-mode="selectionMode"
+              @activate="handleActivate"
+              @select="toggleSelection"
+              @context-action="openActionMenu"
             />
           </template>
         </MasonryWall>
@@ -123,6 +189,17 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
     >
       <UButton icon="tabler:arrow-up" color="neutral" variant="soft" size="lg" class="rounded-full bg-white/80 shadow-lg backdrop-blur dark:bg-neutral-900/80" @click="scrollToTop" />
     </motion.div>
+
+    <PhotoActionMenu
+      :open="actionMenu.open"
+      :x="actionMenu.x"
+      :y="actionMenu.y"
+      :photo="actionMenu.photo"
+      allow-select
+      @close="actionMenu.open = false"
+      @select="enterSelection"
+    />
+    <PhotoBulkActionBar :selected="selectedPhotos" :all-count="displayPhotos.length" @cancel="cancelSelection" @select-all="selectAll" />
   </div>
 </template>
 

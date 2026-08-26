@@ -6,10 +6,18 @@ const props = withDefaults(defineProps<{
   photo: GalleryPhoto
   index: number
   firstScreenItems?: number
-  showOriginal?: boolean
-}>(), { firstScreenItems: 36, showOriginal: false })
+  selected?: boolean
+  selectionMode?: boolean
+}>(), { firstScreenItems: 36, selected: false, selectionMode: false })
 
-const emit = defineEmits<{ openViewer: [number]; thumbnailSettled: [string] }>()
+const emit = defineEmits<{
+  activate: [number, MouseEvent | KeyboardEvent]
+  contextAction: [GalleryPhoto, number, number]
+  select: [number, MouseEvent | KeyboardEvent]
+}>()
+const forwardActivate = (index: number, event: MouseEvent | KeyboardEvent) => emit('activate', index, event)
+const forwardContext = (photo: GalleryPhoto, x: number, y: number) => emit('contextAction', photo, x, y)
+const forwardSelect = (index: number, event: MouseEvent | KeyboardEvent) => emit('select', index, event)
 </script>
 
 <template>
@@ -23,9 +31,11 @@ const emit = defineEmits<{ openViewer: [number]; thumbnailSettled: [string] }>()
     <MasonryItemPhoto
       :photo="photo"
       :index="index"
-      :show-original="showOriginal"
-      @open-viewer="emit('openViewer', $event)"
-      @thumbnail-settled="emit('thumbnailSettled', $event)"
+      :selected="selected"
+      :selection-mode="selectionMode"
+      @activate="forwardActivate"
+      @context-action="forwardContext"
+      @select="forwardSelect"
     />
   </motion.div>
 </template>

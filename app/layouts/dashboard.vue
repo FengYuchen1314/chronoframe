@@ -32,11 +32,6 @@ const navItems = computed<NavigationMenuItem[][]>(() => [
       icon: 'tabler:album',
       to: '/dashboard/albums',
     },
-    {
-      label: '转换任务',
-      icon: 'tabler:arrows-exchange',
-      to: '/dashboard/conversions',
-    },
   ],
   [
     {
@@ -234,7 +229,7 @@ useHead({
           </span>
           <div>
             <h1 class="text-xl font-semibold tracking-tight text-highlighted">{{ isRegistration ? '创建管理员账号' : '登录后台' }}</h1>
-            <p class="mt-1 text-sm leading-6 text-muted">{{ isRegistration ? '首次使用时创建唯一管理员，之后只能通过登录进入。' : '登录后管理相簿、转换任务和存储设置。' }}</p>
+            <p class="mt-1 text-sm leading-6 text-muted">{{ isRegistration ? '首次使用时创建唯一管理员，之后只能通过登录进入。' : '登录后管理相簿、三层图片缓存和存储设置。' }}</p>
           </div>
         </div>
 
