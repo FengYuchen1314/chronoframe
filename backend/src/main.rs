@@ -69,11 +69,13 @@ struct AppState {
     workers: usize,
     jobs: Arc<DashMap<String, CancellationToken>>,
     storage_tasks: Arc<DashMap<String, CancellationToken>>,
+    thumbnail_tasks: Arc<DashMap<String, CancellationToken>>,
     storage_mutation_gate: Arc<tokio::sync::RwLock<()>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
     export_slots: Arc<tokio::sync::Semaphore>,
     upload_slots: Arc<tokio::sync::Semaphore>,
     thumbnail_slots: Arc<tokio::sync::Semaphore>,
+    thumbnail_workers: usize,
     password_hash_slots: Arc<tokio::sync::Semaphore>,
     photo_graph_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -614,6 +616,7 @@ struct StorageService {
     source_deletion_gate: Arc<tokio::sync::Mutex<()>>,
     thumbnail_cache_dir: Arc<PathBuf>,
     thumbnail_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    thumbnail_maintenance_gate: Arc<tokio::sync::RwLock<()>>,
     cache: SharedStoreCache,
 }
 
@@ -823,6 +826,7 @@ impl StorageService {
             source_deletion_gate: Arc::new(tokio::sync::Mutex::new(())),
             thumbnail_cache_dir: Arc::new(thumbnail_cache_dir),
             thumbnail_locks: Arc::new(DashMap::new()),
+            thumbnail_maintenance_gate: Arc::new(tokio::sync::RwLock::new(())),
             cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
@@ -878,6 +882,36 @@ impl StorageService {
                 warn!(photo_id, "failed to remove cached thumbnail: {error:#}");
             }
         }
+    }
+    async fn clear_thumbnail_cache(&self) -> Result<usize> {
+        // Wait for in-flight thumbnail writers and prevent new ones from entering while files are
+        // removed. The cache directory is dedicated, so stale PNG/WEBP and interrupted temp files
+        // can all be discarded safely.
+        let _maintenance_guard = self.thumbnail_maintenance_gate.write().await;
+        tokio::fs::create_dir_all(self.thumbnail_cache_dir.as_ref()).await?;
+        let mut directory = tokio::fs::read_dir(self.thumbnail_cache_dir.as_ref()).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = directory.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_file() || file_type.is_symlink() {
+                paths.push(entry.path());
+            }
+        }
+        let removed = stream::iter(paths.into_iter().map(|path| async move {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("无法删除缩略图缓存 {}", path.display()))?;
+            Ok::<usize, anyhow::Error>(1)
+        }))
+        .buffer_unordered(64)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+        self.thumbnail_locks.clear();
+        Ok(removed)
     }
     async fn values(&self) -> Result<HashMap<String, String>> {
         let rows = sqlx::query("SELECT key,value FROM app_settings WHERE key LIKE 'storage_%'")
@@ -1339,6 +1373,25 @@ struct StorageMigrationJob {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailRebuildJob {
+    id: String,
+    status: String,
+    phase: String,
+    total: i64,
+    completed: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    cancelled: i64,
+    cache_files_removed: i64,
+    worker_count: i64,
+    created_at: i64,
+    updated_at: i64,
+    error: Option<String>,
+}
+
 fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
     Album {
         id: row.get("id"),
@@ -1402,6 +1455,24 @@ fn migration_job_from(row: &sqlx::sqlite::SqliteRow) -> StorageMigrationJob {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         activated_at: row.get("activated_at"),
+        error: row.get("error"),
+    }
+}
+fn thumbnail_job_from(row: &sqlx::sqlite::SqliteRow) -> ThumbnailRebuildJob {
+    ThumbnailRebuildJob {
+        id: row.get("id"),
+        status: row.get("status"),
+        phase: row.get("phase"),
+        total: row.get("total"),
+        completed: row.get("completed"),
+        succeeded: row.get("succeeded"),
+        failed: row.get("failed"),
+        skipped: row.get("skipped"),
+        cancelled: row.get("cancelled"),
+        cache_files_removed: row.get("cache_files_removed"),
+        worker_count: row.get("worker_count"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
         error: row.get("error"),
     }
 }
@@ -4054,6 +4125,7 @@ async fn ensure_png_thumbnail(
     photo_id: &str,
     storage_key: &str,
 ) -> Result<Vec<u8>> {
+    let _maintenance_guard = state.storage.thumbnail_maintenance_gate.read().await;
     if let Some(thumbnail) = state.storage.cached_thumbnail(photo_id).await? {
         if image::guess_format(&thumbnail).ok() == Some(ImageFormat::Png) {
             return Ok(thumbnail);
@@ -4127,7 +4199,7 @@ async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>
             false
         }
     }))
-    .buffer_unordered(DEFAULT_THUMBNAIL_CONCURRENCY)
+    .buffer_unordered(state.thumbnail_workers)
     .collect::<Vec<_>>()
     .await;
     let ready = outcomes.into_iter().filter(|success| *success).count();
@@ -4137,6 +4209,13 @@ async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>
         failed = total - ready,
         "automatic PNG thumbnail batch finished"
     );
+}
+
+fn automatic_thumbnail_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().saturating_mul(2))
+        .unwrap_or(DEFAULT_THUMBNAIL_CONCURRENCY)
+        .clamp(DEFAULT_THUMBNAIL_CONCURRENCY, 32)
 }
 
 fn spawn_thumbnail_generation(state: AppState, photos: Vec<(String, String)>) {
@@ -4161,6 +4240,427 @@ fn spawn_thumbnail_backfill(state: AppState) {
             .collect();
         generate_thumbnail_batch(state, photos).await;
     });
+}
+
+const THUMBNAIL_REBUILD_JOB_COLUMNS: &str = "id,status,phase,total,completed,succeeded,failed,skipped,cancelled,cache_files_removed,worker_count,created_at,updated_at,error";
+
+async fn refresh_thumbnail_rebuild_counts(db: &SqlitePool, job_id: &str) -> Result<()> {
+    sqlx::query("UPDATE thumbnail_rebuild_jobs SET completed=(SELECT COUNT(*) FROM thumbnail_rebuild_items WHERE job_id=? AND status IN ('succeeded','failed','skipped','cancelled')),succeeded=(SELECT COUNT(*) FROM thumbnail_rebuild_items WHERE job_id=? AND status='succeeded'),failed=(SELECT COUNT(*) FROM thumbnail_rebuild_items WHERE job_id=? AND status='failed'),skipped=(SELECT COUNT(*) FROM thumbnail_rebuild_items WHERE job_id=? AND status='skipped'),cancelled=(SELECT COUNT(*) FROM thumbnail_rebuild_items WHERE job_id=? AND status='cancelled'),updated_at=? WHERE id=?")
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(now())
+        .bind(job_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn finish_thumbnail_rebuild_item(
+    state: &AppState,
+    job_id: &str,
+    item_id: &str,
+    status: &str,
+    error: Option<String>,
+) -> Result<()> {
+    sqlx::query("UPDATE thumbnail_rebuild_items SET status=?,error=? WHERE id=? AND job_id=? AND status='processing'")
+        .bind(status)
+        .bind(error)
+        .bind(item_id)
+        .bind(job_id)
+        .execute(&state.db)
+        .await?;
+    let (succeeded, failed, skipped) = match status {
+        "succeeded" => (1, 0, 0),
+        "failed" => (0, 1, 0),
+        "skipped" => (0, 0, 1),
+        _ => (0, 0, 0),
+    };
+    sqlx::query("UPDATE thumbnail_rebuild_jobs SET completed=completed+1,succeeded=succeeded+?,failed=failed+?,skipped=skipped+?,updated_at=? WHERE id=?")
+        .bind(succeeded)
+        .bind(failed)
+        .bind(skipped)
+        .bind(now())
+        .bind(job_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+async fn process_thumbnail_rebuild_item(
+    state: AppState,
+    job_id: String,
+    item_id: String,
+    photo_id: String,
+    storage_key: String,
+) -> Result<()> {
+    let claimed = sqlx::query("UPDATE thumbnail_rebuild_items SET status='processing',error=NULL WHERE id=? AND job_id=? AND status='queued'")
+        .bind(&item_id)
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    if claimed.rows_affected() != 1 {
+        return Ok(());
+    }
+    let current_storage_key: Option<String> =
+        sqlx::query_scalar("SELECT storage_key FROM photos WHERE id=?")
+            .bind(&photo_id)
+            .fetch_optional(&state.db)
+            .await?;
+    if current_storage_key.as_deref() != Some(storage_key.as_str()) {
+        return finish_thumbnail_rebuild_item(
+            &state,
+            &job_id,
+            &item_id,
+            "skipped",
+            Some("图片已删除或存储对象已被替换".into()),
+        )
+        .await;
+    }
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match ensure_png_thumbnail(&state, &photo_id, &storage_key).await {
+            Ok(_) => {
+                return finish_thumbnail_rebuild_item(&state, &job_id, &item_id, "succeeded", None)
+                    .await;
+            }
+            Err(error) => {
+                last_error = Some(format!("{error:#}"));
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(1_u64 << (attempt - 1))).await;
+                }
+            }
+        }
+    }
+    finish_thumbnail_rebuild_item(&state, &job_id, &item_id, "failed", last_error).await
+}
+
+async fn run_thumbnail_rebuild(
+    state: AppState,
+    job_id: String,
+    token: CancellationToken,
+    _storage_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Result<()> {
+    let phase: String = sqlx::query_scalar("SELECT phase FROM thumbnail_rebuild_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let changed = sqlx::query("UPDATE thumbnail_rebuild_jobs SET status='running',updated_at=?,error=NULL WHERE id=? AND status='queued'")
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    if changed.rows_affected() != 1 {
+        bail!("缩略图重建任务状态已经改变");
+    }
+
+    if phase != "generating" {
+        sqlx::query("UPDATE thumbnail_rebuild_jobs SET phase='clearing',updated_at=? WHERE id=?")
+            .bind(now())
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+        let clear = state.storage.clear_thumbnail_cache();
+        tokio::pin!(clear);
+        let removed = tokio::select! {
+            result = &mut clear => result?,
+            _ = token.cancelled() => {
+                sqlx::query("UPDATE thumbnail_rebuild_items SET status='cancelled',error='管理员安全中断任务' WHERE job_id=? AND status IN ('queued','processing')")
+                    .bind(&job_id).execute(&state.db).await?;
+                refresh_thumbnail_rebuild_counts(&state.db, &job_id).await?;
+                sqlx::query("UPDATE thumbnail_rebuild_jobs SET status='cancelled',updated_at=?,error='管理员安全中断任务' WHERE id=?")
+                    .bind(now()).bind(&job_id).execute(&state.db).await?;
+                return Ok(());
+            }
+        };
+        sqlx::query("UPDATE thumbnail_rebuild_jobs SET phase='generating',cache_files_removed=?,updated_at=? WHERE id=?")
+            .bind(removed as i64)
+            .bind(now())
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    }
+
+    let rows = sqlx::query("SELECT id,photo_id,storage_key FROM thumbnail_rebuild_items WHERE job_id=? AND status='queued' ORDER BY id")
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await?;
+    let items = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("photo_id"),
+                row.get::<String, _>("storage_key"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut work = stream::iter(items.into_iter().map(|(item_id, photo_id, storage_key)| {
+        process_thumbnail_rebuild_item(
+            state.clone(),
+            job_id.clone(),
+            item_id,
+            photo_id,
+            storage_key,
+        )
+    }))
+    .buffer_unordered(state.thumbnail_workers);
+    let mut was_cancelled = false;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                was_cancelled = true;
+                break;
+            }
+            result = work.next() => match result {
+                Some(result) => result?,
+                None => break,
+            }
+        }
+    }
+    drop(work);
+    if was_cancelled {
+        sqlx::query("UPDATE thumbnail_rebuild_items SET status='cancelled',error='管理员安全中断任务' WHERE job_id=? AND status IN ('queued','processing')")
+            .bind(&job_id)
+            .execute(&state.db)
+            .await?;
+    }
+    refresh_thumbnail_rebuild_counts(&state.db, &job_id).await?;
+    let row = sqlx::query("SELECT failed,cancelled FROM thumbnail_rebuild_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let failed: i64 = row.get("failed");
+    let cancelled: i64 = row.get("cancelled");
+    let (status, error) = if was_cancelled || cancelled > 0 {
+        ("cancelled", Some("管理员安全中断任务"))
+    } else if failed > 0 {
+        ("failed", Some("部分缩略图生成失败；可以继续任务重试失败项"))
+    } else {
+        ("completed", None)
+    };
+    sqlx::query("UPDATE thumbnail_rebuild_jobs SET status=?,updated_at=?,error=? WHERE id=?")
+        .bind(status)
+        .bind(now())
+        .bind(error)
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+fn spawn_thumbnail_rebuild(
+    state: AppState,
+    job_id: String,
+    storage_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) {
+    let token = CancellationToken::new();
+    state.thumbnail_tasks.insert(job_id.clone(), token.clone());
+    tokio::spawn(async move {
+        let inner_state = state.clone();
+        let inner_job_id = job_id.clone();
+        let outcome = tokio::spawn(async move {
+            run_thumbnail_rebuild(inner_state, inner_job_id, token, storage_guard).await
+        })
+        .await;
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("缩略图重建执行器异常退出：{error}")),
+        };
+        if let Some(reason) = failure {
+            error!(job_id, "thumbnail rebuild failed: {reason}");
+            let _ = refresh_thumbnail_rebuild_counts(&state.db, &job_id).await;
+            let _ = sqlx::query("UPDATE thumbnail_rebuild_jobs SET status='failed',updated_at=?,error=? WHERE id=? AND status IN ('queued','running')")
+                .bind(now())
+                .bind(reason)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await;
+        }
+        state.thumbnail_tasks.remove(&job_id);
+    });
+}
+
+async fn latest_thumbnail_rebuild(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Option<ThumbnailRebuildJob>>> {
+    require_admin(&headers, &state, false).await?;
+    let sql = format!(
+        "SELECT {THUMBNAIL_REBUILD_JOB_COLUMNS} FROM thumbnail_rebuild_jobs ORDER BY created_at DESC LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(row.as_ref().map(thumbnail_job_from)))
+}
+
+async fn start_thumbnail_rebuild(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<ThumbnailRebuildJob>)> {
+    require_admin(&headers, &state, true).await?;
+    let storage_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储迁移或清理正在运行，请稍后重建缩略图"))?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM thumbnail_rebuild_jobs WHERE status IN ('queued','running'))",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    if active {
+        return Err(AppError::conflict("已有缩略图重建任务正在运行"));
+    }
+    let photos = sqlx::query("SELECT id,storage_key FROM photos ORDER BY id")
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let timestamp = now();
+    let job_id = Uuid::new_v4().to_string();
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO thumbnail_rebuild_jobs(id,status,phase,total,worker_count,created_at,updated_at) VALUES(?,'queued','queued',?,?,?,?)")
+        .bind(&job_id)
+        .bind(photos.len() as i64)
+        .bind(state.thumbnail_workers as i64)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| AppError::conflict(format!("无法开始缩略图重建：{error}")))?;
+    for photo in photos {
+        sqlx::query("INSERT INTO thumbnail_rebuild_items(id,job_id,photo_id,storage_key,status) VALUES(?,?,?,?,'queued')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&job_id)
+            .bind(photo.get::<String, _>("id"))
+            .bind(photo.get::<String, _>("storage_key"))
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    let sql =
+        format!("SELECT {THUMBNAIL_REBUILD_JOB_COLUMNS} FROM thumbnail_rebuild_jobs WHERE id=?");
+    let row = sqlx::query(&sql)
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let job = thumbnail_job_from(&row);
+    spawn_thumbnail_rebuild(state, job_id, storage_guard);
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn cancel_thumbnail_rebuild(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let token = state
+        .thumbnail_tasks
+        .get(&job_id)
+        .ok_or_else(|| AppError::bad("缩略图重建任务不在运行中"))?;
+    token.cancel();
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn resume_thumbnail_rebuild(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let storage_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储迁移或清理正在运行，请稍后继续缩略图任务"))?;
+    let row = sqlx::query("SELECT status,phase FROM thumbnail_rebuild_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad("缩略图重建任务不存在"))?;
+    let status: String = row.get("status");
+    let phase: String = row.get("phase");
+    if !matches!(status.as_str(), "failed" | "cancelled" | "interrupted") {
+        return Err(AppError::bad("此缩略图任务当前不能继续"));
+    }
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    if phase == "generating" {
+        sqlx::query("UPDATE thumbnail_rebuild_items SET status='queued',error=NULL WHERE job_id=? AND status IN ('failed','cancelled','processing')")
+            .bind(&job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    } else {
+        sqlx::query("UPDATE thumbnail_rebuild_items SET status='queued',error=NULL WHERE job_id=?")
+            .bind(&job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+        sqlx::query(
+            "UPDATE thumbnail_rebuild_jobs SET phase='queued',cache_files_removed=0 WHERE id=?",
+        )
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    }
+    sqlx::query(
+        "UPDATE thumbnail_rebuild_jobs SET status='queued',updated_at=?,error=NULL WHERE id=?",
+    )
+    .bind(now())
+    .bind(&job_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    refresh_thumbnail_rebuild_counts(&state.db, &job_id)
+        .await
+        .map_err(AppError::internal)?;
+    spawn_thumbnail_rebuild(state, job_id, storage_guard);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn recover_thumbnail_rebuild(state: AppState) -> bool {
+    let job_id: Option<String> = match sqlx::query_scalar("SELECT id FROM thumbnail_rebuild_jobs WHERE status='interrupted' ORDER BY created_at DESC LIMIT 1")
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            warn!("thumbnail rebuild recovery lookup failed: {error:#}");
+            return false;
+        }
+    };
+    let Some(job_id) = job_id else {
+        return false;
+    };
+    if let Err(error) = sqlx::query(
+        "UPDATE thumbnail_rebuild_jobs SET status='queued',updated_at=?,error=NULL WHERE id=?",
+    )
+    .bind(now())
+    .bind(&job_id)
+    .execute(&state.db)
+    .await
+    {
+        warn!(
+            job_id,
+            "thumbnail rebuild recovery update failed: {error:#}"
+        );
+        return false;
+    }
+    let storage_guard = state.storage_mutation_gate.clone().read_owned().await;
+    spawn_thumbnail_rebuild(state, job_id, storage_guard);
+    true
 }
 
 async fn photo_thumbnail(
@@ -4725,7 +5225,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,next_retry_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status);").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,next_retry_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status); CREATE TABLE IF NOT EXISTS thumbnail_rebuild_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,phase TEXT NOT NULL DEFAULT 'queued',total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cache_files_removed INTEGER NOT NULL DEFAULT 0,worker_count INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS thumbnail_rebuild_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES thumbnail_rebuild_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_thumbnail_rebuild_items_job_status ON thumbnail_rebuild_items(job_id,status); CREATE UNIQUE INDEX IF NOT EXISTS idx_thumbnail_rebuild_one_active ON thumbnail_rebuild_jobs((1)) WHERE status IN ('queued','running');").execute(pool).await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -4851,6 +5351,13 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await?;
     sqlx::query("UPDATE storage_migration_jobs SET cleanup_status='interrupted',updated_at=?,error='服务器重启，旧存储清理已安全中断' WHERE cleanup_status='cleaning'")
+        .bind(now())
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE thumbnail_rebuild_items SET status='queued',error='服务器重启，生成任务已安全中断' WHERE status='processing'")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE thumbnail_rebuild_jobs SET status='interrupted',completed=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status IN ('succeeded','failed','skipped','cancelled')),succeeded=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='succeeded'),failed=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='failed'),skipped=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='skipped'),cancelled=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='cancelled'),updated_at=?,error='服务器重启，缩略图重建已自动排队恢复' WHERE status IN ('queued','running')")
         .bind(now())
         .execute(pool)
         .await?;
@@ -5003,6 +5510,7 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let thumbnail_workers = automatic_thumbnail_worker_count();
     let state = AppState {
         db,
         storage,
@@ -5011,17 +5519,21 @@ async fn main() -> Result<()> {
         workers: config.workers,
         jobs: Arc::new(DashMap::new()),
         storage_tasks: Arc::new(DashMap::new()),
+        thumbnail_tasks: Arc::new(DashMap::new()),
         storage_mutation_gate,
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
-        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_THUMBNAIL_CONCURRENCY)),
+        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(thumbnail_workers)),
+        thumbnail_workers,
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
-    // The scan is intentionally scheduled only after startup recovery and state construction.
-    // It backfills pre-existing photos and repairs any thumbnail task interrupted by a restart.
-    spawn_thumbnail_backfill(state.clone());
+    // A persisted administrator rebuild takes precedence over the opportunistic startup backfill.
+    // Its phase and item states make a restart safe even if it happened while clearing the cache.
+    if !recover_thumbnail_rebuild(state.clone()).await {
+        spawn_thumbnail_backfill(state.clone());
+    }
     let api = Router::new()
         .route("/api/auth/status", get(auth_status))
         .route(
@@ -5084,6 +5596,19 @@ async fn main() -> Result<()> {
         .route("/api/photos/{photo_id}/file", get(photo_file))
         .route("/api/photos/{photo_id}/thumbnail", get(photo_thumbnail))
         .route(
+            "/api/thumbnails/rebuilds/latest",
+            get(latest_thumbnail_rebuild),
+        )
+        .route("/api/thumbnails/rebuilds", post(start_thumbnail_rebuild))
+        .route(
+            "/api/thumbnails/rebuilds/{job_id}/cancel",
+            post(cancel_thumbnail_rebuild),
+        )
+        .route(
+            "/api/thumbnails/rebuilds/{job_id}/resume",
+            post(resume_thumbnail_rebuild),
+        )
+        .route(
             "/api/conversions",
             get(list_conversions).post(start_conversion),
         )
@@ -5135,11 +5660,13 @@ mod tests {
             workers: 2,
             jobs: Arc::new(DashMap::new()),
             storage_tasks: Arc::new(DashMap::new()),
+            thumbnail_tasks: Arc::new(DashMap::new()),
             storage_mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
             thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            thumbnail_workers: 1,
             password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             photo_graph_lock: Arc::new(tokio::sync::Mutex::new(())),
         }

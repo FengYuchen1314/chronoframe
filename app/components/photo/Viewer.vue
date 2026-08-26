@@ -45,6 +45,9 @@ let gesturePointerId: number | null = null
 let dragFrame: number | null = null
 let pendingDragX = 0
 const viewerPreloads = new Map<string, HTMLImageElement>()
+const viewerReadyOriginalIds = shallowRef(new Set<string>())
+let viewerPreloadQueue: GalleryPhoto[] = []
+let activeViewerPreloads = 0
 
 const currentPhoto = computed(() => props.photos[props.currentIndex])
 const mobileSlides = computed(() => {
@@ -65,31 +68,52 @@ const clearViewerPreloads = () => {
     if (!image.complete) image.src = ''
   }
   viewerPreloads.clear()
+  viewerPreloadQueue = []
+  activeViewerPreloads = 0
 }
-const preloadViewerWindow = () => {
+
+const markViewerOriginalReady = (photoId: string) => {
+  if (viewerReadyOriginalIds.value.has(photoId)) return
+  const ready = new Set(viewerReadyOriginalIds.value)
+  ready.add(photoId)
+  viewerReadyOriginalIds.value = ready
+}
+const pumpViewerPreloads = () => {
   if (!import.meta.client || !props.isOpen) return
-  const desired = new Set<string>()
-  const start = Math.max(0, props.currentIndex - 2)
-  const end = Math.min(props.photos.length - 1, props.currentIndex + 2)
-  for (let index = start; index <= end; index += 1) {
-    const photo = props.photos[index]
-    if (!photo) continue
-    desired.add(photo.id)
-    if (viewerPreloads.has(photo.id)) continue
+  while (activeViewerPreloads < 2 && viewerPreloadQueue.length) {
+    const photo = viewerPreloadQueue.shift()
+    if (!photo || viewerReadyOriginalIds.value.has(photo.id) || viewerPreloads.has(photo.id)) continue
     const image = new Image()
     image.decoding = 'async'
     image.fetchPriority = 'high'
-    image.src = photo.originalUrl
+    activeViewerPreloads += 1
+    const finish = (ready: boolean) => {
+      viewerPreloads.delete(photo.id)
+      activeViewerPreloads = Math.max(0, activeViewerPreloads - 1)
+      if (ready) markViewerOriginalReady(photo.id)
+      pumpViewerPreloads()
+    }
+    image.onload = () => finish(true)
+    image.onerror = () => finish(false)
     viewerPreloads.set(photo.id, image)
-  }
-  for (const [photoId, image] of viewerPreloads) {
-    if (desired.has(photoId)) continue
-    image.onload = null
-    image.onerror = null
-    if (!image.complete) image.src = ''
-    viewerPreloads.delete(photoId)
+    image.src = photo.originalUrl
   }
 }
+const preloadViewerWindow = () => {
+  if (!import.meta.client || !props.isOpen) return
+  viewerPreloadQueue = []
+  for (const distance of [1, 2]) {
+    for (const index of [props.currentIndex - distance, props.currentIndex + distance]) {
+      const photo = props.photos[index]
+      if (photo) viewerPreloadQueue.push(photo)
+    }
+  }
+  pumpViewerPreloads()
+}
+const mobileSlideSrc = (photo: GalleryPhoto, index: number) =>
+  index === visualIndex.value || viewerReadyOriginalIds.value.has(photo.id)
+    ? photo.originalUrl
+    : photo.thumbnailUrl
 
 const imageAspectRatio = computed(() => {
   if (naturalSize.width > 0 && naturalSize.height > 0) return naturalSize.width / naturalSize.height
@@ -461,6 +485,8 @@ const onCurrentImageLoad = (event: Event) => {
   const image = event.currentTarget as HTMLImageElement
   naturalSize.width = image.naturalWidth
   naturalSize.height = image.naturalHeight
+  if (currentPhoto.value) markViewerOriginalReady(currentPhoto.value.id)
+  preloadViewerWindow()
 }
 const maybeShowGestureHint = () => {
   if (!import.meta.client || !props.isOpen || !isMobile.value || showGestureHint.value) return
@@ -508,7 +534,10 @@ watch(() => props.isOpen, open => {
 })
 watch(
   [() => props.isOpen, () => props.currentIndex, () => props.photos.map(photo => photo.id).join('\u0000')],
-  preloadViewerWindow,
+  ([open]) => {
+    clearViewerPreloads()
+    if (!open) viewerReadyOriginalIds.value = new Set()
+  },
   { immediate: true },
 )
 watch(() => props.currentIndex, (index) => {
@@ -560,12 +589,12 @@ onBeforeUnmount(() => {
               <div v-for="slide in mobileSlides" :key="slide.photo.id" class="absolute inset-y-0 w-full" :style="{ left: `${slide.index * 100}%` }">
                 <PhotoProgressiveImage
                   :data-viewer-current="slide.index === visualIndex ? 'true' : undefined"
-                  :src="slide.photo.originalUrl"
-                  :placeholder-src="slide.photo.thumbnailUrl"
+                  :src="mobileSlideSrc(slide.photo, slide.index)"
+                  :placeholder-src="slide.index === visualIndex ? slide.photo.thumbnailUrl : null"
                   :alt="slide.photo.title || $t('ui.photo.altFallback')"
                   fit="contain"
-                  loading="eager"
-                  fetch-priority="high"
+                  :loading="slide.index === visualIndex ? 'eager' : 'lazy'"
+                  :fetch-priority="slide.index === visualIndex ? 'high' : 'auto'"
                   class="h-full w-full select-none bg-black will-change-transform"
                   :style="slide.index === visualIndex ? mobileImageStyle : undefined"
                   @load="slide.index === visualIndex && onCurrentImageLoad($event)"
