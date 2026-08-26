@@ -4102,11 +4102,7 @@ async fn photo_thumbnail(
             .await
             .map_err(AppError::internal)?
             .map_err(AppError::internal)?;
-    if let Err(error) = state
-        .storage
-        .cache_thumbnail(&photo_id, &thumbnail)
-        .await
-    {
+    if let Err(error) = state.storage.cache_thumbnail(&photo_id, &thumbnail).await {
         warn!(photo_id, "thumbnail cache write failed: {error:#}");
     }
     Ok((
@@ -4372,7 +4368,9 @@ async fn confirm_delete_sources(
                 "background source deletion batch finished"
             ),
             Ok(_) => {}
-            Err(error) => warn!(job_id = %worker_job_id, "background source deletion deferred: {error:#}"),
+            Err(error) => {
+                warn!(job_id = %worker_job_id, "background source deletion deferred: {error:#}")
+            }
         }
     });
     Ok((
@@ -4851,11 +4849,7 @@ async fn main() -> Result<()> {
         .await?;
     setup_database(&db).await?;
     let master_key = load_or_create_master_key(&config.master_key_file).await?;
-    let storage = StorageService::new(
-        db.clone(),
-        master_key,
-        config.thumbnail_cache_dir.clone(),
-    );
+    let storage = StorageService::new(db.clone(), master_key, config.thumbnail_cache_dir.clone());
     let photo_graph_lock = Arc::new(tokio::sync::Mutex::new(()));
     let storage_mutation_gate = Arc::new(tokio::sync::RwLock::new(()));
     match recover_pending_blobs(&storage, &db, true).await {
@@ -4942,9 +4936,7 @@ async fn main() -> Result<()> {
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
-        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(
-            DEFAULT_THUMBNAIL_CONCURRENCY,
-        )),
+        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_THUMBNAIL_CONCURRENCY)),
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
@@ -5048,10 +5040,8 @@ mod tests {
             .await
             .unwrap();
         setup_database(&db).await.unwrap();
-        let thumbnail_cache_dir = std::env::temp_dir().join(format!(
-            "chronoframe-test-thumbnails-{}",
-            Uuid::new_v4()
-        ));
+        let thumbnail_cache_dir =
+            std::env::temp_dir().join(format!("chronoframe-test-thumbnails-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&thumbnail_cache_dir)
             .await
             .unwrap();
