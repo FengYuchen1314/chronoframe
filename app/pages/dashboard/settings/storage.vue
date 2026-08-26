@@ -5,6 +5,7 @@ import type {
   StorageMigrationJob,
   StorageSettings,
   StorageSettingsInput,
+  ThumbnailRebuildJob,
 } from '~/types/dashboard'
 
 definePageMeta({
@@ -59,7 +60,10 @@ const isTesting = ref(false)
 const isSaving = ref(false)
 const isLoadingMigrations = ref(false)
 const isStorageTaskAction = ref(false)
+const isLoadingThumbnailJob = ref(false)
+const isThumbnailTaskAction = ref(false)
 const migrationJobs = ref<StorageMigrationJob[]>([])
+const latestThumbnailJob = ref<ThumbnailRebuildJob | null>(null)
 const storedPhotoCount = ref(0)
 const loadError = ref('')
 const lastTest = ref<{ backend: StorageBackend, at: Date } | null>(null)
@@ -115,6 +119,14 @@ const migrationRequired = computed(() => storageTargetChanged.value && storedPho
 const migrationProgress = computed(() => {
   const job = latestMigration.value
   if (!job?.total) return 0
+  return Math.min(100, Math.round((job.completed / job.total) * 100))
+})
+const thumbnailTaskActive = computed(() =>
+  latestThumbnailJob.value && ['queued', 'running'].includes(latestThumbnailJob.value.status),
+)
+const thumbnailProgress = computed(() => {
+  const job = latestThumbnailJob.value
+  if (!job?.total) return job?.status === 'completed' ? 100 : 0
   return Math.min(100, Math.round((job.completed / job.total) * 100))
 })
 
@@ -193,6 +205,62 @@ const loadMigrations = async () => {
     if (!loadError.value) loadError.value = getAdminApiErrorMessage(error)
   } finally {
     isLoadingMigrations.value = false
+  }
+}
+
+const loadThumbnailJob = async () => {
+  if (isLoadingThumbnailJob.value) return
+  isLoadingThumbnailJob.value = true
+  try {
+    latestThumbnailJob.value = await adminFetch<ThumbnailRebuildJob | null>('/api/thumbnails/rebuilds/latest')
+  } catch (error) {
+    if (!loadError.value) loadError.value = getAdminApiErrorMessage(error)
+  } finally {
+    isLoadingThumbnailJob.value = false
+  }
+}
+
+const thumbnailStatusText = computed(() => {
+  const job = latestThumbnailJob.value
+  if (!job) return '尚未手动重建'
+  if (job.status === 'running') return job.phase === 'clearing' ? '正在清空缓存' : '正在并发生成'
+  return {
+    queued: '等待开始',
+    completed: '重建完成',
+    failed: '部分生成失败',
+    cancelled: '已安全中断',
+    interrupted: '服务重启后待恢复',
+  }[job.status] || job.status
+})
+
+const thumbnailStatusColor = computed((): 'neutral' | 'success' | 'error' | 'warning' | 'primary' => {
+  const status = latestThumbnailJob.value?.status
+  if (!status) return 'neutral'
+  if (status === 'completed') return 'success'
+  if (status === 'failed') return 'error'
+  if (status === 'cancelled' || status === 'interrupted') return 'warning'
+  return 'primary'
+})
+
+const runThumbnailTaskAction = async (action: 'start' | 'cancel' | 'resume') => {
+  if (isThumbnailTaskAction.value) return
+  isThumbnailTaskAction.value = true
+  try {
+    const job = latestThumbnailJob.value
+    const endpoint = action === 'start'
+      ? '/api/thumbnails/rebuilds'
+      : `/api/thumbnails/rebuilds/${job?.id}/${action}`
+    await adminFetch(endpoint, { method: 'POST' })
+    toast.add({
+      title: action === 'start' ? '缩略图缓存开始重建' : action === 'resume' ? '缩略图重建已继续' : '已请求安全中断',
+      description: action === 'cancel' ? '正在停止尚未开始的项目，已完成的缩略图会保留。' : '任务在后端并发运行，可以离开此页面。',
+      color: action === 'cancel' ? 'warning' : 'success',
+    })
+    await loadThumbnailJob()
+  } catch (error) {
+    toast.add({ title: '缩略图任务操作失败', description: getAdminApiErrorMessage(error), color: 'error' })
+  } finally {
+    isThumbnailTaskAction.value = false
   }
 }
 
@@ -329,10 +397,10 @@ const changeBackend = (backend: StorageBackend) => {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), loadMigrations()])
+  await Promise.all([loadSettings(), loadMigrations(), loadThumbnailJob()])
   migrationPoll = window.setInterval(async () => {
     const wasActive = Boolean(activeStorageTask.value)
-    await loadMigrations()
+    await Promise.all([loadMigrations(), loadThumbnailJob()])
     if (wasActive && !activeStorageTask.value) await loadSettings()
   }, 2000)
 })
@@ -346,7 +414,7 @@ onBeforeUnmount(() => {
   <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
       <UDashboardNavbar title="存储设置">
-        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading || isLoadingMigrations" @click="loadSettings(); loadMigrations()">重新读取</UButton></template>
+        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading || isLoadingMigrations || isLoadingThumbnailJob" @click="loadSettings(); loadMigrations(); loadThumbnailJob()">重新读取</UButton></template>
       </UDashboardNavbar>
     </template>
 
@@ -358,6 +426,27 @@ onBeforeUnmount(() => {
 
         <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="存储设置加载失败" :description="loadError" />
         <UAlert v-if="lastTest" color="success" variant="subtle" icon="tabler:circle-check" title="最近一次连接验证通过" :description="lastTestDescription" />
+
+        <section class="dashboard-section overflow-hidden">
+          <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
+            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:photo-cog" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">缩略图缓存</h2><p class="mt-1 text-sm text-muted">清空本机缓存并为当前图库重新生成 PNG 缩略图</p></div></div>
+            <UBadge :color="thumbnailStatusColor" variant="soft">{{ thumbnailStatusText }}</UBadge>
+          </header>
+          <div class="space-y-4 p-5 sm:p-6">
+            <template v-if="latestThumbnailJob">
+              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">{{ latestThumbnailJob.phase === 'clearing' && latestThumbnailJob.status === 'running' ? '正在清理旧缓存' : '生成进度' }}</span><strong class="text-highlighted">{{ latestThumbnailJob.completed }} / {{ latestThumbnailJob.total }}（{{ thumbnailProgress }}%）</strong></div>
+              <UProgress :model-value="thumbnailProgress" />
+              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted"><span>成功 {{ latestThumbnailJob.succeeded }}</span><span>失败 {{ latestThumbnailJob.failed }}</span><span>跳过 {{ latestThumbnailJob.skipped }}</span><span>已清理文件 {{ latestThumbnailJob.cacheFilesRemoved }}</span><span>并发 {{ latestThumbnailJob.workerCount }}</span></div>
+              <UAlert v-if="latestThumbnailJob.error" color="warning" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestThumbnailJob.error" />
+            </template>
+            <p v-else class="text-sm leading-6 text-muted">缩略图缓存位于服务器本地，不会删除原图。任务会根据 CPU 自动调整并发（至少 7，最多 32），可以关闭页面，服务重启后会自动恢复。</p>
+            <div class="flex flex-wrap justify-end gap-2">
+              <UButton v-if="thumbnailTaskActive" color="warning" variant="soft" icon="tabler:player-stop" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('cancel')">安全中断</UButton>
+              <UButton v-else-if="latestThumbnailJob && ['failed', 'cancelled', 'interrupted'].includes(latestThumbnailJob.status)" icon="tabler:player-play" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('resume')">继续重建</UButton>
+              <UButton v-else icon="tabler:refresh" :loading="isThumbnailTaskAction" :disabled="Boolean(activeStorageTask)" @click="runThumbnailTaskAction('start')">清空并重新生成</UButton>
+            </div>
+          </div>
+        </section>
 
         <section v-if="latestMigration" class="dashboard-section overflow-hidden">
           <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">

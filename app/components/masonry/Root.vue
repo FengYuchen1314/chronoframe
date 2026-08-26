@@ -17,7 +17,7 @@ const headerColumnWidth = ref(280)
 const gap = 4
 
 const displayPhotos = computed(() => hasActiveFilters.value ? filteredPhotos.value : sortedPhotos.value)
-const { isOriginalReady, markThumbnailSettled, prioritizeAround } = useGalleryImagePipeline(displayPhotos)
+const { isOriginalReady, markThumbnailSettled, pauseBackgroundOriginals } = useGalleryImagePipeline(displayPhotos)
 const items = computed(() => displayPhotos.value.map((photo, index) => ({ photo, index, id: photo.id })))
 const keyMapper = (item: { id: string }) => item.id
 const columnWidth = computed(() => 280)
@@ -53,7 +53,7 @@ const dateRangeText = computed(() => {
 const openPhoto = (index: number) => {
   const photo = displayPhotos.value[index]
   if (!photo) return
-  prioritizeAround(index)
+  pauseBackgroundOriginals()
   viewer.openViewer(index, '/photos', displayPhotos.value)
   router.push(`/${photo.id}`)
 }

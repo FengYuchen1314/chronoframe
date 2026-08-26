@@ -113,7 +113,7 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 可勾选一个或多个相簿，将其中的 PNG、JPG/JPEG、WEBP 转为三者之一。任务默认在 Rust 后台使用 7 个并发 worker 执行，界面只读取持久化进度；关闭或切换页面不会中断任务。管理员确认删除旧格式图片后，删除请求也会立即进入 7 路并发的持久化后台队列，服务重启后自动续作。
 
-图片记录成功写入数据库后，Rust 后台会自动并发生成 PNG 缩略图并持久缓存在 Compose 同目录的 `./data/thumbnails`；上传和格式转换接口不等待缩略图编码，服务重启后也会扫描并补齐历史图片。公开相簿先加载这些 PNG 缩略图，首轮全部就绪后，浏览器会在没有应用层带宽节流的情况下逐张替换为清晰原图。打开查看器时，当前图片和前后各两张原图会提升到最高加载优先级。
+图片记录成功写入数据库后，Rust 后台会自动并发生成 PNG 缩略图并持久缓存在 Compose 同目录的 `./data/thumbnails`；上传和格式转换接口不等待缩略图编码，服务重启后也会扫描并补齐历史图片。管理员可在“存储设置”一键清空缩略图缓存并重建：任务根据 CPU 自动采用 7–32 个 worker，持久化逐项进度，可安全中断、继续，并会在服务重启后自动恢复。公开相簿最多只在后台预取两张清晰原图；进入查看器时会立即取消这些低优先级请求，只让当前原图独占最高优先级，当前图清晰后才并发预取相邻图片，避免整本相簿的原图队列阻塞当前照片。
 
 - 每项任务有独立状态（排队、处理中、成功、失败、取消），失败不影响其他图片。
 - 取消会停止尚未开始或可撤销的工作；正在进行原子提交的单张图片会安全完成，绝不出现半写入文件。
@@ -142,6 +142,8 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `GET/POST /api/storage-migrations` — 查看迁移进度或以新的存储配置开始迁移
 - `POST /api/storage-migrations/:job_id/resume`、`POST /api/storage-migrations/:job_id/cancel`
 - `POST /api/storage-migrations/:job_id/cleanup`、`POST /api/storage-migrations/:job_id/retain` — 删除或保留旧存储图片
+- `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建
+- `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断缩略图重建
 - `GET/POST /api/conversions` — 列出任务，或提交 `{ "albumIds": [], "targetFormat": "png|jpg|jpeg|webp" }`
 - `GET /api/conversions/:job_id`
 - `POST /api/conversions/:job_id/cancel`

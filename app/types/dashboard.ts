@@ -109,6 +109,23 @@ export interface StorageMigrationJob {
   error: string | null
 }
 
+export interface ThumbnailRebuildJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  phase: 'queued' | 'clearing' | 'generating'
+  total: number
+  completed: number
+  succeeded: number
+  failed: number
+  skipped: number
+  cancelled: number
+  cacheFilesRemoved: number
+  workerCount: number
+  createdAt: number
+  updatedAt: number
+  error: string | null
+}
+
 export interface StorageSettings {
   backend: StorageBackend
   localPath: string
