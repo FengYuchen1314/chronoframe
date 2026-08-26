@@ -126,6 +126,26 @@ export interface ThumbnailRebuildJob {
   error: string | null
 }
 
+export interface S3CleanupJob {
+  id: string
+  status: 'running' | 'ready' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  phase: 'scanning' | 'ready' | 'deleting'
+  scannedObjects: number
+  protectedObjects: number
+  total: number
+  completed: number
+  deleted: number
+  failed: number
+  skipped: number
+  bytesFound: number
+  bytesDeleted: number
+  workerCount: number
+  managedPrefix: string
+  createdAt: number
+  updatedAt: number
+  error: string | null
+}
+
 export interface StorageSettings {
   backend: StorageBackend
   localPath: string
