@@ -25,15 +25,15 @@ const toneClasses = {
   <component
     :is="to ? resolveComponent('NuxtLink') : 'div'"
     :to="to"
-    class="group flex min-w-0 items-center gap-4 rounded-2xl border border-default bg-default p-4 shadow-sm transition duration-200"
-    :class="to ? 'hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-md' : ''"
+    class="group flex min-w-0 items-center gap-3 rounded-xl border border-default bg-default p-4 shadow-xs transition"
+    :class="to ? 'hover:border-accented hover:bg-elevated/40' : ''"
   >
-    <span class="flex size-11 shrink-0 items-center justify-center rounded-xl" :class="toneClasses[tone]">
+    <span class="flex size-10 shrink-0 items-center justify-center rounded-lg" :class="toneClasses[tone]">
       <Icon :name="icon" class="size-5" />
     </span>
     <span class="min-w-0 flex-1">
       <span class="block text-xs font-medium text-muted">{{ label }}</span>
-      <span class="mt-0.5 block truncate text-xl font-semibold text-highlighted">{{ value }}</span>
+      <span class="mt-0.5 block truncate text-lg font-semibold text-highlighted">{{ value }}</span>
       <span v-if="hint" class="mt-0.5 block truncate text-xs text-muted">{{ hint }}</span>
     </span>
     <Icon v-if="to" name="tabler:chevron-right" class="size-4 shrink-0 text-dimmed transition group-hover:translate-x-0.5 group-hover:text-primary" />

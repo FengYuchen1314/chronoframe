@@ -2948,6 +2948,8 @@ impl<'de> Deserialize<'de> for PatchString {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AlbumPatch {
     #[serde(default)]
+    name: PatchString,
+    #[serde(default)]
     description: PatchString,
     #[serde(default)]
     display_created_date: PatchString,
@@ -2961,6 +2963,14 @@ struct AlbumPatch {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AlbumOrderInput {
     album_ids: Vec<String>,
+}
+
+fn normalize_album_name(value: Option<String>) -> ApiResult<String> {
+    let name = value.unwrap_or_default().trim().to_string();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err(AppError::bad("相簿名不能为空且不得超过 100 个字符"));
+    }
+    Ok(name)
 }
 
 fn normalize_album_description(value: Option<String>) -> ApiResult<String> {
@@ -3060,10 +3070,7 @@ async fn create_album(
     Json(input): Json<NewAlbum>,
 ) -> ApiResult<(StatusCode, Json<Album>)> {
     require_admin(&headers, &state, true).await?;
-    let name = input.name.trim();
-    if name.is_empty() || name.chars().count() > 100 {
-        return Err(AppError::bad("相簿名不能为空且不得超过 100 个字符"));
-    }
+    let name = normalize_album_name(Some(input.name))?;
     let description = normalize_album_description(input.description)?;
     let position: i64 = sqlx::query_scalar("SELECT COALESCE(MIN(position),0)-1 FROM albums")
         .fetch_one(&state.db)
@@ -3071,7 +3078,7 @@ async fn create_album(
         .map_err(AppError::internal)?;
     let album = Album {
         id: Uuid::new_v4().to_string(),
-        name: name.into(),
+        name,
         description,
         created_at: now(),
         display_created_date: None,
@@ -3100,7 +3107,7 @@ async fn patch_album(
 ) -> ApiResult<Json<Album>> {
     require_admin(&headers, &state, true).await?;
 
-    let current = sqlx::query("SELECT description,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id=?")
+    let current = sqlx::query("SELECT name,description,display_created_date,photo_date_start,photo_date_end FROM albums WHERE id=?")
         .bind(&album_id)
         .fetch_optional(&state.db)
         .await
@@ -3112,6 +3119,13 @@ async fn patch_album(
         })?;
 
     let mut changed = false;
+    let name = match input.name {
+        PatchString::Missing => current.get::<String, _>("name"),
+        PatchString::Present(value) => {
+            changed = true;
+            normalize_album_name(value)?
+        }
+    };
     let description = match input.description {
         PatchString::Missing => current.get::<String, _>("description"),
         PatchString::Present(value) => {
@@ -3148,7 +3162,8 @@ async fn patch_album(
         return Err(AppError::bad("至少需要提供一个相簿字段"));
     }
 
-    sqlx::query("UPDATE albums SET description=?,display_created_date=?,photo_date_start=?,photo_date_end=? WHERE id=?")
+    sqlx::query("UPDATE albums SET name=?,description=?,display_created_date=?,photo_date_start=?,photo_date_end=? WHERE id=?")
+        .bind(name)
         .bind(description)
         .bind(display_created_date)
         .bind(photo_date_start)
@@ -3556,6 +3571,41 @@ struct DeletePhotosInput {
     photo_ids: Vec<String>,
 }
 
+async fn ensure_photo_deletable(
+    db: &SqlitePool,
+    photo_id: &str,
+    storage_key: &str,
+) -> ApiResult<()> {
+    let conversion_reference: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversion_items WHERE status IN ('queued','processing') AND (source_photo_id=? OR target_photo_id=?))")
+        .bind(photo_id)
+        .bind(photo_id)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    let pending_source_cleanup: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM source_deletion_outbox WHERE source_photo_id=? OR target_key=?)")
+        .bind(photo_id)
+        .bind(storage_key)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    let unresolved_migration: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_migration_items item JOIN storage_migration_jobs job ON job.id=item.job_id WHERE item.photo_id=? AND (job.status!='completed' OR job.cleanup_status NOT IN ('cleaned','retained')))")
+        .bind(photo_id)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    if conversion_reference || pending_source_cleanup {
+        return Err(AppError::conflict(
+            "所选图片正被转换任务或旧图清理任务使用，请先结束相关任务",
+        ));
+    }
+    if unresolved_migration {
+        return Err(AppError::conflict(
+            "所选图片属于尚未收尾的存储迁移，请先继续迁移并处理旧存储",
+        ));
+    }
+    Ok(())
+}
+
 async fn delete_photo_records(
     state: &AppState,
     photo_ids: Vec<String>,
@@ -3593,23 +3643,7 @@ async fn delete_photo_records(
     for row in &rows {
         let photo_id: String = row.get("id");
         let storage_key: String = row.get("storage_key");
-        let conversion_reference: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversion_items WHERE status IN ('queued','processing') AND (source_photo_id=? OR target_photo_id=?))")
-            .bind(&photo_id)
-            .bind(&photo_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(AppError::internal)?;
-        let pending_source_cleanup: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM source_deletion_outbox WHERE source_photo_id=? OR target_key=?)")
-            .bind(&photo_id)
-            .bind(&storage_key)
-            .fetch_one(&state.db)
-            .await
-            .map_err(AppError::internal)?;
-        if conversion_reference || pending_source_cleanup {
-            return Err(AppError::conflict(
-                "所选图片正被转换任务或旧图清理任务使用，请先结束相关任务",
-            ));
-        }
+        ensure_photo_deletable(&state.db, &photo_id, &storage_key).await?;
     }
     let mut tx = state.db.begin().await.map_err(AppError::internal)?;
     for row in &rows {
@@ -3658,6 +3692,82 @@ async fn delete_photos(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&headers, &state, true).await?;
     Ok(Json(delete_photo_records(&state, input.photo_ids).await?))
+}
+
+async fn delete_album(
+    State(state): State<AppState>,
+    AxumPath(album_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&headers, &state, true).await?;
+    let _mutation_guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_read_owned()
+        .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再删除相簿"))?;
+    let _photo_graph_guard = state.photo_graph_lock.lock().await;
+    let _storage_guard = state.storage.gate.read().await;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM albums WHERE id=?)")
+        .bind(&album_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    if !exists {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "相簿不存在".into(),
+            clear_auth_cookies: None,
+        });
+    }
+    let rows = sqlx::query("SELECT id,storage_key FROM photos WHERE album_id=? ORDER BY id")
+        .bind(&album_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    for row in &rows {
+        ensure_photo_deletable(
+            &state.db,
+            &row.get::<String, _>("id"),
+            &row.get::<String, _>("storage_key"),
+        )
+        .await?;
+    }
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    for row in &rows {
+        sqlx::query(
+            "INSERT INTO photo_deletion_outbox(photo_id,storage_key,created_at) VALUES(?,?,?)",
+        )
+        .bind(row.get::<String, _>("id"))
+        .bind(row.get::<String, _>("storage_key"))
+        .bind(now())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    }
+    let deleted = sqlx::query("DELETE FROM albums WHERE id=?")
+        .bind(&album_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?
+        .rows_affected();
+    if deleted != 1 {
+        return Err(AppError::conflict("相簿已由其他请求删除，请刷新页面"));
+    }
+    sqlx::query("WITH ranked AS (SELECT id,ROW_NUMBER() OVER (ORDER BY position ASC,created_at DESC,id ASC)-1 new_position FROM albums) UPDATE albums SET position=(SELECT new_position FROM ranked WHERE ranked.id=albums.id)")
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    let drain = drain_photo_deletion_outbox(&state.storage, &state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "photosDeleted": rows.len(),
+        "objectsRemoved": drain.removed,
+        "cleanupPending": drain.failures.len(),
+        "failures": drain.failures
+    })))
 }
 
 async fn upload_photos(
@@ -4651,7 +4761,7 @@ async fn main() -> Result<()> {
         .route("/api/albums/export", get(export_albums))
         .route(
             "/api/albums/{album_id}",
-            get(album_detail).patch(patch_album),
+            get(album_detail).patch(patch_album).delete(delete_album),
         )
         .route(
             "/api/albums/{album_id}/photos",
@@ -5060,6 +5170,76 @@ mod tests {
         );
         assert!(normalize_album_description(Some("介".repeat(1000))).is_ok());
         assert!(normalize_album_description(Some("介".repeat(1001))).is_err());
+    }
+
+    #[test]
+    fn album_name_is_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_album_name(Some("  夏日旅行\n".into())).unwrap(),
+            "夏日旅行"
+        );
+        assert!(normalize_album_name(None).is_err());
+        assert!(normalize_album_name(Some(" \t ".into())).is_err());
+        assert!(normalize_album_name(Some("相".repeat(100))).is_ok());
+        assert!(normalize_album_name(Some("相".repeat(101))).is_err());
+    }
+
+    #[tokio::test]
+    async fn album_can_be_renamed_and_empty_album_can_be_deleted() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,'admin','hash',?)")
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO albums(id,name,description,created_at,position) VALUES('first','First','',1,0),('second','Second','',2,1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (token, csrf) = create_session(&state).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}; {CSRF_COOKIE}={csrf}"))
+                .unwrap(),
+        );
+        headers.insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+
+        let Json(renamed) = patch_album(
+            State(state.clone()),
+            AxumPath("first".into()),
+            headers.clone(),
+            Json(AlbumPatch {
+                name: PatchString::Present(Some("  Renamed album  ".into())),
+                description: PatchString::Missing,
+                display_created_date: PatchString::Missing,
+                photo_date_start: PatchString::Missing,
+                photo_date_end: PatchString::Missing,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.name, "Renamed album");
+
+        let Json(result) = delete_album(State(state.clone()), AxumPath("first".into()), headers)
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["photosDeleted"], 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM albums WHERE id='first'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT position FROM albums WHERE id='second'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

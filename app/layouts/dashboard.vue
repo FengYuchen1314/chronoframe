@@ -23,29 +23,29 @@ const isRegistration = computed(() => !authState.value.initialized)
 const navItems = computed<NavigationMenuItem[][]>(() => [
   [
     {
-      label: '概览',
+      label: '工作台',
       icon: 'tabler:dashboard',
       to: '/dashboard',
     },
     {
-      label: '相簿',
+      label: '相簿管理',
       icon: 'tabler:album',
       to: '/dashboard/albums',
     },
     {
-      label: '格式转换',
+      label: '转换任务',
       icon: 'tabler:arrows-exchange',
       to: '/dashboard/conversions',
     },
   ],
   [
     {
-      label: '站点外观',
+      label: '网站设置',
       icon: 'tabler:palette',
       to: '/dashboard/settings/general',
     },
     {
-      label: '存储中心',
+      label: '存储设置',
       icon: 'tabler:database-cog',
       to: '/dashboard/settings/storage',
     },
@@ -175,7 +175,7 @@ useHead({
     v-if="!authState.checked || authState.loading"
     class="dashboard-surface flex min-h-svh items-center justify-center px-4 py-10"
   >
-    <div class="w-full max-w-sm rounded-3xl border border-default bg-default/90 p-8 text-center shadow-xl backdrop-blur-xl">
+    <div class="w-full max-w-sm rounded-xl border border-default bg-default p-8 text-center shadow-lg">
       <div class="flex flex-col items-center gap-4 py-4">
         <span class="flex size-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
           <Icon name="tabler:loader-2" class="size-7 animate-spin" />
@@ -214,118 +214,97 @@ useHead({
 
   <div
     v-else-if="!authState.authenticated"
-    class="dashboard-surface relative flex min-h-svh items-center justify-center overflow-hidden px-4 py-10"
+    class="dashboard-surface flex min-h-svh items-center justify-center px-4 py-10"
   >
-    <div class="pointer-events-none absolute -left-32 -top-32 size-96 rounded-full bg-primary/10 blur-3xl" />
-    <div class="pointer-events-none absolute -bottom-40 -right-28 size-[30rem] rounded-full bg-info/10 blur-3xl" />
-
-    <div class="relative grid w-full max-w-5xl overflow-hidden rounded-3xl border border-default bg-default/90 shadow-2xl backdrop-blur-xl lg:grid-cols-[1.05fr_0.95fr]">
-      <section class="hidden min-h-[620px] flex-col justify-between bg-gradient-to-br from-primary via-pink-500 to-purple-600 p-10 text-white lg:flex">
-        <div>
-          <div class="flex items-center gap-3">
-            <img :src="siteSettings.avatarUrl" class="size-11 rounded-2xl bg-white/20 object-cover ring-1 ring-white/20" alt="" />
-            <div>
-              <p class="text-lg font-semibold">{{ appTitle }}</p>
-              <p class="text-sm text-white/70">内容管理工作台</p>
-            </div>
-          </div>
-
-          <div class="mt-24 max-w-md">
-            <p class="text-sm font-semibold uppercase tracking-[0.2em] text-white/70">ChronoFrame Studio</p>
-            <h1 class="mt-4 text-4xl font-semibold leading-tight">把相簿、存储和转换任务放在一个清晰的工作流里。</h1>
-            <p class="mt-5 leading-7 text-white/75">创建相簿后上传，转换过程实时可见，旧图始终由管理员最终确认。</p>
+    <section class="w-full max-w-md overflow-hidden rounded-xl border border-default bg-default shadow-lg">
+      <header class="border-b border-default px-6 py-5 sm:px-7">
+        <div class="flex items-center gap-3">
+          <img :src="siteSettings.avatarUrl" class="size-10 rounded-lg bg-elevated object-cover ring-1 ring-default" alt="" />
+          <div class="min-w-0">
+            <p class="truncate font-semibold text-highlighted">{{ appTitle }}</p>
+            <p class="text-xs text-muted">管理后台</p>
           </div>
         </div>
+      </header>
 
-        <div class="grid grid-cols-3 gap-3 text-sm">
-          <div class="rounded-2xl bg-white/10 p-4 backdrop-blur"><Icon name="tabler:album" class="mb-2 size-5" /><p>相簿优先</p></div>
-          <div class="rounded-2xl bg-white/10 p-4 backdrop-blur"><Icon name="tabler:progress" class="mb-2 size-5" /><p>进度可见</p></div>
-          <div class="rounded-2xl bg-white/10 p-4 backdrop-blur"><Icon name="tabler:shield-check" class="mb-2 size-5" /><p>安全可控</p></div>
-        </div>
-      </section>
-
-      <section class="flex min-h-[560px] flex-col justify-center px-6 py-10 sm:px-12 lg:min-h-[620px]">
-        <div class="mx-auto w-full max-w-sm">
-          <span class="flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary lg:hidden">
-            <Icon :name="isRegistration ? 'tabler:user-plus' : 'tabler:shield-lock'" class="size-6" />
+      <div class="px-6 py-6 sm:px-7">
+        <div class="flex items-start gap-3">
+          <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <Icon :name="isRegistration ? 'tabler:user-plus' : 'tabler:shield-lock'" class="size-5" />
           </span>
-          <p class="mt-6 text-xs font-semibold uppercase tracking-[0.18em] text-primary">{{ appTitle }}</p>
-          <h1 class="mt-2 text-3xl font-semibold tracking-tight text-highlighted">
-            {{ isRegistration ? '创建管理员账号' : '欢迎回来' }}
-          </h1>
-          <p class="mt-2 text-sm leading-6 text-muted">
-            {{ isRegistration ? '首次打开后台的人可以创建唯一管理员账号，创建后立即进入工作台。' : '登录后管理相簿、转换任务和存储连接。' }}
-          </p>
-
-      <form class="mt-8 space-y-5" @submit.prevent="submitAuth">
-        <UAlert
-          v-if="formError"
-          color="error"
-          variant="subtle"
-          icon="tabler:alert-circle"
-          :description="formError"
-        />
-
-        <UFormField label="管理员用户名" help="1–64 个字符" required>
-          <UInput
-            v-model="username"
-            autocomplete="username"
-            placeholder="输入用户名"
-            icon="tabler:user"
-            class="w-full"
-            autofocus
-            :disabled="isSubmitting"
-            @update:model-value="clearFormError"
-          />
-        </UFormField>
-
-        <UFormField label="管理员密码" help="至少 12 个字符，最多 1024 字节" required>
-          <UInput
-            v-model="password"
-            type="password"
-            :autocomplete="isRegistration ? 'new-password' : 'current-password'"
-            placeholder="输入密码"
-            icon="tabler:lock-password"
-            class="w-full"
-            :minlength="12"
-            :maxlength="1024"
-            :disabled="isSubmitting"
-            @update:model-value="clearFormError"
-          />
-        </UFormField>
-
-        <UFormField v-if="isRegistration" label="确认管理员密码" required>
-          <UInput
-            v-model="passwordConfirmation"
-            type="password"
-            autocomplete="new-password"
-            placeholder="再次输入密码"
-            icon="tabler:lock-check"
-            class="w-full"
-            :minlength="12"
-            :maxlength="1024"
-            :disabled="isSubmitting"
-            @update:model-value="clearFormError"
-          />
-        </UFormField>
-
-        <UButton
-          type="submit"
-          block
-          size="lg"
-          :icon="isRegistration ? 'tabler:user-plus' : 'tabler:login-2'"
-          :loading="isSubmitting"
-        >
-          {{ isRegistration ? '创建账号并进入后台' : '登录' }}
-        </UButton>
-      </form>
-          <p class="mt-6 flex items-start gap-2 text-xs leading-5 text-muted">
-            <Icon name="tabler:lock" class="mt-0.5 size-4 shrink-0" />
-            管理员凭据只发送给当前 ChronoFrame 服务，不会写入浏览器 URL 或站点设置。
-          </p>
+          <div>
+            <h1 class="text-xl font-semibold tracking-tight text-highlighted">{{ isRegistration ? '创建管理员账号' : '登录后台' }}</h1>
+            <p class="mt-1 text-sm leading-6 text-muted">{{ isRegistration ? '首次使用时创建唯一管理员，之后只能通过登录进入。' : '登录后管理相簿、转换任务和存储设置。' }}</p>
+          </div>
         </div>
-      </section>
-    </div>
+
+        <UAlert v-if="isRegistration" class="mt-5" color="info" variant="subtle" icon="tabler:info-circle" title="首次初始化" description="第一个成功提交的人会成为管理员，请现在设置强密码。" />
+
+        <form class="mt-6 space-y-5" @submit.prevent="submitAuth">
+          <UAlert
+            v-if="formError"
+            color="error"
+            variant="subtle"
+            icon="tabler:alert-circle"
+            :description="formError"
+          />
+
+          <UFormField label="管理员用户名" help="1–64 个字符" required>
+            <UInput
+              v-model="username"
+              autocomplete="username"
+              placeholder="输入用户名"
+              icon="tabler:user"
+              class="w-full"
+              autofocus
+              :disabled="isSubmitting"
+              @update:model-value="clearFormError"
+            />
+          </UFormField>
+
+          <UFormField label="管理员密码" help="至少 12 个字符，最多 1024 字节" required>
+            <UInput
+              v-model="password"
+              type="password"
+              :autocomplete="isRegistration ? 'new-password' : 'current-password'"
+              placeholder="输入密码"
+              icon="tabler:lock-password"
+              class="w-full"
+              :minlength="12"
+              :maxlength="1024"
+              :disabled="isSubmitting"
+              @update:model-value="clearFormError"
+            />
+          </UFormField>
+
+          <UFormField v-if="isRegistration" label="确认管理员密码" required>
+            <UInput
+              v-model="passwordConfirmation"
+              type="password"
+              autocomplete="new-password"
+              placeholder="再次输入密码"
+              icon="tabler:lock-check"
+              class="w-full"
+              :minlength="12"
+              :maxlength="1024"
+              :disabled="isSubmitting"
+              @update:model-value="clearFormError"
+            />
+          </UFormField>
+
+          <UButton
+            type="submit"
+            block
+            size="lg"
+            :icon="isRegistration ? 'tabler:user-plus' : 'tabler:login-2'"
+            :loading="isSubmitting"
+          >
+            {{ isRegistration ? '创建账号并进入后台' : '登录' }}
+          </UButton>
+        </form>
+        <p class="mt-5 flex items-start gap-2 border-t border-default pt-4 text-xs leading-5 text-muted"><Icon name="tabler:lock" class="mt-0.5 size-4 shrink-0" />管理员凭据不会写入浏览器 URL 或公开站点设置。</p>
+      </div>
+    </section>
   </div>
 
   <UDashboardGroup v-else class="dashboard-surface">
@@ -336,7 +315,7 @@ useHead({
       mode="drawer"
       :min-size="15"
       :max-size="20"
-      class="border-r border-default bg-default/90 backdrop-blur-xl"
+      class="border-r border-default bg-default"
       :ui="{ header: 'border-b border-default', footer: 'border-t border-default' }"
       :toggle="{
         color: 'primary',
@@ -355,7 +334,7 @@ useHead({
             <NuxtLink to="/dashboard" class="line-clamp-1 font-semibold text-highlighted">
               {{ appTitle }}
             </NuxtLink>
-            <span class="truncate text-xs text-muted">内容管理工作台</span>
+            <span class="truncate text-xs text-muted">管理后台</span>
           </div>
         </div>
         <img v-else :src="siteSettings.avatarUrl" class="mx-auto size-9 rounded-xl object-cover" alt="" />
