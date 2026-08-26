@@ -44,8 +44,10 @@ export interface GalleryPhoto {
   width: number | null
   height: number | null
   aspectRatio: number | null
-  originalUrl: string
   thumbnailUrl: string
+  previewUrl: string
+  highUrl: string
+  renderUrl: string
   storageKey: string
   tags: string[]
   exif: GalleryExif | null

@@ -34,6 +34,8 @@ const pinchStart = reactive({ distance: 1, scale: 1, centerX: 0, centerY: 0, pan
 const lastTap = reactive({ x: 0, y: 0, time: 0 })
 const visualIndex = ref(props.currentIndex)
 const showGestureHint = ref(false)
+const showHigh = ref(false)
+const actionMenu = reactive({ open: false, x: 0, y: 0 })
 const activePointers = new Map<number, PointerPoint>()
 let previousBodyOverflow = ''
 let desktopClickTimer: ReturnType<typeof setTimeout> | null = null
@@ -42,6 +44,7 @@ let motionTimer: ReturnType<typeof setTimeout> | null = null
 let hintTimer: ReturnType<typeof setTimeout> | null = null
 let zoomTimer: ReturnType<typeof setTimeout> | null = null
 let gesturePointerId: number | null = null
+let longPressTimer: ReturnType<typeof setTimeout> | null = null
 let dragFrame: number | null = null
 let pendingDragX = 0
 const viewerPreloads = new Map<string, HTMLImageElement>()
@@ -96,7 +99,7 @@ const pumpViewerPreloads = () => {
     image.onload = () => finish(true)
     image.onerror = () => finish(false)
     viewerPreloads.set(photo.id, image)
-    image.src = photo.originalUrl
+    image.src = photo.previewUrl
   }
 }
 const preloadViewerWindow = () => {
@@ -111,9 +114,12 @@ const preloadViewerWindow = () => {
   pumpViewerPreloads()
 }
 const mobileSlideSrc = (photo: GalleryPhoto, index: number) =>
-  index === visualIndex.value || viewerReadyOriginalIds.value.has(photo.id)
-    ? photo.originalUrl
+  index === visualIndex.value
+    ? (showHigh.value ? photo.highUrl : photo.previewUrl)
+    : viewerReadyOriginalIds.value.has(photo.id)
+      ? photo.previewUrl
     : photo.thumbnailUrl
+const currentDisplayUrl = computed(() => (showHigh.value ? currentPhoto.value?.highUrl : currentPhoto.value?.previewUrl) || '')
 
 const imageAspectRatio = computed(() => {
   if (naturalSize.width > 0 && naturalSize.height > 0) return naturalSize.width / naturalSize.height
@@ -154,12 +160,14 @@ const clearInteractionTimers = () => {
   clearTimer(motionTimer)
   clearTimer(hintTimer)
   clearTimer(zoomTimer)
+  clearTimer(longPressTimer)
   clearDragFrame()
   desktopClickTimer = null
   mobileTapTimer = null
   motionTimer = null
   hintTimer = null
   zoomTimer = null
+  longPressTimer = null
 }
 const resetTransform = () => {
   scale.value = 1
@@ -246,6 +254,17 @@ const onDesktopDoubleClick = (event: MouseEvent) => {
   desktopClickTimer = null
   toggleZoom()
 }
+const openViewerActionMenu = (event: MouseEvent | PointerEvent) => {
+  actionMenu.x = event.clientX
+  actionMenu.y = event.clientY
+  actionMenu.open = true
+}
+const openViewerActionMenuFromButton = (event: MouseEvent) => {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  actionMenu.x = rect.right - 280
+  actionMenu.y = rect.bottom + 8
+  actionMenu.open = true
+}
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 const clampZoomPanForScale = (x: number, y: number, nextScale: number) => {
@@ -322,6 +341,16 @@ const onPointerStart = (event: PointerEvent) => {
   zoomSettling.value = false
   Object.assign(gestureStart, { x: event.clientX, y: event.clientY, time: now, panX: panX.value, panY: panY.value })
   Object.assign(gestureLast, { x: event.clientX, y: event.clientY, time: now })
+  clearTimer(longPressTimer)
+  if (event.pointerType !== 'mouse' && scale.value === 1) {
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null
+      gestureMode.value = 'blocked'
+      lastTap.time = 0
+      navigator.vibrate?.(18)
+      openViewerActionMenu(event)
+    }, 520)
+  }
 }
 const onPointerMove = (event: PointerEvent) => {
   if (!activePointers.has(event.pointerId)) return
@@ -335,6 +364,10 @@ const onPointerMove = (event: PointerEvent) => {
 
   const deltaX = event.clientX - gestureStart.x
   const deltaY = event.clientY - gestureStart.y
+  if (Math.hypot(deltaX, deltaY) > 10) {
+    clearTimer(longPressTimer)
+    longPressTimer = null
+  }
   if (gestureMode.value === 'pending' && Math.hypot(deltaX, deltaY) > 6) {
     if (scale.value > 1) gestureMode.value = 'zoom-pan'
     else if (Math.abs(deltaX) > Math.abs(deltaY) * 1.03) gestureMode.value = 'horizontal'
@@ -416,6 +449,8 @@ const handleMobileTap = (event: PointerEvent) => {
 }
 const onPointerEnd = (event: PointerEvent) => {
   if (!activePointers.has(event.pointerId)) return
+  clearTimer(longPressTimer)
+  longPressTimer = null
   activePointers.delete(event.pointerId)
   if (gestureMode.value === 'pinch') {
     const remaining = Array.from(activePointers.entries())[0]
@@ -466,6 +501,8 @@ const onPointerEnd = (event: PointerEvent) => {
   }
 }
 const onPointerCancel = (event: PointerEvent) => {
+  clearTimer(longPressTimer)
+  longPressTimer = null
   activePointers.delete(event.pointerId)
   if (gestureMode.value === 'pinch' && activePointers.size) {
     const remaining = Array.from(activePointers.entries())[0]!
@@ -542,6 +579,8 @@ watch(
 )
 watch(() => props.currentIndex, (index) => {
   visualIndex.value = index
+  showHigh.value = false
+  actionMenu.open = false
   if (!isSliding.value) {
     scale.value = 1
     panX.value = 0
@@ -572,7 +611,7 @@ onBeforeUnmount(() => {
         :transition="{ duration: 0.18 }"
         :style="{ backgroundColor: `rgb(0 0 0 / ${backdropOpacity})` }"
       >
-        <div ref="viewerPane" class="relative h-full w-full overflow-hidden" @click="onDesktopPaneClick" @dblclick="onDesktopDoubleClick" @selectstart.prevent @dragstart.prevent @wheel.prevent="onWheel">
+        <div ref="viewerPane" class="relative h-full w-full overflow-hidden" @click="onDesktopPaneClick" @dblclick="onDesktopDoubleClick" @contextmenu.prevent.stop="openViewerActionMenu" @selectstart.prevent @dragstart.prevent @wheel.prevent="onWheel">
           <motion.div
             :key="`desktop-${currentPhoto.id}`"
             data-viewer-current="true"
@@ -581,7 +620,7 @@ onBeforeUnmount(() => {
             :animate="{ opacity: 1, scale }"
             :transition="{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }"
           >
-            <PhotoProgressiveImage :src="currentPhoto.originalUrl" :placeholder-src="currentPhoto.thumbnailUrl" :alt="currentPhoto.title || $t('ui.photo.altFallback')" fit="contain" loading="eager" fetch-priority="high" class="h-full w-full bg-black" @load="onCurrentImageLoad" />
+            <PhotoProgressiveImage :src="currentDisplayUrl" :placeholder-src="showHigh ? currentPhoto.previewUrl : currentPhoto.thumbnailUrl" :alt="currentPhoto.title || $t('ui.photo.altFallback')" fit="contain" loading="eager" fetch-priority="high" class="h-full w-full bg-black" @load="onCurrentImageLoad" />
           </motion.div>
 
           <div class="absolute inset-0 overflow-hidden md:hidden" style="touch-action: none" :style="mobileStageStyle" @pointerdown="onPointerStart" @pointermove="onPointerMove" @pointerup.prevent="onPointerEnd" @pointercancel="onPointerCancel">
@@ -621,7 +660,7 @@ onBeforeUnmount(() => {
             <div class="flex items-start justify-between gap-4">
               <h2 class="min-w-0 truncate pt-2 text-sm font-semibold sm:text-lg">{{ currentPhoto.title || $t('ui.photo.untitled') }}</h2>
               <div class="pointer-events-auto flex shrink-0 items-center gap-1 rounded-full bg-black/35 p-1 backdrop-blur-xl" @click.stop @dblclick.stop @pointerdown.stop @pointerup.stop>
-                <a :href="currentPhoto.originalUrl" :download="currentPhoto.title" class="grid size-11 place-items-center rounded-full transition active:bg-white/20 md:size-10 md:hover:bg-white/15" :title="$t('ui.action.share.actions.downloadOriginal')"><Icon name="tabler:download" class="size-5" /></a>
+                <button class="grid size-11 place-items-center rounded-full transition active:bg-white/20 md:size-10 md:hover:bg-white/15" type="button" aria-label="复制或下载为" @click.stop="openViewerActionMenuFromButton"><Icon name="tabler:dots" class="size-5" /></button>
                 <button class="grid size-11 place-items-center rounded-full transition active:bg-white/20 md:size-10 md:hover:bg-white/15" type="button" :aria-label="$t('viewer.navigation.close')" @click.stop="close"><Icon name="tabler:x" class="size-6" /></button>
               </div>
             </div>
@@ -634,7 +673,20 @@ onBeforeUnmount(() => {
           <div class="viewer-mobile-counter pointer-events-none absolute bottom-0 left-1/2 z-40 -translate-x-1/2 rounded-full bg-black/35 px-3 py-1 text-xs text-white/75 backdrop-blur md:hidden" :class="dragY ? 'opacity-0' : 'opacity-100'">{{ currentIndex + 1 }} / {{ photos.length }}<span v-if="scale > 1" class="ml-2">{{ Math.round(scale * 100) }}%</span></div>
 
           <PhotoGalleryThumbnail class="absolute inset-x-0 bottom-0 z-20 hidden md:block" :photos="photos" :current-index="currentIndex" @click.stop @dblclick.stop @index-change="emit('indexChange', $event)" />
+
+          <button
+            v-if="!showHigh"
+            type="button"
+            class="viewer-high-button absolute left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/15 bg-neutral-700/65 px-4 py-2 text-xs font-semibold text-white shadow-xl backdrop-blur-2xl transition hover:bg-neutral-600/75 active:scale-95"
+            @click.stop="showHigh = true"
+            @dblclick.stop
+            @pointerdown.stop
+            @pointerup.stop
+          >
+            <Icon name="tabler:zoom-in-area" class="size-4" />显示高清（≤ 5 MB）
+          </button>
         </div>
+        <PhotoActionMenu :open="actionMenu.open" :x="actionMenu.x" :y="actionMenu.y" :photo="currentPhoto" @close="actionMenu.open = false" />
       </motion.div>
     </AnimatePresence>
   </Teleport>
@@ -645,6 +697,7 @@ onBeforeUnmount(() => {
 .viewer-no-select, .viewer-no-select * { -webkit-user-select: none !important; user-select: none !important; }
 .viewer-no-select img { -webkit-user-drag: none; }
 .viewer-mobile-counter { bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+.viewer-high-button { bottom: max(2.8rem, calc(env(safe-area-inset-bottom) + 2.3rem)); }
 .viewer-gesture-hint { padding-top: max(5.25rem, calc(env(safe-area-inset-top) + 4.5rem)); }
 .viewer-nav-frosted { background-color: rgb(82 82 91 / 62%); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); }
 .viewer-nav-frosted:hover { background-color: rgb(113 113 122 / 72%); }
@@ -654,4 +707,5 @@ onBeforeUnmount(() => {
 @keyframes pinch-left { 0%, 100% { left: 2.25rem; transform: scale(0.92); } 50% { left: 0.55rem; transform: scale(1.08); } }
 @keyframes pinch-right { 0%, 100% { right: 2.25rem; transform: scale(0.92); } 50% { right: 0.55rem; transform: scale(1.08); } }
 @media (prefers-reduced-motion: reduce) { .viewer-finger-left, .viewer-finger-right { animation: none; } }
+@media (min-width: 768px) { .viewer-high-button { bottom: 7.25rem; } }
 </style>

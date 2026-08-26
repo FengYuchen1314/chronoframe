@@ -252,13 +252,13 @@ const runThumbnailTaskAction = async (action: 'start' | 'cancel' | 'resume') => 
       : `/api/thumbnails/rebuilds/${job?.id}/${action}`
     await adminFetch(endpoint, { method: 'POST' })
     toast.add({
-      title: action === 'start' ? '缩略图缓存开始重建' : action === 'resume' ? '缩略图重建已继续' : '已请求安全中断',
-      description: action === 'cancel' ? '正在停止尚未开始的项目，已完成的缩略图会保留。' : '任务在后端并发运行，可以离开此页面。',
+      title: action === 'start' ? '三层派生图开始重建' : action === 'resume' ? '派生图重建已继续' : '已请求安全中断',
+      description: action === 'cancel' ? '正在停止尚未开始的项目，已完成的派生图会保留。' : '任务在后端并发运行，可以离开此页面。每张图片会生成完整三层。',
       color: action === 'cancel' ? 'warning' : 'success',
     })
     await loadThumbnailJob()
   } catch (error) {
-    toast.add({ title: '缩略图任务操作失败', description: getAdminApiErrorMessage(error), color: 'error' })
+    toast.add({ title: '派生图任务操作失败', description: getAdminApiErrorMessage(error), color: 'error' })
   } finally {
     isThumbnailTaskAction.value = false
   }
@@ -429,7 +429,7 @@ onBeforeUnmount(() => {
 
         <section class="dashboard-section overflow-hidden">
           <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:photo-cog" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">缩略图缓存</h2><p class="mt-1 text-sm text-muted">清空本机缓存并为当前图库重新生成 PNG 缩略图</p></div></div>
+            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:photo-cog" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">三层图片缓存</h2><p class="mt-1 text-sm text-muted">为旧图库重建 320px PNG、≤1.5 MB WebP 和 ≤5 MB WebP</p></div></div>
             <UBadge :color="thumbnailStatusColor" variant="soft">{{ thumbnailStatusText }}</UBadge>
           </header>
           <div class="space-y-4 p-5 sm:p-6">
@@ -439,7 +439,7 @@ onBeforeUnmount(() => {
               <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted"><span>成功 {{ latestThumbnailJob.succeeded }}</span><span>失败 {{ latestThumbnailJob.failed }}</span><span>跳过 {{ latestThumbnailJob.skipped }}</span><span>已清理文件 {{ latestThumbnailJob.cacheFilesRemoved }}</span><span>并发 {{ latestThumbnailJob.workerCount }}</span></div>
               <UAlert v-if="latestThumbnailJob.error" color="warning" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestThumbnailJob.error" />
             </template>
-            <p v-else class="text-sm leading-6 text-muted">缩略图缓存位于服务器本地，不会删除原图。任务会根据 CPU 自动调整并发（至少 7，最多 32），可以关闭页面，服务重启后会自动恢复。</p>
+            <p v-else class="text-sm leading-6 text-muted">三层派生图缓存在服务器本地，不会删除存储后端里的原始母本。任务会根据 CPU 自动调整并发（至少 7，最多 32），可以关闭页面，服务重启后会自动恢复。</p>
             <div class="flex flex-wrap justify-end gap-2">
               <UButton v-if="thumbnailTaskActive" color="warning" variant="soft" icon="tabler:player-stop" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('cancel')">安全中断</UButton>
               <UButton v-else-if="latestThumbnailJob && ['failed', 'cancelled', 'interrupted'].includes(latestThumbnailJob.status)" icon="tabler:player-play" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('resume')">继续重建</UButton>
@@ -503,7 +503,7 @@ onBeforeUnmount(() => {
 
           <section class="dashboard-section overflow-hidden">
             <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-              <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon :name="backendIcons[form.backend]" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">2. 配置 {{ backendOptions.find(item => item.value === form.backend)?.label }}</h2><p class="mt-1 text-sm text-muted">上传、缩略图、转换和旧图删除都会使用这里的配置</p></div></div>
+              <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon :name="backendIcons[form.backend]" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">2. 配置 {{ backendOptions.find(item => item.value === form.backend)?.label }}</h2><p class="mt-1 text-sm text-muted">原始上传文件、迁移和删除会使用这里的配置；三层浏览图保存在应用数据目录</p></div></div>
               <UBadge v-if="form.backend === savedBackend" color="success" variant="soft">当前已启用</UBadge>
             </header>
 

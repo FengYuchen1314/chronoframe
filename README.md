@@ -78,15 +78,15 @@ Compose 变量只负责服务运行时，不负责存储：
 - `CHRONOFRAME_BIND`、`CHRONOFRAME_PORT`：宿主机监听地址和端口。
 - `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；默认 `auto`，反代报告 HTTPS 时自动使用 Secure Cookie。
 - `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded` 和 `X-Forwarded-Proto`；默认 `true`，以兼容无需额外配置的反向代理部署。
-- `CF_CONVERSION_WORKERS`：全局转换 worker 上限，默认 7，限制为 1–16。
+- `CF_CONVERSION_WORKERS`：仅用于兼容旧版本遗留转换任务，默认 7，限制为 1–16；新上传的三层派生图会自动按 CPU 调整并发。
 
 容器内部的 SQLite 路径、主密钥路径、静态前端目录和监听地址已固定在镜像与 Compose 中，无需用户配置。
 
-WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-GCM 加密，读取设置时永不返回明文。主密钥与管理员密码完全解耦；备份或迁移时必须同时保存 SQLite 数据库和 `CF_MASTER_KEY_FILE`，缺少任意一项都无法恢复存储凭据。上传和转换在 WebDAV 中会先写入临时对象，再使用 `MOVE` 原子提交；S3 使用临时对象复制到最终键；本地存储则先写入同目录临时文件后重命名。请使用支持 WebDAV `MKCOL`、`PUT`、`MOVE`、`DELETE` 的服务端，以及兼容 S3 path-style 请求的对象存储服务。
+WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-GCM 加密，读取设置时永不返回明文。主密钥与管理员密码完全解耦；备份或迁移时必须同时保存 SQLite 数据库和 `CF_MASTER_KEY_FILE`，缺少任意一项都无法恢复存储凭据。上传对象在 WebDAV 中会先写入临时对象，再使用 `MOVE` 原子提交；S3 使用临时对象复制到最终键；本地存储则先写入同目录临时文件后重命名。请使用支持 WebDAV `MKCOL`、`PUT`、`MOVE`、`DELETE` 的服务端，以及兼容 S3 path-style 请求的对象存储服务。
 
 从旧的 `X-Admin-Token` 版本升级时，可在第一次启动新版时暂时保留原 `CF_ADMIN_TOKEN`。只有在主密钥文件尚不存在时，程序才会一次性用旧令牌派生兼容密钥并写入 `CF_MASTER_KEY_FILE`；确认密钥文件已经生成后即可移除该环境变量。它不会再被用于登录或 API 鉴权。
 
-上传必须指定一个已存在的相簿。应用本身不限制单次选择的图片数量、单张大小或总大小；浏览器默认使用 7 个异步 worker 连续提交，Rust 后端同时允许 7 个上传请求并行处理，避免逐张等待产生的带宽空档。每张图片仍独立提交并确认，某张失败不会影响其他成功项，失败文件会保留在待上传列表中供直接重试。服务仍会校验扩展名、文件签名和完整解码，只接受 PNG、JPG/JPEG 与 WEBP。若通过第三方反向代理或 CDN 访问，还需确保其请求体大小、连接数和超时配置不会额外限制上传。
+上传必须指定一个已存在的相簿。应用本身不限制单次选择的图片数量、单张大小或总大小；浏览器默认使用 7 个异步 worker 连续提交，Rust 后端同时允许 7 个上传请求并行处理，避免逐张等待产生的带宽空档。每张图片仍独立提交并确认，某张失败不会影响其他成功项，失败文件会保留在待上传列表中供直接重试。图片入库后会立即进入并发派生图队列，不需要管理员再执行格式转换。服务仍会校验扩展名、文件签名和完整解码，只接受 PNG、JPG/JPEG 与 WEBP。若通过第三方反向代理或 CDN 访问，还需确保其请求体大小、连接数和超时配置不会额外限制上传。
 
 ## 图片删除与存储迁移
 
@@ -109,17 +109,19 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 “站点设置”恢复原版的公开自定义项：网站名称、标语、作者、头像 URL 和默认浅色/深色/跟随系统主题。它们与存储配置一样保存在 SQLite 中，不需要环境变量；地图、统计脚本、第三方登录等已删除功能不会因此恢复。
 
-## 批量格式转换与中断语义
+## 三层图片、按需导出与重建任务
 
-可勾选一个或多个相簿，将其中的 PNG、JPG/JPEG、WEBP 转为三者之一。任务默认在 Rust 后台使用 7 个并发 worker 执行，界面只读取持久化进度；关闭或切换页面不会中断任务。管理员确认删除旧格式图片后，删除请求也会立即进入 7 路并发的持久化后台队列，服务重启后自动续作。
+原始上传文件继续作为存储母本保存在本地、WebDAV 或 S3/R2，公开页面不会直接加载它。应用在 Compose 同目录的 `./data/thumbnails` 为每张图片维护三层派生图：
 
-图片记录成功写入数据库后，Rust 后台会自动并发生成 PNG 缩略图并持久缓存在 Compose 同目录的 `./data/thumbnails`；上传和格式转换接口不等待缩略图编码，服务重启后也会扫描并补齐历史图片。管理员可在“存储设置”一键清空缩略图缓存并重建：任务根据 CPU 自动采用 7–32 个 worker，持久化逐项进度，可安全中断、继续，并会在服务重启后自动恢复。公开相簿最多只在后台预取两张清晰原图；进入查看器时会立即取消这些低优先级请求，只让当前原图独占最高优先级，当前图清晰后才并发预取相邻图片，避免整本相簿的原图队列阻塞当前照片。
+- 相簿网格使用最长边 320px 的低清 PNG，优先让页面快速铺满。
+- 点进查看器默认使用最长边不超过 2560px、文件严格不超过 1.5 MB 的 WebP；当前图加载完成后才预取左右邻图的同层版本。
+- 只有点击查看器底部“显示高清”后，当前图片才加载最长边不超过 4096px、文件严格不超过 5 MB 的 WebP。不会预取整本相簿的高清版本。
 
-- 每项任务有独立状态（排队、处理中、成功、失败、取消），失败不影响其他图片。
-- 取消会停止尚未开始或可撤销的工作；正在进行原子提交的单张图片会安全完成，绝不出现半写入文件。
-- 服务重启将未完成任务标为 `interrupted`，保留原图和已经原子提交的转换结果；持久化待提交账本只清理没有数据库记录的孤立对象。
-- 转换成功会把新图加入原相簿，旧图默认保留。管理员确认删除后，系统先在同一个数据库事务中写入全部删除授权，再通过持久化 outbox 幂等执行；即使删除途中被强制终止，重启后也会继续完成已确认的删除，而不会误删未确认原图。
-- 页面任务中心会在刷新或重新打开后恢复最近 100 个任务及其进度/错误详情；完成前可随时安全中断。
+上传接口不等待派生图编码完成；每张图片写入数据库后立即进入 7–32 路自适应并发队列。若后台处理尚未完成，三个公开接口也会按需生成缺失层。管理员可在“存储设置”一键清空并重建全站三层缓存，兼容旧版本上传的图片；该任务逐张持久化进度，可离开页面、安全中断、继续，并在服务重启后自动恢复。
+
+在图片上单击右键，或在移动设备上长按，可展开“复制为”和“下载为”，支持 WEBP、PNG、JPG/JPEG。非 WebP 格式由服务从 5 MB 高清层现场转换，不会新增相簿图片，也不会改动原始母本。浏览器的图片剪贴板只在安全上下文中开放，因此“复制为”需要 HTTPS；HTTP IP + 端口访问仍可浏览和下载。
+
+相簿网格支持多选：桌面端可点击勾选并用 Shift 连选，下载时生成一个 ZIP；移动端长按进入多选后按顺序逐张下载，并显示完成进度。旧版“批量格式转换”入口已经从后台移除；升级时遗留的后端任务表和接口暂时保留，仅用于兼容已有数据。
 
 管理员密码使用带随机盐的 Argon2id 哈希保存，不会写入 Cookie 或前端存储。登录成功后服务端签发 7 天有效的随机会话：浏览器只持有 `HttpOnly`、`SameSite=Strict` 的会话 Cookie，数据库只保存令牌摘要；管理写操作还必须通过与该会话绑定的 CSRF 双重校验。退出会立即删除服务端会话，过期会话不能重放。项目是前后端同源应用，不开放宽松 CORS。
 
@@ -138,16 +140,15 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `GET/POST /api/albums/:album_id/photos`
 - `GET /api/photos` — 按创建时间倒序列出图片
 - `DELETE /api/photos/:photo_id`、`POST /api/photos/delete` — 删除单张或批量删除图片
-- `GET /api/photos/:photo_id/file`、`GET /api/photos/:photo_id/thumbnail`
+- `GET /api/photos/:photo_id/thumbnail` — 320px PNG 网格图
+- `GET /api/photos/:photo_id/preview`、`GET /api/photos/:photo_id/high` — 1.5 MB 默认查看图和 5 MB 手动高清图
+- `GET /api/photos/:photo_id/render?format=webp|png|jpg|jpeg&download=true` — 按需复制或下载指定格式
+- `POST /api/photos/export` — 提交 `{ "photoIds": [], "format": "webp|png|jpg|jpeg" }` 并流式下载多选 ZIP
 - `GET/POST /api/storage-migrations` — 查看迁移进度或以新的存储配置开始迁移
 - `POST /api/storage-migrations/:job_id/resume`、`POST /api/storage-migrations/:job_id/cancel`
 - `POST /api/storage-migrations/:job_id/cleanup`、`POST /api/storage-migrations/:job_id/retain` — 删除或保留旧存储图片
-- `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建
-- `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断缩略图重建
-- `GET/POST /api/conversions` — 列出任务，或提交 `{ "albumIds": [], "targetFormat": "png|jpg|jpeg|webp" }`
-- `GET /api/conversions/:job_id`
-- `POST /api/conversions/:job_id/cancel`
-- `DELETE /api/conversions/:job_id/delete-sources`
+- `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建三层派生图
+- `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断派生图重建
 
 ## 验收测试
 
