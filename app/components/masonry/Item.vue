@@ -6,9 +6,10 @@ const props = withDefaults(defineProps<{
   photo: GalleryPhoto
   index: number
   firstScreenItems?: number
-}>(), { firstScreenItems: 36 })
+  showOriginal?: boolean
+}>(), { firstScreenItems: 36, showOriginal: false })
 
-const emit = defineEmits<{ openViewer: [number] }>()
+const emit = defineEmits<{ openViewer: [number]; thumbnailSettled: [string] }>()
 </script>
 
 <template>
@@ -19,6 +20,12 @@ const emit = defineEmits<{ openViewer: [number] }>()
     :animate="{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }"
     :transition="{ type: 'spring', duration: 0.35, bounce: 0, delay: Math.min(index, 24) * 0.018 }"
   >
-    <MasonryItemPhoto :photo="photo" :index="index" @open-viewer="emit('openViewer', $event)" />
+    <MasonryItemPhoto
+      :photo="photo"
+      :index="index"
+      :show-original="showOriginal"
+      @open-viewer="emit('openViewer', $event)"
+      @thumbnail-settled="emit('thumbnailSettled', $event)"
+    />
   </motion.div>
 </template>

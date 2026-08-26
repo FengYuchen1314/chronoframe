@@ -80,6 +80,10 @@ struct AppState {
 
 const STORAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 7;
+const DEFAULT_CONVERSION_CONCURRENCY: usize = 7;
+const DEFAULT_SOURCE_DELETE_CONCURRENCY: usize = 7;
+const DEFAULT_THUMBNAIL_CONCURRENCY: usize = 7;
+const THUMBNAIL_LONGEST_EDGE: u32 = 720;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SESSION_COOKIE: &str = "cf_session";
 const CSRF_COOKIE: &str = "cf_csrf";
@@ -114,6 +118,7 @@ fn validate_storage_prefix(prefix: &str) -> Result<()> {
 struct Config {
     database_url: String,
     master_key_file: PathBuf,
+    thumbnail_cache_dir: PathBuf,
     secure_cookies: Option<bool>,
     trust_proxy_headers: bool,
     workers: usize,
@@ -128,11 +133,15 @@ impl Config {
         let default_master_key = database_path(&database_url)
             .and_then(|path| path.parent().map(|parent| parent.join("secret.key")))
             .unwrap_or_else(|| PathBuf::from("data/secret.key"));
+        let thumbnail_cache_dir = database_path(&database_url)
+            .and_then(|path| path.parent().map(|parent| parent.join("thumbnails")))
+            .unwrap_or_else(|| PathBuf::from("data/thumbnails"));
         Ok(Self {
             database_url,
             master_key_file: env::var("CF_MASTER_KEY_FILE")
                 .map(PathBuf::from)
                 .unwrap_or(default_master_key),
+            thumbnail_cache_dir,
             secure_cookies: match get("CF_COOKIE_SECURE", "auto")
                 .trim()
                 .to_ascii_lowercase()
@@ -152,9 +161,9 @@ impl Config {
                 "false" | "0" | "no" => false,
                 _ => bail!("CF_TRUST_PROXY_HEADERS must be true or false"),
             },
-            workers: get("CF_CONVERSION_WORKERS", "4")
+            workers: get("CF_CONVERSION_WORKERS", "7")
                 .parse::<usize>()
-                .unwrap_or(4)
+                .unwrap_or(DEFAULT_CONVERSION_CONCURRENCY)
                 .clamp(1, 16),
             web_dir: get("CF_WEB_DIR", "./.output/public"),
         })
@@ -602,6 +611,9 @@ struct StorageService {
     db: SqlitePool,
     encryption_key: [u8; 32],
     gate: Arc<tokio::sync::RwLock<()>>,
+    source_deletion_gate: Arc<tokio::sync::Mutex<()>>,
+    thumbnail_cache_dir: Arc<PathBuf>,
+    thumbnail_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cache: SharedStoreCache,
 }
 
@@ -803,12 +815,52 @@ impl SiteSettings {
 }
 
 impl StorageService {
-    fn new(db: SqlitePool, encryption_key: [u8; 32]) -> Self {
+    fn new(db: SqlitePool, encryption_key: [u8; 32], thumbnail_cache_dir: PathBuf) -> Self {
         Self {
             db,
             encryption_key,
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            source_deletion_gate: Arc::new(tokio::sync::Mutex::new(())),
+            thumbnail_cache_dir: Arc::new(thumbnail_cache_dir),
+            thumbnail_locks: Arc::new(DashMap::new()),
             cache: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+    fn thumbnail_path(&self, photo_id: &str) -> Result<PathBuf> {
+        Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
+        Ok(self.thumbnail_cache_dir.join(format!("{photo_id}.webp")))
+    }
+    async fn cached_thumbnail(&self, photo_id: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.thumbnail_path(photo_id)?;
+        match tokio::fs::read(path).await {
+            Ok(data) => Ok(Some(data)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    async fn cache_thumbnail(&self, photo_id: &str, data: &[u8]) -> Result<()> {
+        tokio::fs::create_dir_all(self.thumbnail_cache_dir.as_ref()).await?;
+        let destination = self.thumbnail_path(photo_id)?;
+        let temporary = self
+            .thumbnail_cache_dir
+            .join(format!(".{photo_id}.{}.tmp", Uuid::new_v4()));
+        tokio::fs::write(&temporary, data).await?;
+        if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+    async fn remove_cached_thumbnail(&self, photo_id: &str) {
+        let Ok(path) = self.thumbnail_path(photo_id) else {
+            return;
+        };
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != ErrorKind::NotFound
+        {
+            warn!(photo_id, "failed to remove cached thumbnail: {error:#}");
         }
     }
     async fn values(&self) -> Result<HashMap<String, String>> {
@@ -1234,6 +1286,10 @@ struct ConversionJob {
     created_at: i64,
     updated_at: i64,
     sources_deleted_at: Option<i64>,
+    source_delete_total: i64,
+    source_delete_completed: i64,
+    source_delete_remaining: i64,
+    source_delete_failed: i64,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1307,6 +1363,10 @@ fn job_from(row: &sqlx::sqlite::SqliteRow) -> ConversionJob {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         sources_deleted_at: row.get("sources_deleted_at"),
+        source_delete_total: row.get("source_delete_total"),
+        source_delete_completed: row.get("source_delete_completed"),
+        source_delete_remaining: row.get("source_delete_remaining"),
+        source_delete_failed: row.get("source_delete_failed"),
     }
 }
 fn migration_job_from(row: &sqlx::sqlite::SqliteRow) -> StorageMigrationJob {
@@ -1448,6 +1508,7 @@ async fn drain_photo_deletion_outbox(
             .bind(&photo_id)
             .execute(db)
             .await?;
+        storage.remove_cached_thumbnail(&photo_id).await;
         result.removed += 1;
     }
     Ok(result)
@@ -1491,49 +1552,89 @@ async fn drain_source_deletion_outbox(
     db: &SqlitePool,
     only_job: Option<&str>,
 ) -> Result<SourceDeletionDrain> {
+    // Only one drain owns a snapshot of the durable outbox at a time. Items inside that
+    // snapshot still run concurrently, so a janitor retry can never race an API-triggered run.
+    let _drain_guard = storage.source_deletion_gate.lock().await;
     let rows = if let Some(job_id) = only_job {
-        sqlx::query("SELECT job_id,source_photo_id,source_key,target_key,target_format,target_size FROM source_deletion_outbox WHERE job_id=? ORDER BY created_at,source_photo_id").bind(job_id).fetch_all(db).await?
+        sqlx::query("SELECT job_id,source_photo_id,source_key,target_key,target_format,target_size,attempts FROM source_deletion_outbox WHERE job_id=? AND next_retry_at<=? ORDER BY created_at,source_photo_id").bind(job_id).bind(now()).fetch_all(db).await?
     } else {
-        sqlx::query("SELECT job_id,source_photo_id,source_key,target_key,target_format,target_size FROM source_deletion_outbox ORDER BY created_at,source_photo_id").fetch_all(db).await?
+        sqlx::query("SELECT job_id,source_photo_id,source_key,target_key,target_format,target_size,attempts FROM source_deletion_outbox WHERE next_retry_at<=? ORDER BY created_at,source_photo_id").bind(now()).fetch_all(db).await?
     };
     let store = if rows.is_empty() {
         None
     } else {
         Some(storage.store().await?)
     };
+    let outcomes = if let Some(store) = store {
+        let db = db.clone();
+        let storage = storage.clone();
+        stream::iter(rows.into_iter().map(|row| {
+            let db = db.clone();
+            let storage = storage.clone();
+            let store = store.clone();
+            async move {
+                let job_id: String = row.get("job_id");
+                let source_photo_id: String = row.get("source_photo_id");
+                let source_key: String = row.get("source_key");
+                let target_key: String = row.get("target_key");
+                let target_format: String = row.get("target_format");
+                let target_size: i64 = row.get("target_size");
+                let attempts: i64 = row.get("attempts");
+                let outcome: Result<()> = async {
+                    verify_target_blob(&store, &target_key, &target_format, target_size)
+                        .await
+                        .context("目标图验证失败")?;
+                    store.delete(&source_key).await.context("旧图对象删除失败")?;
+                    let mut tx = db.begin().await?;
+                    sqlx::query("DELETE FROM photos WHERE id=?")
+                        .bind(&source_photo_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM source_deletion_outbox WHERE job_id=? AND source_photo_id=?")
+                        .bind(&job_id)
+                        .bind(&source_photo_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                    storage.remove_cached_thumbnail(&source_photo_id).await;
+                    Ok(())
+                }
+                .await;
+                match outcome {
+                    Ok(()) => Ok(source_photo_id),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let retry_delay = 5_i64 * 2_i64.pow((attempts + 1).clamp(0, 6) as u32);
+                        if let Err(update_error) = sqlx::query("UPDATE source_deletion_outbox SET attempts=attempts+1,last_error=?,next_retry_at=? WHERE job_id=? AND source_photo_id=?")
+                            .bind(&message)
+                            .bind(now() + retry_delay)
+                            .bind(&job_id)
+                            .bind(&source_photo_id)
+                            .execute(&db)
+                            .await
+                        {
+                            warn!(job_id, photo_id = %source_photo_id, "failed to persist source deletion retry: {update_error:#}");
+                        }
+                        Err(serde_json::json!({
+                            "photoId": source_photo_id,
+                            "error": message
+                        }))
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(DEFAULT_SOURCE_DELETE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+    } else {
+        vec![]
+    };
     let mut result = SourceDeletionDrain::default();
-    for row in rows {
-        let job_id: String = row.get("job_id");
-        let source_photo_id: String = row.get("source_photo_id");
-        let source_key: String = row.get("source_key");
-        let target_key: String = row.get("target_key");
-        let target_format: String = row.get("target_format");
-        let target_size: i64 = row.get("target_size");
-        let store = store.as_ref().expect("outbox rows require a store");
-        if let Err(error) =
-            verify_target_blob(store, &target_key, &target_format, target_size).await
-        {
-            result.failures.push(serde_json::json!({"photoId": source_photo_id, "error": format!("目标图验证失败：{error:#}")}));
-            continue;
+    for outcome in outcomes {
+        match outcome {
+            Ok(_) => result.removed += 1,
+            Err(failure) => result.failures.push(failure),
         }
-        if let Err(error) = store.delete(&source_key).await {
-            result
-                .failures
-                .push(serde_json::json!({"photoId": source_photo_id, "error": error.to_string()}));
-            continue;
-        }
-        let mut tx = db.begin().await?;
-        sqlx::query("DELETE FROM photos WHERE id=?")
-            .bind(&source_photo_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM source_deletion_outbox WHERE job_id=? AND source_photo_id=?")
-            .bind(&job_id)
-            .bind(&source_photo_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        result.removed += 1;
     }
     if let Some(job_id) = only_job {
         sqlx::query("UPDATE conversion_jobs SET sources_deleted_at=?,updated_at=? WHERE id=? AND sources_deleted_at=-2 AND NOT EXISTS(SELECT 1 FROM source_deletion_outbox WHERE job_id=?)").bind(now()).bind(now()).bind(job_id).bind(job_id).execute(db).await?;
@@ -3911,7 +4012,10 @@ async fn photo_file(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, photo.content_type),
-            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable".to_string(),
+            ),
         ],
         data,
     )
@@ -3922,13 +4026,8 @@ async fn photo_thumbnail(
     State(state): State<AppState>,
     AxumPath(photo_id): AxumPath<String>,
 ) -> ApiResult<Response> {
-    let _permit = state
-        .thumbnail_slots
-        .acquire()
-        .await
-        .map_err(|_| AppError::bad("缩略图工作池已关闭"))?;
     let storage_key: String = sqlx::query_scalar("SELECT storage_key FROM photos WHERE id=?")
-        .bind(photo_id)
+        .bind(&photo_id)
         .fetch_optional(&state.db)
         .await
         .map_err(AppError::internal)?
@@ -3937,6 +4036,56 @@ async fn photo_thumbnail(
             message: "图片不存在".into(),
             clear_auth_cookies: None,
         })?;
+    if let Some(thumbnail) = state
+        .storage
+        .cached_thumbnail(&photo_id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable",
+                ),
+            ],
+            thumbnail,
+        )
+            .into_response());
+    }
+    let thumbnail_lock = state
+        .storage
+        .thumbnail_locks
+        .entry(photo_id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _thumbnail_guard = thumbnail_lock.lock().await;
+    if let Some(thumbnail) = state
+        .storage
+        .cached_thumbnail(&photo_id)
+        .await
+        .map_err(AppError::internal)?
+    {
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable",
+                ),
+            ],
+            thumbnail,
+        )
+            .into_response());
+    }
+    let _permit = state
+        .thumbnail_slots
+        .acquire()
+        .await
+        .map_err(|_| AppError::bad("缩略图工作池已关闭"))?;
     let data = {
         let _storage_guard = state.storage.gate.read().await;
         state
@@ -3948,15 +4097,26 @@ async fn photo_thumbnail(
             .await
             .map_err(AppError::internal)?
     };
-    let thumbnail = tokio::task::spawn_blocking(move || encode_thumbnail(&data, 720))
+    let thumbnail =
+        tokio::task::spawn_blocking(move || encode_thumbnail(&data, THUMBNAIL_LONGEST_EDGE))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(AppError::internal)?;
+    if let Err(error) = state
+        .storage
+        .cache_thumbnail(&photo_id, &thumbnail)
         .await
-        .map_err(AppError::internal)?
-        .map_err(AppError::internal)?;
+    {
+        warn!(photo_id, "thumbnail cache write failed: {error:#}");
+    }
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/webp"),
-            (header::CACHE_CONTROL, "private, max-age=86400"),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            ),
         ],
         thumbnail,
     )
@@ -4028,6 +4188,10 @@ async fn start_conversion(
         created_at: timestamp,
         updated_at: timestamp,
         sources_deleted_at: None,
+        source_delete_total: 0,
+        source_delete_completed: 0,
+        source_delete_remaining: 0,
+        source_delete_failed: 0,
     };
     let mut tx = state.db.begin().await.map_err(AppError::internal)?;
     sqlx::query("INSERT INTO conversion_jobs(id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(&job.id).bind(&job.status).bind(&job.target_format).bind(job.total).bind(0).bind(0).bind(0).bind(0).bind(timestamp).bind(timestamp).execute(&mut *tx).await.map_err(AppError::internal)?;
@@ -4074,7 +4238,7 @@ async fn list_conversions(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<ConversionJob>>> {
     require_admin(&headers, &state, false).await?;
-    let rows = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs ORDER BY created_at DESC LIMIT 100").fetch_all(&state.db).await.map_err(AppError::internal)?;
+    let rows = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at,CASE WHEN sources_deleted_at IS NULL THEN 0 ELSE succeeded END source_delete_total,CASE WHEN sources_deleted_at IS NULL THEN 0 ELSE MAX(0,succeeded-(SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id)) END source_delete_completed,CASE WHEN sources_deleted_at=-2 THEN (SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id) ELSE 0 END source_delete_remaining,CASE WHEN sources_deleted_at=-2 THEN (SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id AND pending.last_error IS NOT NULL) ELSE 0 END source_delete_failed FROM conversion_jobs ORDER BY created_at DESC LIMIT 100").fetch_all(&state.db).await.map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(job_from).collect()))
 }
 #[derive(Deserialize)]
@@ -4088,7 +4252,7 @@ async fn get_conversion(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&headers, &state, false).await?;
-    let row = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at FROM conversion_jobs WHERE id=?").bind(&job_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "转换任务不存在".into(), clear_auth_cookies: None })?;
+    let row = sqlx::query("SELECT id,status,target_format,total,completed,succeeded,failed,cancelled,created_at,updated_at,sources_deleted_at,CASE WHEN sources_deleted_at IS NULL THEN 0 ELSE succeeded END source_delete_total,CASE WHEN sources_deleted_at IS NULL THEN 0 ELSE MAX(0,succeeded-(SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id)) END source_delete_completed,CASE WHEN sources_deleted_at=-2 THEN (SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id) ELSE 0 END source_delete_remaining,CASE WHEN sources_deleted_at=-2 THEN (SELECT COUNT(*) FROM source_deletion_outbox pending WHERE pending.job_id=conversion_jobs.id AND pending.last_error IS NOT NULL) ELSE 0 END source_delete_failed FROM conversion_jobs WHERE id=?").bind(&job_id).fetch_optional(&state.db).await.map_err(AppError::internal)?.ok_or_else(|| AppError { status: StatusCode::NOT_FOUND, message: "转换任务不存在".into(), clear_auth_cookies: None })?;
     let items = if query.items.unwrap_or(true) {
         sqlx::query("SELECT i.id,i.source_photo_id,COALESCE(p.original_name,'已删除原图') source_name,i.status,i.target_photo_id,i.error FROM conversion_items i LEFT JOIN photos p ON p.id=i.source_photo_id WHERE i.job_id=? ORDER BY source_name").bind(&job_id).fetch_all(&state.db).await.map_err(AppError::internal)?.iter().map(|r| ConversionItem { id:r.get("id"), source_photo_id:r.get::<Option<String>, _>("source_photo_id").unwrap_or_default(), source_name:r.get("source_name"), status:r.get("status"), target_photo_id:r.get("target_photo_id"), error:r.get("error") }).collect::<Vec<_>>()
     } else {
@@ -4115,15 +4279,14 @@ async fn confirm_delete_sources(
     State(state): State<AppState>,
     AxumPath(job_id): AxumPath<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     require_admin(&headers, &state, true).await?;
-    let _mutation_guard = state
+    let mutation_guard = state
         .storage_mutation_gate
         .clone()
         .try_read_owned()
         .map_err(|_| AppError::conflict("存储正在迁移或清理，请稍后再删除旧格式图片"))?;
-    let _photo_graph_guard = state.photo_graph_lock.lock().await;
-    let _storage_guard = state.storage.gate.read().await;
+    let photo_graph_guard = state.photo_graph_lock.clone().lock_owned().await;
     let job =
         sqlx::query("SELECT status,succeeded,sources_deleted_at FROM conversion_jobs WHERE id=?")
             .bind(&job_id)
@@ -4155,36 +4318,26 @@ async fn confirm_delete_sources(
         ));
     }
     let rows = sqlx::query("SELECT p.id,p.storage_key,t.storage_key target_key,t.format target_format,t.byte_size target_size FROM conversion_items i JOIN photos p ON p.id=i.source_photo_id LEFT JOIN photos t ON t.id=i.target_photo_id WHERE i.job_id=? AND i.status='succeeded'").bind(&job_id).fetch_all(&state.db).await.map_err(AppError::internal)?;
-    let storage = state.storage.store().await.map_err(AppError::internal)?;
+    if rows.len() != succeeded as usize {
+        return Err(AppError::conflict(
+            "部分转换记录已发生变化，无法安全建立旧图删除任务",
+        ));
+    }
     let mut prepared = vec![];
-    let mut validation_failures = vec![];
     for row in rows {
         let id: String = row.get("id");
         let source_key: String = row.get("storage_key");
         let target_key: Option<String> = row.get("target_key");
         let target_format: Option<String> = row.get("target_format");
         let target_size: Option<i64> = row.get("target_size");
-        let verified = async {
-            let target_key = target_key.ok_or_else(|| anyhow!("转换图记录已不存在"))?;
-            let target_format = target_format.ok_or_else(|| anyhow!("转换图格式记录缺失"))?;
-            let target_size = target_size.ok_or_else(|| anyhow!("转换图大小记录缺失"))?;
-            verify_target_blob(&storage, &target_key, &target_format, target_size).await?;
-            Ok::<_, anyhow::Error>((target_key, target_format, target_size))
-        }
-        .await;
-        match verified {
-            Ok((target_key, target_format, target_size)) => {
-                prepared.push((id, source_key, target_key, target_format, target_size))
-            }
-            Err(error) => validation_failures.push(
-                serde_json::json!({"photoId": id, "error": format!("目标图验证失败：{error:#}")}),
-            ),
-        }
-    }
-    if !validation_failures.is_empty() {
-        return Ok(Json(
-            serde_json::json!({"removed": 0, "failures": validation_failures}),
-        ));
+        let (Some(target_key), Some(target_format), Some(target_size)) =
+            (target_key, target_format, target_size)
+        else {
+            return Err(AppError::conflict(
+                "转换后的新图记录不完整，未授权删除任何旧图",
+            ));
+        };
+        prepared.push((id, source_key, target_key, target_format, target_size));
     }
 
     // Persist every authorized deletion before touching a source object. The -2 state means the
@@ -4198,11 +4351,38 @@ async fn confirm_delete_sources(
         sqlx::query("INSERT OR IGNORE INTO source_deletion_outbox(job_id,source_photo_id,source_key,target_key,target_format,target_size,created_at) VALUES(?,?,?,?,?,?,?)").bind(&job_id).bind(id).bind(source_key).bind(target_key).bind(target_format).bind(target_size).bind(now()).execute(&mut *tx).await.map_err(AppError::internal)?;
     }
     tx.commit().await.map_err(AppError::internal)?;
-    let result = drain_source_deletion_outbox(&state.storage, &state.db, Some(&job_id))
+    let queued = prepared.len();
+    let worker_state = state.clone();
+    let worker_job_id = job_id.clone();
+    tokio::spawn(async move {
+        let _mutation_guard = mutation_guard;
+        let _photo_graph_guard = photo_graph_guard;
+        let _storage_guard = worker_state.storage.gate.read().await;
+        match drain_source_deletion_outbox(
+            &worker_state.storage,
+            &worker_state.db,
+            Some(&worker_job_id),
+        )
         .await
-        .map_err(AppError::internal)?;
-    Ok(Json(
-        serde_json::json!({"removed": result.removed, "failures": result.failures}),
+        {
+            Ok(result) if result.removed > 0 || !result.failures.is_empty() => info!(
+                job_id = %worker_job_id,
+                removed = result.removed,
+                failures = result.failures.len(),
+                "background source deletion batch finished"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(job_id = %worker_job_id, "background source deletion deferred: {error:#}"),
+        }
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "queued",
+            "total": queued,
+            "removed": 0,
+            "failures": []
+        })),
     ))
 }
 
@@ -4468,7 +4648,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status);").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,next_retry_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status);").execute(pool).await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -4521,6 +4701,31 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         sqlx::query("ALTER TABLE photos ADD COLUMN height INTEGER NOT NULL DEFAULT 0")
             .execute(pool)
             .await?;
+    }
+    let source_deletion_columns: HashSet<String> =
+        sqlx::query("PRAGMA table_info(source_deletion_outbox)")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|row| row.get("name"))
+            .collect();
+    for (column, migration) in [
+        (
+            "attempts",
+            "ALTER TABLE source_deletion_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_error",
+            "ALTER TABLE source_deletion_outbox ADD COLUMN last_error TEXT",
+        ),
+        (
+            "next_retry_at",
+            "ALTER TABLE source_deletion_outbox ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !source_deletion_columns.contains(column) {
+            sqlx::query(migration).execute(pool).await?;
+        }
     }
     for (key, value) in [
         ("storage_backend", "local"),
@@ -4628,6 +4833,7 @@ async fn main() -> Result<()> {
     {
         tokio::fs::create_dir_all(parent).await?;
     }
+    tokio::fs::create_dir_all(&config.thumbnail_cache_dir).await?;
     let db = SqlitePoolOptions::new()
         .max_connections(8)
         .after_connect(|connection, _metadata| {
@@ -4645,7 +4851,11 @@ async fn main() -> Result<()> {
         .await?;
     setup_database(&db).await?;
     let master_key = load_or_create_master_key(&config.master_key_file).await?;
-    let storage = StorageService::new(db.clone(), master_key);
+    let storage = StorageService::new(
+        db.clone(),
+        master_key,
+        config.thumbnail_cache_dir.clone(),
+    );
     let photo_graph_lock = Arc::new(tokio::sync::Mutex::new(()));
     let storage_mutation_gate = Arc::new(tokio::sync::RwLock::new(()));
     match recover_pending_blobs(&storage, &db, true).await {
@@ -4732,7 +4942,9 @@ async fn main() -> Result<()> {
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
-        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+        thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_THUMBNAIL_CONCURRENCY,
+        )),
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
@@ -4836,8 +5048,15 @@ mod tests {
             .await
             .unwrap();
         setup_database(&db).await.unwrap();
+        let thumbnail_cache_dir = std::env::temp_dir().join(format!(
+            "chronoframe-test-thumbnails-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&thumbnail_cache_dir)
+            .await
+            .unwrap();
         AppState {
-            storage: StorageService::new(db.clone(), [7u8; 32]),
+            storage: StorageService::new(db.clone(), [7u8; 32], thumbnail_cache_dir),
             db,
             secure_cookies: Some(false),
             trust_proxy_headers: false,
@@ -4891,6 +5110,27 @@ mod tests {
         let thumbnail = encode_thumbnail(&png_fixture(120, 80), 720).unwrap();
         let decoded = image::load_from_memory(&thumbnail).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (120, 80));
+    }
+
+    #[tokio::test]
+    async fn thumbnail_cache_persists_and_is_removed_with_the_photo() {
+        let state = test_state().await;
+        let photo_id = Uuid::new_v4().to_string();
+        let expected = b"cached-webp".to_vec();
+        state
+            .storage
+            .cache_thumbnail(&photo_id, &expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.storage.cached_thumbnail(&photo_id).await.unwrap(),
+            Some(expected)
+        );
+        state.storage.remove_cached_thumbnail(&photo_id).await;
+        assert_eq!(
+            state.storage.cached_thumbnail(&photo_id).await.unwrap(),
+            None
+        );
     }
 
     #[test]

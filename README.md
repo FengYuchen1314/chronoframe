@@ -35,7 +35,7 @@ services:
     environment:
       CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
       CF_MASTER_KEY_FILE: /app/data/secret.key
-      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-4}"
+      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-7}"
       CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-auto}"
       CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-true}"
     volumes:
@@ -78,7 +78,7 @@ Compose 变量只负责服务运行时，不负责存储：
 - `CHRONOFRAME_BIND`、`CHRONOFRAME_PORT`：宿主机监听地址和端口。
 - `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；默认 `auto`，反代报告 HTTPS 时自动使用 Secure Cookie。
 - `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded` 和 `X-Forwarded-Proto`；默认 `true`，以兼容无需额外配置的反向代理部署。
-- `CF_CONVERSION_WORKERS`：全局转换 worker 上限，限制为 1–16。
+- `CF_CONVERSION_WORKERS`：全局转换 worker 上限，默认 7，限制为 1–16。
 
 容器内部的 SQLite 路径、主密钥路径、静态前端目录和监听地址已固定在镜像与 Compose 中，无需用户配置。
 
@@ -111,7 +111,9 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 ## 批量格式转换与中断语义
 
-可勾选一个或多个相簿，将其中的 PNG、JPG/JPEG、WEBP 转为三者之一。任务在 Rust 后台使用固定上限的并发 worker 执行，界面定时读取实时进度；上传和浏览不会被阻塞。
+可勾选一个或多个相簿，将其中的 PNG、JPG/JPEG、WEBP 转为三者之一。任务默认在 Rust 后台使用 7 个并发 worker 执行，界面只读取持久化进度；关闭或切换页面不会中断任务。管理员确认删除旧格式图片后，删除请求也会立即进入 7 路并发的持久化后台队列，服务重启后自动续作。
+
+公开相簿会先并发加载轻量 WEBP 缩略图，缩略图缓存在 Compose 同目录的 `./data/thumbnails`；首轮缩略图全部就绪后，浏览器会在没有应用层带宽节流的情况下逐张替换为清晰原图。打开查看器时，当前图片和前后各两张原图会提升到最高加载优先级。
 
 - 每项任务有独立状态（排队、处理中、成功、失败、取消），失败不影响其他图片。
 - 取消会停止尚未开始或可撤销的工作；正在进行原子提交的单张图片会安全完成，绝不出现半写入文件。

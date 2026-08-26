@@ -43,6 +43,10 @@ export interface ConversionJob {
   createdAt: number
   updatedAt: number
   sourcesDeletedAt: number | null
+  sourceDeleteTotal: number
+  sourceDeleteCompleted: number
+  sourceDeleteRemaining: number
+  sourceDeleteFailed: number
 }
 
 export interface ConversionItem {
@@ -65,6 +69,8 @@ export interface SourceDeletionFailure {
 }
 
 export interface SourceDeletionResult {
+  status: 'queued'
+  total: number
   removed: number
   failures: SourceDeletionFailure[]
 }
