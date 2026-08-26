@@ -30,6 +30,7 @@ use axum::{
         rejection::{BytesRejection, JsonRejection},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
 };
@@ -4580,6 +4581,40 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn apply_web_cache_policy(request: axum::extract::Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+
+    if path == "/api" || path.starts_with("/api/") {
+        return response;
+    }
+
+    if path.starts_with("/_nuxt/") && response.status().is_success() {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"))
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        response
+            .headers_mut()
+            .insert(header::EXPIRES, HeaderValue::from_static("0"));
+    }
+
+    response
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -4779,6 +4814,7 @@ async fn main() -> Result<()> {
         .merge(api)
         .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")))
         .fallback_service(ServeDir::new(&config.web_dir).fallback(ServeFile::new(index)))
+        .layer(middleware::from_fn(apply_web_cache_policy))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let bind_addr = env::var("CF_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
