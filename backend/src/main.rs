@@ -79,6 +79,7 @@ struct AppState {
 }
 
 const STORAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 7;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SESSION_COOKIE: &str = "cf_session";
 const CSRF_COOKIE: &str = "cf_csrf";
@@ -4730,7 +4731,7 @@ async fn main() -> Result<()> {
         storage_mutation_gate,
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
-        upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
         thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
@@ -4846,7 +4847,7 @@ mod tests {
             storage_mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY)),
             thumbnail_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             photo_graph_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -4858,6 +4859,23 @@ mod tests {
         let mut output = Cursor::new(Vec::new());
         image.write_to(&mut output, ImageFormat::Png).unwrap();
         output.into_inner()
+    }
+
+    #[tokio::test]
+    async fn upload_queue_allows_exactly_seven_concurrent_requests() {
+        let state = test_state().await;
+        let permits = state
+            .upload_slots
+            .clone()
+            .try_acquire_many_owned(DEFAULT_UPLOAD_CONCURRENCY as u32)
+            .unwrap();
+        assert_eq!(state.upload_slots.available_permits(), 0);
+        assert!(state.upload_slots.clone().try_acquire_owned().is_err());
+        drop(permits);
+        assert_eq!(
+            state.upload_slots.available_permits(),
+            DEFAULT_UPLOAD_CONCURRENCY
+        );
     }
 
     #[test]
