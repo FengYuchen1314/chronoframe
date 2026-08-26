@@ -17,7 +17,9 @@ const album = computed(() => data.value ? adaptRustAlbumDetail(data.value, globa
 const viewer = useViewerState()
 const isMobile = useMediaQuery('(max-width: 768px)')
 const showTop = ref(false)
-const items = computed(() => (album.value?.photos || []).map((photo, index) => ({ id: photo.id, photo, index })))
+const albumPhotos = computed(() => album.value?.photos || [])
+const { isOriginalReady, markThumbnailSettled, prioritizeAround } = useGalleryImagePipeline(albumPhotos)
+const items = computed(() => albumPhotos.value.map((photo, index) => ({ id: photo.id, photo, index })))
 const keyMapper = (item: { id: string }) => item.id
 const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
 const dateRange = computed(() => {
@@ -42,6 +44,7 @@ const createdDate = computed(() => {
 const openPhoto = (index: number) => {
   const photo = album.value?.photos[index]
   if (!photo || !album.value) return
+  prioritizeAround(index)
   viewer.openViewer(index, `/albums/${album.value.id}`, album.value.photos)
   router.push(`/${photo.id}`)
 }
@@ -91,7 +94,13 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
           :key-mapper="keyMapper"
         >
           <template #default="{ item }">
-            <MasonryItem :photo="item.photo" :index="item.index" @open-viewer="openPhoto" />
+            <MasonryItem
+              :photo="item.photo"
+              :index="item.index"
+              :show-original="isOriginalReady(item.photo.id)"
+              @thumbnail-settled="markThumbnailSettled"
+              @open-viewer="openPhoto"
+            />
           </template>
         </MasonryWall>
       </section>

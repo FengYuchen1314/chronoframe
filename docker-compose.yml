@@ -12,7 +12,7 @@ services:
     environment:
       CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
       CF_MASTER_KEY_FILE: /app/data/secret.key
-      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-4}"
+      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-7}"
       CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-auto}"
       CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-true}"
     volumes:

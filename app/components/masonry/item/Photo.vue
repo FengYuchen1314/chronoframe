@@ -1,8 +1,12 @@
 <script setup lang="ts">
 import type { GalleryPhoto } from '~~/shared/types/photo'
 
-const props = defineProps<{ photo: GalleryPhoto; index: number }>()
-const emit = defineEmits<{ openViewer: [number] }>()
+const props = withDefaults(defineProps<{
+  photo: GalleryPhoto
+  index: number
+  showOriginal?: boolean
+}>(), { showOriginal: false })
+const emit = defineEmits<{ openViewer: [number]; thumbnailSettled: [string] }>()
 
 const aspectRatio = computed(() => props.photo.aspectRatio || 1.2)
 const camera = computed(() => [props.photo.exif?.Make, props.photo.exif?.Model].filter(Boolean).join(' '))
@@ -17,12 +21,16 @@ const camera = computed(() => [props.photo.exif?.Make, props.photo.exif?.Model].
     @click="emit('openViewer', index)"
   >
     <PhotoProgressiveImage
-      :src="photo.thumbnailUrl"
+      :src="showOriginal ? photo.originalUrl : photo.thumbnailUrl"
+      :placeholder-src="showOriginal ? photo.thumbnailUrl : null"
       :fallback-src="photo.originalUrl"
       :alt="photo.title"
-      loading="lazy"
+      loading="eager"
+      :fetch-priority="showOriginal ? 'low' : 'auto'"
       fit="cover"
       class="absolute inset-0 h-full w-full transition-transform duration-500 group-hover:scale-[1.035]"
+      @load="!showOriginal && emit('thumbnailSettled', photo.id)"
+      @error="!showOriginal && emit('thumbnailSettled', photo.id)"
     />
     <div class="absolute inset-0 bg-black/0 transition-colors duration-300 group-hover:bg-black/15" />
     <div class="absolute inset-x-0 bottom-0 translate-y-full bg-linear-to-t from-black/70 to-transparent p-3 pt-12 text-white opacity-0 transition duration-300 group-hover:translate-y-0 group-hover:opacity-100">

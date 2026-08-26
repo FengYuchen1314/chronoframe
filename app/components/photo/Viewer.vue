@@ -44,6 +44,7 @@ let zoomTimer: ReturnType<typeof setTimeout> | null = null
 let gesturePointerId: number | null = null
 let dragFrame: number | null = null
 let pendingDragX = 0
+const viewerPreloads = new Map<string, HTMLImageElement>()
 
 const currentPhoto = computed(() => props.photos[props.currentIndex])
 const mobileSlides = computed(() => {
@@ -56,6 +57,39 @@ const mobileSlides = computed(() => {
   }
   return result
 })
+
+const clearViewerPreloads = () => {
+  for (const image of viewerPreloads.values()) {
+    image.onload = null
+    image.onerror = null
+    if (!image.complete) image.src = ''
+  }
+  viewerPreloads.clear()
+}
+const preloadViewerWindow = () => {
+  if (!import.meta.client || !props.isOpen) return
+  const desired = new Set<string>()
+  const start = Math.max(0, props.currentIndex - 2)
+  const end = Math.min(props.photos.length - 1, props.currentIndex + 2)
+  for (let index = start; index <= end; index += 1) {
+    const photo = props.photos[index]
+    if (!photo) continue
+    desired.add(photo.id)
+    if (viewerPreloads.has(photo.id)) continue
+    const image = new Image()
+    image.decoding = 'async'
+    image.fetchPriority = 'high'
+    image.src = photo.originalUrl
+    viewerPreloads.set(photo.id, image)
+  }
+  for (const [photoId, image] of viewerPreloads) {
+    if (desired.has(photoId)) continue
+    image.onload = null
+    image.onerror = null
+    if (!image.complete) image.src = ''
+    viewerPreloads.delete(photoId)
+  }
+}
 
 const imageAspectRatio = computed(() => {
   if (naturalSize.width > 0 && naturalSize.height > 0) return naturalSize.width / naturalSize.height
@@ -466,11 +500,17 @@ watch(() => props.isOpen, open => {
     }
   }
   if (!open) {
+    clearViewerPreloads()
     showGestureHint.value = false
     clearInteractionTimers()
     resetTransform()
   }
 })
+watch(
+  [() => props.isOpen, () => props.currentIndex, () => props.photos.map(photo => photo.id).join('\u0000')],
+  preloadViewerWindow,
+  { immediate: true },
+)
 watch(() => props.currentIndex, (index) => {
   visualIndex.value = index
   if (!isSliding.value) {
@@ -484,6 +524,7 @@ watch(() => props.currentIndex, (index) => {
   naturalSize.height = currentPhoto.value?.height || 0
 }, { flush: 'sync' })
 onBeforeUnmount(() => {
+  clearViewerPreloads()
   clearInteractionTimers()
   activePointers.clear()
   if (import.meta.client) document.body.style.overflow = previousBodyOverflow
@@ -519,12 +560,12 @@ onBeforeUnmount(() => {
               <div v-for="slide in mobileSlides" :key="slide.photo.id" class="absolute inset-y-0 w-full" :style="{ left: `${slide.index * 100}%` }">
                 <PhotoProgressiveImage
                   :data-viewer-current="slide.index === visualIndex ? 'true' : undefined"
-                  :src="Math.abs(slide.index - visualIndex) <= 1 ? slide.photo.originalUrl : slide.photo.thumbnailUrl"
-                  :placeholder-src="Math.abs(slide.index - visualIndex) <= 1 ? slide.photo.thumbnailUrl : null"
+                  :src="slide.photo.originalUrl"
+                  :placeholder-src="slide.photo.thumbnailUrl"
                   :alt="slide.photo.title || $t('ui.photo.altFallback')"
                   fit="contain"
-                  :loading="Math.abs(slide.index - visualIndex) <= 1 ? 'eager' : 'lazy'"
-                  :fetch-priority="slide.index === visualIndex ? 'high' : 'low'"
+                  loading="eager"
+                  fetch-priority="high"
                   class="h-full w-full select-none bg-black will-change-transform"
                   :style="slide.index === visualIndex ? mobileImageStyle : undefined"
                   @load="slide.index === visualIndex && onCurrentImageLoad($event)"

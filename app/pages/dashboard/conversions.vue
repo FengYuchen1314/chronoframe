@@ -28,8 +28,6 @@ const targetFormat = ref<ImageTargetFormat>('webp')
 const jobs = ref<ConversionJob[]>([])
 const selectedJobId = ref('')
 const selectedDetail = ref<ConversionDetail | null>(null)
-const deletionResults = ref<Record<string, SourceDeletionResult>>({})
-
 const isLoading = ref(false)
 const isStarting = ref(false)
 const isLoadingDetail = ref(false)
@@ -346,20 +344,28 @@ const confirmSourceDeletion = async (job: ConversionJob) => {
       `/api/conversions/${job.id}/delete-sources`,
       { method: 'DELETE' },
     )
-    deletionResults.value = { ...deletionResults.value, [job.id]: result }
-    toast.add({
-      title: result.failures.length ? '旧图删除已持久化，但有项目待恢复' : '旧格式原图已删除',
-      description: `已删除 ${result.removed} 张，失败 ${result.failures.length} 张`,
-      color: result.failures.length ? 'warning' : 'success',
-    })
-    await loadJobDetail(job.id, true)
-    const refreshedJob = selectedDetail.value?.job
-    if (refreshedJob?.id === job.id) {
-      jobs.value = jobs.value.map(candidate =>
-        candidate.id === job.id ? refreshedJob : candidate,
-      )
+    jobs.value = jobs.value.map(candidate => candidate.id === job.id
+      ? {
+          ...candidate,
+          sourcesDeletedAt: -2,
+          sourceDeleteTotal: result.total,
+          sourceDeleteCompleted: 0,
+          sourceDeleteRemaining: result.total,
+          sourceDeleteFailed: 0,
+        }
+      : candidate)
+    if (selectedDetail.value?.job.id === job.id) {
+      selectedDetail.value = {
+        ...selectedDetail.value,
+        job: jobs.value.find(candidate => candidate.id === job.id) || selectedDetail.value.job,
+      }
     }
-    beginPolling(result.failures.length ? 3000 : 0)
+    toast.add({
+      title: '旧图删除任务已进入后台',
+      description: `${result.total} 张旧图将以 7 路并发校验并删除，现在可以离开本页。`,
+      color: 'success',
+    })
+    beginPolling(0)
   } catch (error) {
     toast.add({
       title: '旧图删除确认失败',
@@ -404,9 +410,9 @@ onBeforeUnmount(() => {
     <template #header>
       <UDashboardNavbar title="格式转换">
         <template #right>
-          <UBadge v-if="hasActiveJobs" color="info" variant="soft">
+          <UBadge v-if="hasPollableWork" color="info" variant="soft">
             <span class="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-current" />
-            正在同步进度
+            {{ hasActiveJobs ? '正在同步转换进度' : '旧图正在后台清理' }}
           </UBadge>
           <UButton
             icon="tabler:refresh"
@@ -678,7 +684,7 @@ onBeforeUnmount(() => {
                         v-else-if="detailJob.sourcesDeletedAt !== null && detailJob.sourcesDeletedAt < 0"
                         class="mt-1 text-sm text-warning"
                       >
-                        删除意图已持久化，后端正在处理或等待恢复未完成的项目。
+                        后台正以 7 路并发校验并删除；离开本页不会中断，服务重启后也会自动续作。
                       </p>
                       <p v-else class="mt-1 text-sm text-success">
                         管理员已于 {{ formatTime(detailJob.sourcesDeletedAt) }} 确认删除旧图。
@@ -697,13 +703,13 @@ onBeforeUnmount(() => {
                   </div>
 
                   <UAlert
-                    v-if="deletionResults[detailJob.id]?.failures.length"
+                    v-if="detailJob.sourcesDeletedAt === -2"
                     class="mt-4"
-                    color="warning"
+                    color="info"
                     variant="subtle"
-                    icon="tabler:alert-triangle"
-                    title="部分删除待后端恢复"
-                    :description="`${deletionResults[detailJob.id]?.failures.length || 0} 个项目未完成，删除意图已写入持久化队列，不要重复提交。`"
+                    icon="tabler:loader-2"
+                    title="旧图后台清理进度"
+                    :description="`已完成 ${detailJob.sourceDeleteCompleted} / ${detailJob.sourceDeleteTotal}，剩余 ${detailJob.sourceDeleteRemaining}${detailJob.sourceDeleteFailed ? `，其中 ${detailJob.sourceDeleteFailed} 个正在退避重试` : ''}。可以安全离开本页。`"
                   />
                 </div>
 
