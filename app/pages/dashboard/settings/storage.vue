@@ -200,7 +200,9 @@ const migrationStatusText = (job: StorageMigrationJob) => {
   if (job.cleanupStatus === 'cleaning') return '正在清理旧存储'
   if (job.status === 'completed') {
     return {
+      not_ready: '迁移完成',
       pending: '等待处理旧存储',
+      cleaning: '正在清理旧存储',
       cleaned: '旧存储已清理',
       retained: '旧存储已保留',
       failed: '旧存储清理失败',
