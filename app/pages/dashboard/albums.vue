@@ -10,6 +10,8 @@ useHead({ title: '相簿' })
 const toast = useToast()
 const { adminFetch } = useAdminApi()
 
+const UPLOAD_CONCURRENCY = 7
+
 const albums = ref<Album[]>([])
 const selectedAlbumId = ref('')
 const photos = ref<Photo[]>([])
@@ -55,7 +57,7 @@ const isReorderingAlbums = ref(false)
 const isAlbumDetailReady = ref(false)
 const uploadCompleted = ref(0)
 const uploadTotal = ref(0)
-const uploadCurrentName = ref('')
+const uploadActiveCount = ref(0)
 const albumError = ref('')
 const photoError = ref('')
 let detailRequestSerial = 0
@@ -109,9 +111,6 @@ const isAlbumInteractionLocked = computed(() =>
 
 const selectedBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
-)
-const uploadCurrentPosition = computed(() =>
-  Math.min(uploadCompleted.value + 1, uploadTotal.value),
 )
 const allPhotosSelected = computed(() =>
   photos.value.length > 0 && selectedPhotoIds.value.length === photos.value.length,
@@ -640,32 +639,46 @@ const uploadPhotos = async () => {
 
   const albumId = selectedAlbumId.value
   const files = [...selectedFiles.value]
-  const failed: Array<{ file: File, message: string }> = []
+  const failed: Array<{ index: number, file: File, message: string }> = []
   let uploadedCount = 0
+  let nextFileIndex = 0
   isUploading.value = true
   isAlbumDetailReady.value = false
   uploadCompleted.value = 0
   uploadTotal.value = files.length
+  uploadActiveCount.value = 0
   try {
-    for (const file of files) {
-      uploadCurrentName.value = file.name
-      const formData = new FormData()
-      formData.append('files', file, file.name)
-      try {
-        const uploaded = await adminFetch<Photo[]>(
-          `/api/albums/${albumId}/photos`,
-          { method: 'POST', body: formData },
-        )
-        uploadedCount += uploaded.length
-        const knownIds = new Set(photos.value.map(photo => photo.id))
-        photos.value = [...uploaded.filter(photo => !knownIds.has(photo.id)), ...photos.value]
-      } catch (error) {
-        failed.push({ file, message: getAdminApiErrorMessage(error) })
-      } finally {
-        uploadCompleted.value += 1
+    const uploadWorker = async () => {
+      while (nextFileIndex < files.length) {
+        const index = nextFileIndex++
+        const file = files[index]
+        if (!file) continue
+
+        uploadActiveCount.value += 1
+        const formData = new FormData()
+        formData.append('files', file, file.name)
+        try {
+          const uploaded = await adminFetch<Photo[]>(
+            `/api/albums/${albumId}/photos`,
+            { method: 'POST', body: formData },
+          )
+          uploadedCount += uploaded.length
+          const knownIds = new Set(photos.value.map(photo => photo.id))
+          const newPhotos = uploaded.filter(photo => !knownIds.has(photo.id))
+          if (newPhotos.length) photos.value = [...newPhotos, ...photos.value]
+        } catch (error) {
+          failed.push({ index, file, message: getAdminApiErrorMessage(error) })
+        } finally {
+          uploadActiveCount.value -= 1
+          uploadCompleted.value += 1
+        }
       }
     }
 
+    const workerCount = Math.min(UPLOAD_CONCURRENCY, files.length)
+    await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()))
+
+    failed.sort((left, right) => left.index - right.index)
     selectedFiles.value = failed.map(item => item.file)
     if (!failed.length && uploadInput.value) uploadInput.value.value = ''
     const refreshed = await refreshAlbums(albumId)
@@ -693,7 +706,7 @@ const uploadPhotos = async () => {
     }
   } finally {
     isUploading.value = false
-    uploadCurrentName.value = ''
+    uploadActiveCount.value = 0
     uploadCompleted.value = 0
     uploadTotal.value = 0
   }
@@ -874,7 +887,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                   <div v-if="selectedFiles.length" class="mt-4 flex flex-col gap-3 rounded-xl border border-primary/15 bg-default p-3 sm:flex-row sm:items-center sm:justify-between">
                     <div class="min-w-0 text-sm">
                       <div class="flex items-center gap-2"><Icon name="tabler:files" class="size-4 shrink-0 text-primary" /><span>已选择 <strong>{{ selectedFiles.length }}</strong> 张，共 {{ formatBytes(selectedBytes) }}</span></div>
-                      <p v-if="isUploading" class="mt-1 truncate pl-6 text-xs text-muted">正在上传 {{ uploadCurrentPosition }} / {{ uploadTotal }}：{{ uploadCurrentName }}</p>
+                      <p v-if="isUploading" class="mt-1 pl-6 text-xs text-muted">7 路异步上传中 · 已完成 {{ uploadCompleted }} / {{ uploadTotal }} · 当前 {{ uploadActiveCount }} 张</p>
                     </div>
                     <div class="flex gap-2">
                       <UButton size="sm" color="neutral" variant="ghost" :disabled="hasActiveMutation" @click="clearSelectedFiles">清空</UButton>
