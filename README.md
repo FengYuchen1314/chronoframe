@@ -51,6 +51,8 @@ docker compose pull
 docker compose up -d
 ```
 
+如果旧部署的 Compose 仍使用 `build: .`，`docker compose pull` 不会更新应用。请先改用上方示例中的 `image: ghcr.io/fengyuchen1314/chronoframe:latest`，并保留原来的 `volumes` 映射，再执行更新命令。新版会要求浏览器重新验证入口 HTML，避免更新后因旧页面继续引用已经移除的脚本而出现空白页。
+
 迁移前先停止写入，然后把 Compose 文件和整个 `data` 目录一起打包：
 
 ```bash
