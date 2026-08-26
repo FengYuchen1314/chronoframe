@@ -44,9 +44,9 @@ const startDownload = () => downloadMany(props.selected, format.value, isMobile.
               </select>
               <Icon name="tabler:chevron-down" class="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 text-white/60" />
             </label>
-            <button type="button" class="flex h-10 shrink-0 items-center gap-2 rounded-xl bg-primary px-3.5 text-sm font-semibold text-inverted shadow-lg transition hover:brightness-105 active:scale-[.98] disabled:opacity-55" :disabled="transfer.active" @click="startDownload">
+            <button type="button" class="flex h-10 shrink-0 items-center gap-2 rounded-xl bg-primary px-3.5 text-sm font-semibold text-inverted shadow-lg transition hover:brightness-105 active:scale-[.98] disabled:opacity-55" :disabled="transfer.active" :aria-label="isMobile ? '逐张下载所选图片' : '将所选图片下载为 ZIP'" @click="startDownload">
               <Icon :name="transfer.active ? 'tabler:loader-2' : (isMobile ? 'tabler:download' : 'tabler:file-zip')" class="size-4" :class="transfer.active && 'animate-spin'" />
-              <span class="hidden xs:inline">{{ isMobile ? '逐张下载' : '下载 ZIP' }}</span>
+              <span>{{ isMobile ? '逐张下载' : '下载 ZIP' }}</span>
             </button>
           </div>
         </div>
