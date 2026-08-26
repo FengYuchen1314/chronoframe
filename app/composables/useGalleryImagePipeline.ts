@@ -14,6 +14,10 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
   const activePreloads = new Map<string, ActivePreload>()
   let generation = 0
   let backgroundStarted = false
+  let backgroundPaused = false
+  let backgroundQueue: GalleryPhoto[] = []
+  let activeBackgroundCount = 0
+  const maxBackgroundConcurrency = 2
 
   const replaceSetWith = (target: typeof settledThumbnailIds, value: string) => {
     const next = new Set(target.value)
@@ -30,6 +34,18 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
   const clearPreloads = () => {
     for (const entry of activePreloads.values()) stopPreload(entry)
     activePreloads.clear()
+    backgroundQueue = []
+    activeBackgroundCount = 0
+  }
+
+  const pumpBackgroundQueue = () => {
+    if (backgroundPaused || !import.meta.client) return
+    while (activeBackgroundCount < maxBackgroundConcurrency && backgroundQueue.length) {
+      const photo = backgroundQueue.shift()
+      if (!photo || readyOriginalIds.value.has(photo.id) || activePreloads.has(photo.id)) continue
+      activeBackgroundCount += 1
+      preloadOriginal(photo, 'low')
+    }
   }
 
   const preloadOriginal = (photo: GalleryPhoto, priority: ImagePriority) => {
@@ -46,11 +62,19 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
     image.decoding = 'async'
     image.fetchPriority = priority
     image.onload = () => {
+      const entry = activePreloads.get(photo.id)
       activePreloads.delete(photo.id)
+      if (entry?.priority === 'low') activeBackgroundCount = Math.max(0, activeBackgroundCount - 1)
       if (requestGeneration !== generation) return
       replaceSetWith(readyOriginalIds, photo.id)
+      pumpBackgroundQueue()
     }
-    image.onerror = () => activePreloads.delete(photo.id)
+    image.onerror = () => {
+      const entry = activePreloads.get(photo.id)
+      activePreloads.delete(photo.id)
+      if (entry?.priority === 'low') activeBackgroundCount = Math.max(0, activeBackgroundCount - 1)
+      pumpBackgroundQueue()
+    }
     activePreloads.set(photo.id, { image, priority })
     image.src = photo.originalUrl
   }
@@ -58,9 +82,9 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
   const startBackgroundOriginals = () => {
     if (backgroundStarted || !import.meta.client || !photos.value.length) return
     backgroundStarted = true
-    // Deliberately enqueue the whole original set without a JavaScript concurrency cap.
-    // The browser/network stack retains transport-level scheduling while tiles sharpen one by one.
-    for (const photo of photos.value) preloadOriginal(photo, 'low')
+    backgroundPaused = false
+    backgroundQueue = [...photos.value]
+    pumpBackgroundQueue()
   }
 
   const markThumbnailSettled = (photoId: string) => {
@@ -78,6 +102,17 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
     }
   }
 
+  const pauseBackgroundOriginals = () => {
+    backgroundPaused = true
+    backgroundQueue = []
+    for (const [photoId, entry] of activePreloads) {
+      if (entry.priority !== 'low') continue
+      stopPreload(entry)
+      activePreloads.delete(photoId)
+    }
+    activeBackgroundCount = 0
+  }
+
   const isOriginalReady = (photoId: string) => readyOriginalIds.value.has(photoId)
 
   watch(
@@ -85,6 +120,7 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
     () => {
       generation += 1
       backgroundStarted = false
+      backgroundPaused = false
       clearPreloads()
       settledThumbnailIds.value = new Set()
       readyOriginalIds.value = new Set()
@@ -97,5 +133,5 @@ export function useGalleryImagePipeline(photos: Readonly<Ref<GalleryPhoto[]>>) {
     clearPreloads()
   })
 
-  return { isOriginalReady, markThumbnailSettled, prioritizeAround }
+  return { isOriginalReady, markThumbnailSettled, prioritizeAround, pauseBackgroundOriginals }
 }

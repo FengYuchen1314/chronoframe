@@ -18,7 +18,7 @@ const viewer = useViewerState()
 const isMobile = useMediaQuery('(max-width: 768px)')
 const showTop = ref(false)
 const albumPhotos = computed(() => album.value?.photos || [])
-const { isOriginalReady, markThumbnailSettled, prioritizeAround } = useGalleryImagePipeline(albumPhotos)
+const { isOriginalReady, markThumbnailSettled, pauseBackgroundOriginals } = useGalleryImagePipeline(albumPhotos)
 const items = computed(() => albumPhotos.value.map((photo, index) => ({ id: photo.id, photo, index })))
 const keyMapper = (item: { id: string }) => item.id
 const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
@@ -44,7 +44,7 @@ const createdDate = computed(() => {
 const openPhoto = (index: number) => {
   const photo = album.value?.photos[index]
   if (!photo || !album.value) return
-  prioritizeAround(index)
+  pauseBackgroundOriginals()
   viewer.openViewer(index, `/albums/${album.value.id}`, album.value.photos)
   router.push(`/${photo.id}`)
 }
