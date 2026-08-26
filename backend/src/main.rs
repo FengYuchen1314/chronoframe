@@ -78,8 +78,6 @@ struct AppState {
 }
 
 const STORAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_UPLOAD_BATCH_BYTES: usize = 384 * 1024 * 1024;
-const MAX_UPLOAD_FILES: usize = 128;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SESSION_COOKIE: &str = "cf_session";
 const CSRF_COOKIE: &str = "cf_csrf";
@@ -2236,6 +2234,7 @@ async fn migration_candidates(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn copy_storage_migration_item(
     state: &AppState,
     job_id: &str,
@@ -2707,7 +2706,7 @@ async fn run_storage_cleanup(
                             .execute(&state.db)
                             .await;
                     }
-                    Err(error) if token.is_cancelled() => {}
+                    Err(_error) if token.is_cancelled() => {}
                     Err(error) => {
                         warn!(job_id, item_id, "old storage cleanup failed: {error:#}");
                         let _ = sqlx::query("UPDATE storage_migration_items SET cleanup_error=? WHERE id=? AND source_deleted_at IS NULL")
@@ -3800,9 +3799,9 @@ async fn upload_photos(
             clear_auth_cookies: None,
         });
     }
-    // Validate the complete multipart batch before writing anything. A bad file therefore cannot leave a half-visible upload.
+    // Validate the complete request before writing anything. The dashboard submits one file per
+    // request so successful files remain visible even when a later file is invalid.
     let mut prepared: Vec<(Photo, Vec<u8>)> = vec![];
-    let mut batch_bytes = 0usize;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -3816,18 +3815,6 @@ async fn upload_photos(
             .to_vec();
         if bytes.is_empty() {
             continue;
-        }
-        if prepared.len() >= MAX_UPLOAD_FILES {
-            return Err(AppError::bad(format!(
-                "单次最多上传 {MAX_UPLOAD_FILES} 张图片"
-            )));
-        }
-        if bytes.len() > 100 * 1024 * 1024 {
-            return Err(AppError::bad(format!("{filename} 超过 100MB 限制")));
-        }
-        batch_bytes = batch_bytes.saturating_add(bytes.len());
-        if batch_bytes > MAX_UPLOAD_BATCH_BYTES {
-            return Err(AppError::bad("单次上传总大小不得超过 384MB"));
         }
         let format = file_format(&filename)
             .ok_or_else(|| AppError::bad(format!("{filename} 仅支持 PNG、JPG/JPEG、WEBP")))?;
@@ -4767,7 +4754,7 @@ async fn main() -> Result<()> {
             "/api/albums/{album_id}/photos",
             get(album_photos)
                 .post(upload_photos)
-                .layer(DefaultBodyLimit::max(400 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/photos", get(list_photos))
         .route("/api/photos/delete", post(delete_photos))
