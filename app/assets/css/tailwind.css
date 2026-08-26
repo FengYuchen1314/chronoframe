@@ -52,16 +52,13 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 12%); }
 
 .dashboard-surface {
-  background:
-    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--ui-primary) 8%, transparent), transparent 28rem),
-    radial-gradient(circle at 0% 100%, color-mix(in srgb, var(--ui-info) 6%, transparent), transparent 30rem),
-    var(--ui-bg-muted);
+  background: var(--ui-bg-muted);
 }
 
 .dashboard-panel-body {
   margin-inline: auto;
   width: 100%;
-  max-width: 96rem;
+  max-width: 90rem;
   padding: 1rem;
 }
 
@@ -71,7 +68,19 @@ button, a { -webkit-tap-highlight-color: transparent; }
 
 .dashboard-section {
   border: 1px solid var(--ui-border);
-  border-radius: 1rem;
-  background: color-mix(in srgb, var(--ui-bg) 94%, transparent);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 4%);
+  border-radius: 0.75rem;
+  background: var(--ui-bg);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
+}
+
+.dashboard-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid var(--ui-border);
+  border-radius: 0.75rem;
+  background: var(--ui-bg);
+  padding: 0.75rem;
 }

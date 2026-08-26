@@ -200,7 +200,9 @@ const migrationStatusText = (job: StorageMigrationJob) => {
   if (job.cleanupStatus === 'cleaning') return '正在清理旧存储'
   if (job.status === 'completed') {
     return {
+      not_ready: '迁移完成',
       pending: '等待处理旧存储',
+      cleaning: '正在清理旧存储',
       cleaned: '旧存储已清理',
       retained: '旧存储已保留',
       failed: '旧存储清理失败',
@@ -343,15 +345,15 @@ onBeforeUnmount(() => {
 <template>
   <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="存储中心">
+      <UDashboardNavbar title="存储设置">
         <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading || isLoadingMigrations" @click="loadSettings(); loadMigrations()">重新读取</UButton></template>
       </UDashboardNavbar>
     </template>
 
     <template #body>
       <div class="dashboard-panel-body space-y-6">
-        <DashboardPageHero eyebrow="Storage backend" title="选择图片实际存放的位置" description="本地、WebDAV 和 S3 配置全部写入后台数据库，不需要创建环境变量。系统始终只使用一个活动存储后端。" icon="tabler:database-cog">
-          <template #actions><UBadge color="success" variant="soft" size="lg"><Icon :name="backendIcons[savedBackend]" class="mr-1 size-4" />当前：{{ backendOptions.find(item => item.value === savedBackend)?.label }}</UBadge></template>
+        <DashboardPageHero eyebrow="存储设置" title="图片存储与迁移" description="配置本地、WebDAV 或 S3，并在同一页测试连接、切换后端和查看迁移进度。所有配置均保存在后台数据库。" icon="tabler:database-cog">
+          <template #actions><UBadge color="success" variant="soft"><Icon :name="backendIcons[savedBackend]" class="mr-1 size-4" />当前：{{ backendOptions.find(item => item.value === savedBackend)?.label }}</UBadge></template>
         </DashboardPageHero>
 
         <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="存储设置加载失败" :description="loadError" />
@@ -405,7 +407,7 @@ onBeforeUnmount(() => {
               <div class="flex items-start gap-3"><span class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-success/10 text-success"><Icon name="tabler:shield-lock" class="size-5" /></span><div><h3 class="text-sm font-semibold text-highlighted">密钥不会回显</h3><p class="mt-1 text-xs leading-5 text-muted">后端只返回是否已设置。密码和 Secret Key 不会写入浏览器存储或 URL。</p></div></div>
             </section>
 
-            <section v-if="storageTargetChanged" class="rounded-2xl border border-warning/20 bg-warning/10 p-4 text-sm text-warning">
+            <section v-if="storageTargetChanged" class="rounded-xl border border-warning/20 bg-warning/10 p-4 text-sm text-warning">
               <p class="flex items-center gap-2 font-medium"><Icon name="tabler:alert-triangle" class="size-4" />存储目标发生变化</p><p class="mt-2 text-xs leading-5">{{ storedPhotoCount ? `保存后会迁移 ${storedPhotoCount} 张图片，全部校验成功才切换。` : '当前没有图片，可以直接切换。' }}</p>
             </section>
           </aside>

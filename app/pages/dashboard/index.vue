@@ -131,36 +131,22 @@ onMounted(refreshAll)
         />
 
         <DashboardPageHero
-          eyebrow="ChronoFrame Studio"
-          title="今天想整理哪一组回忆？"
-          description="从相簿开始组织图片，转换和存储状态会在这里持续同步。"
+          eyebrow="工作台"
+          title="内容与任务概览"
+          description="查看相簿、图片、转换任务和当前存储状态，直接进入需要处理的工作区。"
           icon="tabler:layout-dashboard"
         >
           <template #actions>
-            <UButton to="/dashboard/albums" size="lg" icon="tabler:plus">新建或管理相簿</UButton>
-            <UButton to="/dashboard/conversions" size="lg" color="neutral" variant="soft" icon="tabler:arrows-exchange">格式转换</UButton>
+            <UButton to="/dashboard/albums" icon="tabler:plus">新建相簿</UButton>
+            <UButton to="/dashboard/conversions" color="neutral" variant="soft" icon="tabler:arrows-exchange">格式转换</UButton>
           </template>
-          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
-              <p class="text-xs text-muted">相簿</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ albums.length }}</p>
-            </div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
-              <p class="text-xs text-muted">图片</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ photos.length }}</p>
-            </div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
-              <p class="text-xs text-muted">占用空间</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ formatBytes(totalBytes) }}</p>
-            </div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur">
-              <p class="text-xs text-muted">当前存储</p><p class="mt-1 truncate text-xl font-semibold text-highlighted">{{ storage ? storageLabels[storage.backend] : '—' }}</p>
-            </div>
-          </div>
         </DashboardPageHero>
 
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <DashboardMetricCard label="相簿空间" :value="albums.length" icon="tabler:album" tone="info" hint="进入相簿工作台" to="/dashboard/albums" />
           <DashboardMetricCard label="图片总数" :value="photos.length" icon="tabler:photo" tone="success" :hint="formatBytes(totalBytes)" to="/dashboard/albums" />
           <DashboardMetricCard label="进行中任务" :value="activeJobs.length" icon="tabler:progress" tone="warning" hint="后台异步执行" to="/dashboard/conversions" />
-          <DashboardMetricCard label="异常任务" :value="failedJobs.length" icon="tabler:alert-triangle" :tone="failedJobs.length ? 'warning' : 'neutral'" hint="查看任务详情" to="/dashboard/conversions" />
+          <DashboardMetricCard label="当前存储" :value="storage ? storageLabels[storage.backend] : '—'" icon="tabler:database" tone="neutral" :hint="failedJobs.length ? `${failedJobs.length} 个异常任务待查看` : '运行状态正常'" to="/dashboard/settings/storage" />
         </div>
 
         <div class="grid grid-cols-1 gap-4 xl:grid-cols-5">
@@ -170,7 +156,7 @@ onMounted(refreshAll)
                 <h2 class="font-semibold text-highlighted">最近转换任务</h2>
                 <p class="mt-1 text-sm text-muted">任务在后端执行，离开页面也不会停止</p>
               </div>
-              <UButton to="/dashboard/conversions" color="neutral" variant="ghost" trailing-icon="tabler:arrow-right">全部任务</UButton>
+              <div class="flex items-center gap-2"><UBadge v-if="failedJobs.length" color="warning" variant="soft">{{ failedJobs.length }} 个需关注</UBadge><UButton to="/dashboard/conversions" color="neutral" variant="ghost" trailing-icon="tabler:arrow-right">全部任务</UButton></div>
             </div>
 
             <div v-if="recentJobs.length" class="divide-y divide-default px-5">

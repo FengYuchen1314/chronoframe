@@ -424,21 +424,22 @@ onBeforeUnmount(() => {
     <template #body>
       <div class="dashboard-panel-body space-y-6">
         <DashboardPageHero
-          eyebrow="Conversion queue"
-          title="批量转换，过程始终可控"
+          eyebrow="转换任务"
+          title="批量格式转换"
           description="选择一个或多个相簿后交给 Rust 后台并行处理。关闭页面不会停止任务，旧格式原图只会在你检查结果并手动确认后删除。"
           icon="tabler:arrows-exchange"
         >
           <template #actions>
-            <UButton to="/dashboard/albums" color="neutral" variant="soft" size="lg" icon="tabler:album">管理相簿</UButton>
+            <UButton to="/dashboard/albums" color="neutral" variant="soft" icon="tabler:album">管理相簿</UButton>
           </template>
-          <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">进行中</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ activeJobCount }}</p></div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">已完成任务</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ completedJobCount }}</p></div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">成功转换图片</p><p class="mt-1 text-xl font-semibold text-highlighted">{{ convertedImageCount }}</p></div>
-            <div class="rounded-xl border border-white/20 bg-default/70 px-4 py-3 backdrop-blur"><p class="text-xs text-muted">需要关注</p><p class="mt-1 text-xl font-semibold" :class="attentionJobCount ? 'text-warning' : 'text-highlighted'">{{ attentionJobCount }}</p></div>
-          </div>
         </DashboardPageHero>
+
+        <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <DashboardMetricCard label="进行中" :value="activeJobCount" icon="tabler:progress" tone="info" hint="异步任务" />
+          <DashboardMetricCard label="已完成任务" :value="completedJobCount" icon="tabler:circle-check" tone="success" />
+          <DashboardMetricCard label="成功转换图片" :value="convertedImageCount" icon="tabler:photo-check" tone="primary" />
+          <DashboardMetricCard label="需要关注" :value="attentionJobCount" icon="tabler:alert-triangle" :tone="attentionJobCount ? 'warning' : 'neutral'" />
+        </div>
 
         <UAlert
           v-if="pageError"
@@ -460,7 +461,7 @@ onBeforeUnmount(() => {
 
         <div class="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(300px,390px)_minmax(0,1fr)]">
           <div class="space-y-4">
-            <UCard id="new-conversion" class="rounded-2xl shadow-sm">
+            <UCard id="new-conversion" class="rounded-xl shadow-xs">
               <template #header>
                 <div class="flex items-start gap-3">
                   <span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:plus" class="size-5" /></span>
@@ -556,7 +557,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="min-w-0 space-y-4">
-            <UCard class="rounded-2xl shadow-sm" :ui="{ body: 'p-2 sm:p-2' }">
+            <UCard class="rounded-xl shadow-xs" :ui="{ body: 'p-2 sm:p-2' }">
               <template #header>
                 <div class="flex items-center justify-between gap-3">
                   <div>
@@ -609,7 +610,7 @@ onBeforeUnmount(() => {
               </div>
             </UCard>
 
-            <UCard v-if="detailJob" class="rounded-2xl shadow-sm">
+            <UCard v-if="detailJob" class="rounded-xl shadow-xs">
               <template #header>
                 <div class="flex flex-wrap items-start justify-between gap-3">
                   <div class="min-w-0">
