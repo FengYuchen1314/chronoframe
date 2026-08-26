@@ -53,6 +53,9 @@ const isSavingAlbumDates = ref(false)
 const isSavingAlbumIdentity = ref(false)
 const isReorderingAlbums = ref(false)
 const isAlbumDetailReady = ref(false)
+const uploadCompleted = ref(0)
+const uploadTotal = ref(0)
+const uploadCurrentName = ref('')
 const albumError = ref('')
 const photoError = ref('')
 let detailRequestSerial = 0
@@ -106,6 +109,9 @@ const isAlbumInteractionLocked = computed(() =>
 
 const selectedBytes = computed(() =>
   selectedFiles.value.reduce((total, file) => total + file.size, 0),
+)
+const uploadCurrentPosition = computed(() =>
+  Math.min(uploadCompleted.value + 1, uploadTotal.value),
 )
 const allPhotosSelected = computed(() =>
   photos.value.length > 0 && selectedPhotoIds.value.length === photos.value.length,
@@ -632,45 +638,64 @@ const uploadPhotos = async () => {
     return
   }
 
-  const formData = new FormData()
-  for (const file of selectedFiles.value) formData.append('files', file, file.name)
-
   const albumId = selectedAlbumId.value
+  const files = [...selectedFiles.value]
+  const failed: Array<{ file: File, message: string }> = []
+  let uploadedCount = 0
   isUploading.value = true
   isAlbumDetailReady.value = false
+  uploadCompleted.value = 0
+  uploadTotal.value = files.length
   try {
-    const uploaded = await adminFetch<Photo[]>(
-      `/api/albums/${albumId}/photos`,
-      { method: 'POST', body: formData },
-    )
-    clearSelectedFiles()
+    for (const file of files) {
+      uploadCurrentName.value = file.name
+      const formData = new FormData()
+      formData.append('files', file, file.name)
+      try {
+        const uploaded = await adminFetch<Photo[]>(
+          `/api/albums/${albumId}/photos`,
+          { method: 'POST', body: formData },
+        )
+        uploadedCount += uploaded.length
+        const knownIds = new Set(photos.value.map(photo => photo.id))
+        photos.value = [...uploaded.filter(photo => !knownIds.has(photo.id)), ...photos.value]
+      } catch (error) {
+        failed.push({ file, message: getAdminApiErrorMessage(error) })
+      } finally {
+        uploadCompleted.value += 1
+      }
+    }
+
+    selectedFiles.value = failed.map(item => item.file)
+    if (!failed.length && uploadInput.value) uploadInput.value.value = ''
     const refreshed = await refreshAlbums(albumId)
     if (!refreshed) {
       toast.add({
-        title: '图片已上传，但页面刷新失败',
-        description: albumError.value || photoError.value || '请点击刷新，确认相簿的最新状态。',
+        title: uploadedCount ? `已上传 ${uploadedCount} 张，列表同步失败` : '图片列表同步失败',
+        description: albumError.value || photoError.value || '成功项已经保留，请点击刷新确认相簿状态。',
         color: 'warning',
       })
       return
     }
-    toast.add({
-      title: '上传完成',
-      description: `已将 ${uploaded.length} 张图片写入「${selectedAlbum.value?.name || '相簿'}」`,
-      color: 'success',
-    })
-  } catch (error) {
-    const uploadError = getAdminApiErrorMessage(error)
-    clearSelectedFiles()
-    const refreshed = await refreshAlbums(albumId)
-    toast.add({
-      title: refreshed ? '上传请求未确认' : '上传状态无法确认',
-      description: refreshed
-        ? `${uploadError}；已重新同步相簿，请检查图片列表后再决定是否重试。`
-        : `${uploadError}；请先刷新相簿，确认最新状态后再重试。`,
-      color: 'warning',
-    })
+    if (failed.length) {
+      const details = failed.slice(0, 3).map(item => `${item.file.name}：${item.message}`).join('；')
+      toast.add({
+        title: `已上传 ${uploadedCount} 张，${failed.length} 张失败`,
+        description: `${details}${failed.length > 3 ? `；另有 ${failed.length - 3} 张失败` : ''}。失败文件已保留，可直接重试。`,
+        color: uploadedCount ? 'warning' : 'error',
+      })
+    } else {
+      toast.add({
+        title: '上传完成',
+        description: `已将 ${uploadedCount} 张图片写入「${selectedAlbum.value?.name || '相簿'}」`,
+        color: 'success',
+      })
+    }
   } finally {
     isUploading.value = false
+    uploadCurrentName.value = ''
+    uploadCompleted.value = 0
+    uploadTotal.value = 0
   }
 }
 
@@ -840,14 +865,17 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                       <span class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary text-inverted"><Icon name="tabler:cloud-upload" class="size-6" /></span>
                       <div>
                         <p class="font-medium text-highlighted">上传到「{{ selectedAlbum.name }}」</p>
-                        <p class="mt-1 text-xs leading-5 text-muted">PNG、JPG/JPEG、WEBP · 最多 100 张 · 总计 384 MB</p>
+                        <p class="mt-1 text-xs leading-5 text-muted">PNG、JPG/JPEG、WEBP · 不限制单次选择数量和总大小</p>
                       </div>
                     </div>
                     <UButton color="neutral" variant="outline" icon="tabler:photo-plus" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="uploadInput?.click()">选择图片</UButton>
                   </div>
 
                   <div v-if="selectedFiles.length" class="mt-4 flex flex-col gap-3 rounded-xl border border-primary/15 bg-default p-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="flex items-center gap-2 text-sm"><Icon name="tabler:files" class="size-4 text-primary" /><span>已选择 <strong>{{ selectedFiles.length }}</strong> 张，共 {{ formatBytes(selectedBytes) }}</span></div>
+                    <div class="min-w-0 text-sm">
+                      <div class="flex items-center gap-2"><Icon name="tabler:files" class="size-4 shrink-0 text-primary" /><span>已选择 <strong>{{ selectedFiles.length }}</strong> 张，共 {{ formatBytes(selectedBytes) }}</span></div>
+                      <p v-if="isUploading" class="mt-1 truncate pl-6 text-xs text-muted">正在上传 {{ uploadCurrentPosition }} / {{ uploadTotal }}：{{ uploadCurrentName }}</p>
+                    </div>
                     <div class="flex gap-2">
                       <UButton size="sm" color="neutral" variant="ghost" :disabled="hasActiveMutation" @click="clearSelectedFiles">清空</UButton>
                       <UButton size="sm" icon="tabler:upload" :loading="isUploading" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || albumMetadataDirty" @click="uploadPhotos">开始上传</UButton>
