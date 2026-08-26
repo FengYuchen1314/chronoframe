@@ -828,6 +828,10 @@ impl StorageService {
     }
     fn thumbnail_path(&self, photo_id: &str) -> Result<PathBuf> {
         Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
+        Ok(self.thumbnail_cache_dir.join(format!("{photo_id}.png")))
+    }
+    fn legacy_thumbnail_path(&self, photo_id: &str) -> Result<PathBuf> {
+        Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
         Ok(self.thumbnail_cache_dir.join(format!("{photo_id}.webp")))
     }
     async fn cached_thumbnail(&self, photo_id: &str) -> Result<Option<Vec<u8>>> {
@@ -851,16 +855,28 @@ impl StorageService {
                 return Err(error.into());
             }
         }
+        if let Ok(legacy) = self.legacy_thumbnail_path(photo_id)
+            && let Err(error) = tokio::fs::remove_file(legacy).await
+            && error.kind() != ErrorKind::NotFound
+        {
+            warn!(
+                photo_id,
+                "failed to remove legacy WEBP thumbnail: {error:#}"
+            );
+        }
         Ok(())
     }
     async fn remove_cached_thumbnail(&self, photo_id: &str) {
-        let Ok(path) = self.thumbnail_path(photo_id) else {
-            return;
-        };
-        if let Err(error) = tokio::fs::remove_file(path).await
-            && error.kind() != ErrorKind::NotFound
-        {
-            warn!(photo_id, "failed to remove cached thumbnail: {error:#}");
+        let paths = [
+            self.thumbnail_path(photo_id),
+            self.legacy_thumbnail_path(photo_id),
+        ];
+        for path in paths.into_iter().flatten() {
+            if let Err(error) = tokio::fs::remove_file(path).await
+                && error.kind() != ErrorKind::NotFound
+            {
+                warn!(photo_id, "failed to remove cached thumbnail: {error:#}");
+            }
         }
     }
     async fn values(&self) -> Result<HashMap<String, String>> {
@@ -3991,7 +4007,18 @@ async fn upload_photos(
             .map_err(AppError::internal)?;
     }
     tx.commit().await.map_err(AppError::internal)?;
-    Ok(Json(prepared.into_iter().map(|(photo, _)| photo).collect()))
+    let photos = prepared
+        .into_iter()
+        .map(|(photo, _)| photo)
+        .collect::<Vec<_>>();
+    spawn_thumbnail_generation(
+        state.clone(),
+        photos
+            .iter()
+            .map(|photo| (photo.id.clone(), photo.storage_key.clone()))
+            .collect(),
+    );
+    Ok(Json(photos))
 }
 async fn photo_file(
     State(state): State<AppState>,
@@ -4022,6 +4049,120 @@ async fn photo_file(
         .into_response())
 }
 
+async fn ensure_png_thumbnail(
+    state: &AppState,
+    photo_id: &str,
+    storage_key: &str,
+) -> Result<Vec<u8>> {
+    if let Some(thumbnail) = state.storage.cached_thumbnail(photo_id).await? {
+        if image::guess_format(&thumbnail).ok() == Some(ImageFormat::Png) {
+            return Ok(thumbnail);
+        }
+        state.storage.remove_cached_thumbnail(photo_id).await;
+    }
+    let thumbnail_lock = state
+        .storage
+        .thumbnail_locks
+        .entry(photo_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _thumbnail_guard = thumbnail_lock.lock().await;
+    if let Some(thumbnail) = state.storage.cached_thumbnail(photo_id).await? {
+        if image::guess_format(&thumbnail).ok() == Some(ImageFormat::Png) {
+            return Ok(thumbnail);
+        }
+        state.storage.remove_cached_thumbnail(photo_id).await;
+    }
+    let _permit = state
+        .thumbnail_slots
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("缩略图工作池已关闭"))?;
+    let data = {
+        let _storage_guard = state.storage.gate.read().await;
+        state.storage.store().await?.get(storage_key).await?
+    };
+    let thumbnail =
+        tokio::task::spawn_blocking(move || encode_thumbnail(&data, THUMBNAIL_LONGEST_EDGE))
+            .await
+            .context("缩略图编码线程异常")??;
+    let photo_still_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM photos WHERE id=?)")
+            .bind(photo_id)
+            .fetch_one(&state.db)
+            .await?;
+    if !photo_still_exists {
+        bail!("图片已删除，取消写入缩略图");
+    }
+    state.storage.cache_thumbnail(photo_id, &thumbnail).await?;
+    Ok(thumbnail)
+}
+
+async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>) {
+    let total = photos.len();
+    if total == 0 {
+        return;
+    }
+    let outcomes = stream::iter(photos.into_iter().map(|(photo_id, storage_key)| {
+        let state = state.clone();
+        async move {
+            let mut last_error = None;
+            for attempt in 1..=3 {
+                match ensure_png_thumbnail(&state, &photo_id, &storage_key).await {
+                    Ok(_) => return true,
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_secs(1_u64 << (attempt - 1))).await;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = last_error {
+                warn!(
+                    photo_id,
+                    "automatic PNG thumbnail generation deferred: {error:#}"
+                );
+            }
+            false
+        }
+    }))
+    .buffer_unordered(DEFAULT_THUMBNAIL_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let ready = outcomes.into_iter().filter(|success| *success).count();
+    info!(
+        total,
+        ready,
+        failed = total - ready,
+        "automatic PNG thumbnail batch finished"
+    );
+}
+
+fn spawn_thumbnail_generation(state: AppState, photos: Vec<(String, String)>) {
+    tokio::spawn(generate_thumbnail_batch(state, photos));
+}
+
+fn spawn_thumbnail_backfill(state: AppState) {
+    tokio::spawn(async move {
+        let rows = match sqlx::query("SELECT id,storage_key FROM photos ORDER BY created_at,id")
+            .fetch_all(&state.db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!("thumbnail backfill inventory failed: {error:#}");
+                return;
+            }
+        };
+        let photos = rows
+            .iter()
+            .map(|row| (row.get("id"), row.get("storage_key")))
+            .collect();
+        generate_thumbnail_batch(state, photos).await;
+    });
+}
+
 async fn photo_thumbnail(
     State(state): State<AppState>,
     AxumPath(photo_id): AxumPath<String>,
@@ -4036,79 +4177,13 @@ async fn photo_thumbnail(
             message: "图片不存在".into(),
             clear_auth_cookies: None,
         })?;
-    if let Some(thumbnail) = state
-        .storage
-        .cached_thumbnail(&photo_id)
+    let thumbnail = ensure_png_thumbnail(&state, &photo_id, &storage_key)
         .await
-        .map_err(AppError::internal)?
-    {
-        return Ok((
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "image/webp"),
-                (
-                    header::CACHE_CONTROL,
-                    "private, max-age=31536000, immutable",
-                ),
-            ],
-            thumbnail,
-        )
-            .into_response());
-    }
-    let thumbnail_lock = state
-        .storage
-        .thumbnail_locks
-        .entry(photo_id.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    let _thumbnail_guard = thumbnail_lock.lock().await;
-    if let Some(thumbnail) = state
-        .storage
-        .cached_thumbnail(&photo_id)
-        .await
-        .map_err(AppError::internal)?
-    {
-        return Ok((
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "image/webp"),
-                (
-                    header::CACHE_CONTROL,
-                    "private, max-age=31536000, immutable",
-                ),
-            ],
-            thumbnail,
-        )
-            .into_response());
-    }
-    let _permit = state
-        .thumbnail_slots
-        .acquire()
-        .await
-        .map_err(|_| AppError::bad("缩略图工作池已关闭"))?;
-    let data = {
-        let _storage_guard = state.storage.gate.read().await;
-        state
-            .storage
-            .store()
-            .await
-            .map_err(AppError::internal)?
-            .get(&storage_key)
-            .await
-            .map_err(AppError::internal)?
-    };
-    let thumbnail =
-        tokio::task::spawn_blocking(move || encode_thumbnail(&data, THUMBNAIL_LONGEST_EDGE))
-            .await
-            .map_err(AppError::internal)?
-            .map_err(AppError::internal)?;
-    if let Err(error) = state.storage.cache_thumbnail(&photo_id, &thumbnail).await {
-        warn!(photo_id, "thumbnail cache write failed: {error:#}");
-    }
+        .map_err(AppError::internal)?;
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "image/webp"),
+            (header::CONTENT_TYPE, "image/png"),
             (
                 header::CACHE_CONTROL,
                 "private, max-age=31536000, immutable",
@@ -4560,6 +4635,10 @@ async fn convert_one(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    spawn_thumbnail_generation(
+        (*state).clone(),
+        vec![(photo.id.clone(), photo.storage_key.clone())],
+    );
     refresh_job_counts(&state.db, job_id).await
 }
 struct EncodedImage {
@@ -4609,7 +4688,7 @@ fn encode_thumbnail(input: &[u8], longest_edge: u32) -> Result<Vec<u8>> {
         image
     };
     let mut output = Cursor::new(Vec::new());
-    thumbnail.write_to(&mut output, ImageFormat::WebP)?;
+    thumbnail.write_to(&mut output, ImageFormat::Png)?;
     Ok(output.into_inner())
 }
 fn normalize_format(value: &str) -> Option<String> {
@@ -4940,6 +5019,9 @@ async fn main() -> Result<()> {
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
     };
+    // The scan is intentionally scheduled only after startup recovery and state construction.
+    // It backfills pre-existing photos and repairs any thumbnail task interrupted by a restart.
+    spawn_thumbnail_backfill(state.clone());
     let api = Router::new()
         .route("/api/auth/status", get(auth_status))
         .route(
@@ -5088,9 +5170,9 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_is_webp_and_limits_the_longest_edge() {
+    fn thumbnail_is_png_and_limits_the_longest_edge() {
         let thumbnail = encode_thumbnail(&png_fixture(1600, 800), 720).unwrap();
-        assert_eq!(image::guess_format(&thumbnail).unwrap(), ImageFormat::WebP);
+        assert_eq!(image::guess_format(&thumbnail).unwrap(), ImageFormat::Png);
         let decoded = image::load_from_memory(&thumbnail).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (720, 360));
     }
@@ -5106,12 +5188,26 @@ mod tests {
     async fn thumbnail_cache_persists_and_is_removed_with_the_photo() {
         let state = test_state().await;
         let photo_id = Uuid::new_v4().to_string();
-        let expected = b"cached-webp".to_vec();
+        let expected = encode_thumbnail(&png_fixture(64, 48), 720).unwrap();
+        let legacy_path = state.storage.legacy_thumbnail_path(&photo_id).unwrap();
+        tokio::fs::write(&legacy_path, b"legacy-webp")
+            .await
+            .unwrap();
         state
             .storage
             .cache_thumbnail(&photo_id, &expected)
             .await
             .unwrap();
+        assert_eq!(
+            state
+                .storage
+                .thumbnail_path(&photo_id)
+                .unwrap()
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("png")
+        );
+        assert!(!legacy_path.exists());
         assert_eq!(
             state.storage.cached_thumbnail(&photo_id).await.unwrap(),
             Some(expected)

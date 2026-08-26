@@ -37,7 +37,7 @@ export const adaptRustPhoto = (photo: RustPhoto): GalleryPhoto => {
     height,
     aspectRatio: width && height ? width / height : null,
     originalUrl: `/api/photos/${encodeURIComponent(photo.id)}/file`,
-    thumbnailUrl: `/api/photos/${encodeURIComponent(photo.id)}/thumbnail`,
+    thumbnailUrl: `/api/photos/${encodeURIComponent(photo.id)}/thumbnail?v=png1`,
     storageKey: photo.storageKey?.trim() || '',
     tags: Array.isArray(photo.tags) ? photo.tags.filter(Boolean) : [],
     exif: photo.exif ?? null,
