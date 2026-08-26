@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { motion } from 'motion-v'
-import type { RustAlbumDetailPayload } from '~~/shared/types/photo'
+import type { GalleryPhoto, RustAlbumDetailPayload } from '~~/shared/types/photo'
 
 const route = useRoute()
 const router = useRouter()
@@ -18,7 +18,6 @@ const viewer = useViewerState()
 const isMobile = useMediaQuery('(max-width: 768px)')
 const showTop = ref(false)
 const albumPhotos = computed(() => album.value?.photos || [])
-const { isOriginalReady, markThumbnailSettled, pauseBackgroundOriginals } = useGalleryImagePipeline(albumPhotos)
 const items = computed(() => albumPhotos.value.map((photo, index) => ({ id: photo.id, photo, index })))
 const keyMapper = (item: { id: string }) => item.id
 const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
@@ -40,18 +39,74 @@ const createdDate = computed(() => {
     ? formatGalleryCalendarDate(album.value.displayCreatedDate)
     : formatGalleryDate(album.value.createdAt)
 })
+const selectionMode = ref(false)
+const selectedIds = ref(new Set<string>())
+const selectionAnchor = ref<number | null>(null)
+const actionMenu = reactive<{ open: boolean; x: number; y: number; photo: GalleryPhoto | null }>({ open: false, x: 0, y: 0, photo: null })
+const selectedPhotos = computed(() => albumPhotos.value.filter(photo => selectedIds.value.has(photo.id)))
+const replaceSelection = (ids: Iterable<string>) => { selectedIds.value = new Set(ids) }
+const cancelSelection = () => {
+  selectionMode.value = false
+  selectedIds.value = new Set()
+  selectionAnchor.value = null
+}
+const toggleSelection = (index: number, event?: MouseEvent | KeyboardEvent) => {
+  const photo = albumPhotos.value[index]
+  if (!photo) return
+  selectionMode.value = true
+  const next = new Set(selectedIds.value)
+  if (event?.shiftKey && selectionAnchor.value !== null && !isMobile.value) {
+    const start = Math.min(selectionAnchor.value, index)
+    const end = Math.max(selectionAnchor.value, index)
+    for (let current = start; current <= end; current += 1) {
+      const item = albumPhotos.value[current]
+      if (item) next.add(item.id)
+    }
+  } else if (next.has(photo.id)) next.delete(photo.id)
+  else next.add(photo.id)
+  selectionAnchor.value = index
+  replaceSelection(next)
+  if (!next.size) cancelSelection()
+}
+const openActionMenu = (photo: GalleryPhoto | null, x: number, y: number) => Object.assign(actionMenu, { open: true, photo, x, y })
+const enterSelection = (photo: GalleryPhoto | null) => {
+  selectionMode.value = true
+  if (!photo) return
+  const index = albumPhotos.value.findIndex(item => item.id === photo.id)
+  if (index >= 0 && !selectedIds.value.has(photo.id)) toggleSelection(index)
+}
+const selectAll = () => {
+  selectionMode.value = true
+  replaceSelection(albumPhotos.value.map(photo => photo.id))
+}
 
 const openPhoto = (index: number) => {
   const photo = album.value?.photos[index]
   if (!photo || !album.value) return
-  pauseBackgroundOriginals()
   viewer.openViewer(index, `/albums/${album.value.id}`, album.value.photos)
   router.push(`/${photo.id}`)
+}
+const handleActivate = (index: number, event: MouseEvent | KeyboardEvent) => {
+  if (selectionMode.value) toggleSelection(index, event)
+  else openPhoto(index)
+}
+const onEmptyContextMenu = (event: MouseEvent) => {
+  if ((event.target as Element).closest('[data-photo-id]')) return
+  event.preventDefault()
+  openActionMenu(null, event.clientX, event.clientY)
 }
 const onScroll = () => { showTop.value = window.scrollY > 500 }
 const scrollToTop = () => window.scrollTo({ top: 0, behavior: 'smooth' })
 onMounted(() => window.addEventListener('scroll', onScroll, { passive: true }))
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
+useEventListener('keydown', (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && selectionMode.value) cancelSelection()
+})
+watch(() => albumPhotos.value.map(photo => photo.id).join('\u0000'), () => {
+  const available = new Set(albumPhotos.value.map(photo => photo.id))
+  replaceSelection([...selectedIds.value].filter(id => available.has(id)))
+  if (!selectedIds.value.size) selectionMode.value = false
+})
 useHead({ title: computed(() => album.value?.title || t('title.albums')) })
 </script>
 
@@ -81,7 +136,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
         </motion.div>
       </section>
 
-      <section class="container mx-auto px-0.5 pb-10 pt-5 sm:px-4 sm:py-8 lg:px-8">
+      <section class="container mx-auto px-0.5 pb-10 pt-5 sm:px-4 sm:py-8 lg:px-8" @contextmenu="onEmptyContextMenu">
         <div v-if="!items.length" class="grid min-h-64 place-items-center text-center text-neutral-500"><div><Icon name="tabler:library-photo" class="mx-auto mb-3 size-14" /><p>{{ t('album.emptyAlbumTitle') }}</p></div></div>
         <MasonryWall
           v-else
@@ -97,9 +152,11 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
             <MasonryItem
               :photo="item.photo"
               :index="item.index"
-              :show-original="isOriginalReady(item.photo.id)"
-              @thumbnail-settled="markThumbnailSettled"
-              @open-viewer="openPhoto"
+              :selected="selectedIds.has(item.photo.id)"
+              :selection-mode="selectionMode"
+              @activate="handleActivate"
+              @select="toggleSelection"
+              @context-action="openActionMenu"
             />
           </template>
         </MasonryWall>
@@ -113,6 +170,8 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
     <motion.div v-if="showTop" class="album-back-to-top fixed right-4 z-40 sm:right-6" :initial="{ opacity: 0, scale: 0.8 }" :animate="{ opacity: 1, scale: 1 }">
       <UButton icon="tabler:arrow-up" color="neutral" variant="soft" size="lg" class="rounded-full bg-white/80 shadow-lg backdrop-blur dark:bg-neutral-900/80" @click="scrollToTop" />
     </motion.div>
+    <PhotoActionMenu :open="actionMenu.open" :x="actionMenu.x" :y="actionMenu.y" :photo="actionMenu.photo" allow-select @close="actionMenu.open = false" @select="enterSelection" />
+    <PhotoBulkActionBar :selected="selectedPhotos" :all-count="albumPhotos.length" @cancel="cancelSelection" @select-all="selectAll" />
   </main>
 </template>
 

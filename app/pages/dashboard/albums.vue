@@ -878,7 +878,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                       <span class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary text-inverted"><Icon name="tabler:cloud-upload" class="size-6" /></span>
                       <div>
                         <p class="font-medium text-highlighted">上传到「{{ selectedAlbum.name }}」</p>
-                        <p class="mt-1 text-xs leading-5 text-muted">PNG、JPG/JPEG、WEBP · 不限制单次选择数量和总大小</p>
+                        <p class="mt-1 text-xs leading-5 text-muted">PNG、JPG/JPEG、WEBP · 7 路上传，入库后立即并发生成三层浏览图</p>
                       </div>
                     </div>
                     <UButton color="neutral" variant="outline" icon="tabler:photo-plus" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="uploadInput?.click()">选择图片</UButton>
@@ -920,7 +920,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                   <div v-else-if="photos.length" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
                     <div v-for="photo in photos" :key="photo.id" class="group relative min-w-0 overflow-hidden rounded-xl border bg-elevated transition" :class="selectedPhotoIds.includes(photo.id) ? 'border-primary ring-2 ring-primary/20' : 'border-default hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md'">
                       <a :href="`/api/photos/${photo.id}/file`" target="_blank" rel="noopener noreferrer" :class="isSelectingPhotos ? 'pointer-events-none' : ''">
-                        <div class="aspect-square overflow-hidden bg-muted"><img :src="`/api/photos/${photo.id}/thumbnail?v=png1`" :alt="photo.originalName" loading="lazy" class="size-full object-cover transition duration-300 group-hover:scale-105" /></div>
+                        <div class="aspect-square overflow-hidden bg-muted"><img :src="`/api/photos/${photo.id}/thumbnail?v=grid2`" :alt="photo.originalName" loading="lazy" class="size-full object-cover transition duration-300 group-hover:scale-105" /></div>
                         <div class="p-2.5"><p class="truncate text-sm font-medium text-highlighted" :title="photo.originalName">{{ photo.originalName }}</p><p class="mt-1 flex items-center justify-between gap-2 text-xs text-muted"><span>{{ photo.format.toUpperCase() }}</span><span>{{ formatBytes(photo.byteSize) }}</span></p></div>
                       </a>
                       <button v-if="isSelectingPhotos" type="button" class="absolute inset-0 cursor-pointer text-left" :aria-label="`${selectedPhotoIds.includes(photo.id) ? '取消选择' : '选择'} ${photo.originalName}`" @click="togglePhotoSelection(photo.id)">

@@ -85,7 +85,11 @@ const DEFAULT_UPLOAD_CONCURRENCY: usize = 7;
 const DEFAULT_CONVERSION_CONCURRENCY: usize = 7;
 const DEFAULT_SOURCE_DELETE_CONCURRENCY: usize = 7;
 const DEFAULT_THUMBNAIL_CONCURRENCY: usize = 7;
-const THUMBNAIL_LONGEST_EDGE: u32 = 720;
+const GRID_THUMBNAIL_LONGEST_EDGE: u32 = 320;
+const VIEW_PREVIEW_LONGEST_EDGE: u32 = 2560;
+const VIEW_PREVIEW_MAX_BYTES: usize = 1_500_000;
+const VIEW_HIGH_LONGEST_EDGE: u32 = 4096;
+const VIEW_HIGH_MAX_BYTES: usize = 5_000_000;
 const SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SESSION_COOKIE: &str = "cf_session";
 const CSRF_COOKIE: &str = "cf_csrf";
@@ -620,6 +624,30 @@ struct StorageService {
     cache: SharedStoreCache,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageDerivative {
+    Grid,
+    Preview,
+    High,
+}
+
+impl ImageDerivative {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Grid => "grid.png",
+            Self::Preview => "preview.webp",
+            Self::High => "high.webp",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Grid => "image/png",
+            Self::Preview | Self::High => "image/webp",
+        }
+    }
+}
+
 type SharedStoreCache = Arc<tokio::sync::RwLock<Option<(String, Arc<dyn BlobStore>)>>>;
 
 #[derive(Clone, Deserialize)]
@@ -830,28 +858,53 @@ impl StorageService {
             cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
+    fn derivative_path(&self, photo_id: &str, derivative: ImageDerivative) -> Result<PathBuf> {
+        Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
+        Ok(self
+            .thumbnail_cache_dir
+            .join(format!("{photo_id}.{}", derivative.suffix())))
+    }
+    #[cfg(test)]
     fn thumbnail_path(&self, photo_id: &str) -> Result<PathBuf> {
-        Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
-        Ok(self.thumbnail_cache_dir.join(format!("{photo_id}.png")))
+        self.derivative_path(photo_id, ImageDerivative::Grid)
     }
-    fn legacy_thumbnail_path(&self, photo_id: &str) -> Result<PathBuf> {
+    fn legacy_thumbnail_paths(&self, photo_id: &str) -> Result<[PathBuf; 2]> {
         Uuid::parse_str(photo_id).context("缩略图图片 ID 无效")?;
-        Ok(self.thumbnail_cache_dir.join(format!("{photo_id}.webp")))
+        Ok([
+            self.thumbnail_cache_dir.join(format!("{photo_id}.png")),
+            self.thumbnail_cache_dir.join(format!("{photo_id}.webp")),
+        ])
     }
-    async fn cached_thumbnail(&self, photo_id: &str) -> Result<Option<Vec<u8>>> {
-        let path = self.thumbnail_path(photo_id)?;
+    async fn cached_derivative(
+        &self,
+        photo_id: &str,
+        derivative: ImageDerivative,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.derivative_path(photo_id, derivative)?;
         match tokio::fs::read(path).await {
             Ok(data) => Ok(Some(data)),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
-    async fn cache_thumbnail(&self, photo_id: &str, data: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    async fn cached_thumbnail(&self, photo_id: &str) -> Result<Option<Vec<u8>>> {
+        self.cached_derivative(photo_id, ImageDerivative::Grid)
+            .await
+    }
+    async fn cache_derivative(
+        &self,
+        photo_id: &str,
+        derivative: ImageDerivative,
+        data: &[u8],
+    ) -> Result<()> {
         tokio::fs::create_dir_all(self.thumbnail_cache_dir.as_ref()).await?;
-        let destination = self.thumbnail_path(photo_id)?;
-        let temporary = self
-            .thumbnail_cache_dir
-            .join(format!(".{photo_id}.{}.tmp", Uuid::new_v4()));
+        let destination = self.derivative_path(photo_id, derivative)?;
+        let temporary = self.thumbnail_cache_dir.join(format!(
+            ".{photo_id}.{}.{}.tmp",
+            derivative.suffix(),
+            Uuid::new_v4()
+        ));
         tokio::fs::write(&temporary, data).await?;
         if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
             let _ = tokio::fs::remove_file(&temporary).await;
@@ -859,23 +912,37 @@ impl StorageService {
                 return Err(error.into());
             }
         }
-        if let Ok(legacy) = self.legacy_thumbnail_path(photo_id)
-            && let Err(error) = tokio::fs::remove_file(legacy).await
-            && error.kind() != ErrorKind::NotFound
+        if derivative == ImageDerivative::Grid
+            && let Ok(legacy_paths) = self.legacy_thumbnail_paths(photo_id)
         {
-            warn!(
-                photo_id,
-                "failed to remove legacy WEBP thumbnail: {error:#}"
-            );
+            for legacy in legacy_paths {
+                if let Err(error) = tokio::fs::remove_file(legacy).await
+                    && error.kind() != ErrorKind::NotFound
+                {
+                    warn!(photo_id, "failed to remove legacy thumbnail: {error:#}");
+                }
+            }
         }
         Ok(())
     }
+    #[cfg(test)]
+    async fn cache_thumbnail(&self, photo_id: &str, data: &[u8]) -> Result<()> {
+        self.cache_derivative(photo_id, ImageDerivative::Grid, data)
+            .await
+    }
     async fn remove_cached_thumbnail(&self, photo_id: &str) {
-        let paths = [
-            self.thumbnail_path(photo_id),
-            self.legacy_thumbnail_path(photo_id),
-        ];
-        for path in paths.into_iter().flatten() {
+        let mut paths = [
+            ImageDerivative::Grid,
+            ImageDerivative::Preview,
+            ImageDerivative::High,
+        ]
+        .into_iter()
+        .filter_map(|derivative| self.derivative_path(photo_id, derivative).ok())
+        .collect::<Vec<_>>();
+        if let Ok(legacy_paths) = self.legacy_thumbnail_paths(photo_id) {
+            paths.extend(legacy_paths);
+        }
+        for path in paths {
             if let Err(error) = tokio::fs::remove_file(path).await
                 && error.kind() != ErrorKind::NotFound
             {
@@ -4120,17 +4187,42 @@ async fn photo_file(
         .into_response())
 }
 
-async fn ensure_png_thumbnail(
+fn derivative_bytes_are_valid(data: &[u8], derivative: ImageDerivative) -> bool {
+    let expected = match derivative {
+        ImageDerivative::Grid => ImageFormat::Png,
+        ImageDerivative::Preview | ImageDerivative::High => ImageFormat::WebP,
+    };
+    image::guess_format(data).ok() == Some(expected)
+}
+
+async fn cached_valid_derivative(
+    state: &AppState,
+    photo_id: &str,
+    derivative: ImageDerivative,
+) -> Result<Option<Vec<u8>>> {
+    match state
+        .storage
+        .cached_derivative(photo_id, derivative)
+        .await?
+    {
+        Some(data) if derivative_bytes_are_valid(&data, derivative) => Ok(Some(data)),
+        Some(_) => {
+            state.storage.remove_cached_thumbnail(photo_id).await;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+async fn ensure_image_derivative(
     state: &AppState,
     photo_id: &str,
     storage_key: &str,
+    derivative: ImageDerivative,
 ) -> Result<Vec<u8>> {
     let _maintenance_guard = state.storage.thumbnail_maintenance_gate.read().await;
-    if let Some(thumbnail) = state.storage.cached_thumbnail(photo_id).await? {
-        if image::guess_format(&thumbnail).ok() == Some(ImageFormat::Png) {
-            return Ok(thumbnail);
-        }
-        state.storage.remove_cached_thumbnail(photo_id).await;
+    if let Some(data) = cached_valid_derivative(state, photo_id, derivative).await? {
+        return Ok(data);
     }
     let thumbnail_lock = state
         .storage
@@ -4139,11 +4231,8 @@ async fn ensure_png_thumbnail(
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _thumbnail_guard = thumbnail_lock.lock().await;
-    if let Some(thumbnail) = state.storage.cached_thumbnail(photo_id).await? {
-        if image::guess_format(&thumbnail).ok() == Some(ImageFormat::Png) {
-            return Ok(thumbnail);
-        }
-        state.storage.remove_cached_thumbnail(photo_id).await;
+    if let Some(data) = cached_valid_derivative(state, photo_id, derivative).await? {
+        return Ok(data);
     }
     let _permit = state
         .thumbnail_slots
@@ -4154,20 +4243,95 @@ async fn ensure_png_thumbnail(
         let _storage_guard = state.storage.gate.read().await;
         state.storage.store().await?.get(storage_key).await?
     };
-    let thumbnail =
-        tokio::task::spawn_blocking(move || encode_thumbnail(&data, THUMBNAIL_LONGEST_EDGE))
-            .await
-            .context("缩略图编码线程异常")??;
+    let encoded = tokio::task::spawn_blocking(move || encode_derivative(&data, derivative))
+        .await
+        .context("图片派生版本编码线程异常")??;
     let photo_still_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM photos WHERE id=?)")
             .bind(photo_id)
             .fetch_one(&state.db)
             .await?;
     if !photo_still_exists {
-        bail!("图片已删除，取消写入缩略图");
+        bail!("图片已删除，取消写入派生版本");
     }
-    state.storage.cache_thumbnail(photo_id, &thumbnail).await?;
-    Ok(thumbnail)
+    state
+        .storage
+        .cache_derivative(photo_id, derivative, &encoded)
+        .await?;
+    Ok(encoded)
+}
+
+async fn ensure_all_image_derivatives(
+    state: &AppState,
+    photo_id: &str,
+    storage_key: &str,
+) -> Result<()> {
+    let _maintenance_guard = state.storage.thumbnail_maintenance_gate.read().await;
+    let derivatives = [
+        ImageDerivative::Grid,
+        ImageDerivative::Preview,
+        ImageDerivative::High,
+    ];
+    let mut all_ready = true;
+    for derivative in derivatives {
+        if cached_valid_derivative(state, photo_id, derivative)
+            .await?
+            .is_none()
+        {
+            all_ready = false;
+            break;
+        }
+    }
+    if all_ready {
+        return Ok(());
+    }
+    let thumbnail_lock = state
+        .storage
+        .thumbnail_locks
+        .entry(photo_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _thumbnail_guard = thumbnail_lock.lock().await;
+    let mut all_ready = true;
+    for derivative in derivatives {
+        if cached_valid_derivative(state, photo_id, derivative)
+            .await?
+            .is_none()
+        {
+            all_ready = false;
+            break;
+        }
+    }
+    if all_ready {
+        return Ok(());
+    }
+    let _permit = state
+        .thumbnail_slots
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("图片派生版本工作池已关闭"))?;
+    let data = {
+        let _storage_guard = state.storage.gate.read().await;
+        state.storage.store().await?.get(storage_key).await?
+    };
+    let encoded = tokio::task::spawn_blocking(move || encode_all_derivatives(&data))
+        .await
+        .context("图片三层派生版本编码线程异常")??;
+    let photo_still_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM photos WHERE id=?)")
+            .bind(photo_id)
+            .fetch_one(&state.db)
+            .await?;
+    if !photo_still_exists {
+        bail!("图片已删除，取消写入派生版本");
+    }
+    for (derivative, data) in encoded {
+        state
+            .storage
+            .cache_derivative(photo_id, derivative, &data)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>) {
@@ -4180,8 +4344,8 @@ async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>
         async move {
             let mut last_error = None;
             for attempt in 1..=3 {
-                match ensure_png_thumbnail(&state, &photo_id, &storage_key).await {
-                    Ok(_) => return true,
+                match ensure_all_image_derivatives(&state, &photo_id, &storage_key).await {
+                    Ok(()) => return true,
                     Err(error) => {
                         last_error = Some(error);
                         if attempt < 3 {
@@ -4193,7 +4357,7 @@ async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>
             if let Some(error) = last_error {
                 warn!(
                     photo_id,
-                    "automatic PNG thumbnail generation deferred: {error:#}"
+                    "automatic three-tier image generation deferred: {error:#}"
                 );
             }
             false
@@ -4207,7 +4371,7 @@ async fn generate_thumbnail_batch(state: AppState, photos: Vec<(String, String)>
         total,
         ready,
         failed = total - ready,
-        "automatic PNG thumbnail batch finished"
+        "automatic three-tier image batch finished"
     );
 }
 
@@ -4321,8 +4485,8 @@ async fn process_thumbnail_rebuild_item(
     }
     let mut last_error = None;
     for attempt in 1..=3 {
-        match ensure_png_thumbnail(&state, &photo_id, &storage_key).await {
-            Ok(_) => {
+        match ensure_all_image_derivatives(&state, &photo_id, &storage_key).await {
+            Ok(()) => {
                 return finish_thumbnail_rebuild_item(&state, &job_id, &item_id, "succeeded", None)
                     .await;
             }
@@ -4677,7 +4841,7 @@ async fn photo_thumbnail(
             message: "图片不存在".into(),
             clear_auth_cookies: None,
         })?;
-    let thumbnail = ensure_png_thumbnail(&state, &photo_id, &storage_key)
+    let thumbnail = ensure_image_derivative(&state, &photo_id, &storage_key, ImageDerivative::Grid)
         .await
         .map_err(AppError::internal)?;
     Ok((
@@ -4692,6 +4856,279 @@ async fn photo_thumbnail(
         thumbnail,
     )
         .into_response())
+}
+
+async fn photo_derivative_response(
+    state: AppState,
+    photo_id: String,
+    derivative: ImageDerivative,
+) -> ApiResult<Response> {
+    let storage_key: String = sqlx::query_scalar("SELECT storage_key FROM photos WHERE id=?")
+        .bind(&photo_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "图片不存在".into(),
+            clear_auth_cookies: None,
+        })?;
+    let data = ensure_image_derivative(&state, &photo_id, &storage_key, derivative)
+        .await
+        .map_err(AppError::internal)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, derivative.content_type()),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            ),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+async fn photo_preview(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+) -> ApiResult<Response> {
+    photo_derivative_response(state, photo_id, ImageDerivative::Preview).await
+}
+
+async fn photo_high(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+) -> ApiResult<Response> {
+    photo_derivative_response(state, photo_id, ImageDerivative::High).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhotoRenderQuery {
+    format: Option<String>,
+    download: Option<bool>,
+}
+
+fn exported_photo_name(original_name: &str, format: &str) -> String {
+    let safe = sanitize_export_name(original_name, "photo");
+    let stem = Path::new(&safe)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("photo");
+    format!("{stem}.{}", if format == "jpg" { "jpg" } else { format })
+}
+
+async fn photo_render(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+    Query(query): Query<PhotoRenderQuery>,
+) -> ApiResult<Response> {
+    let row = sqlx::query("SELECT original_name,storage_key FROM photos WHERE id=?")
+        .bind(&photo_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "图片不存在".into(),
+            clear_auth_cookies: None,
+        })?;
+    let target = normalize_format(query.format.as_deref().unwrap_or("webp"))
+        .ok_or_else(|| AppError::bad("导出格式仅支持 PNG、JPG/JPEG、WEBP"))?;
+    let high = ensure_image_derivative(
+        &state,
+        &photo_id,
+        &row.get::<String, _>("storage_key"),
+        ImageDerivative::High,
+    )
+    .await
+    .map_err(AppError::internal)?;
+    let _conversion_permit = timeout(
+        Duration::from_secs(5),
+        state.conversion_slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| AppError::too_many("当前图片导出较多，请稍后重试"))?
+    .map_err(|_| AppError::internal(anyhow!("image export queue closed")))?;
+    let target_for_worker = target.clone();
+    let data =
+        tokio::task::spawn_blocking(move || convert_webp_derivative(&high, &target_for_worker))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(AppError::internal)?;
+    let filename = exported_photo_name(&row.get::<String, _>("original_name"), &target);
+    let disposition = if query.download.unwrap_or(false) {
+        "attachment"
+    } else {
+        "inline"
+    };
+    let mut response = Response::new(Body::from(data));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(mime_for(&target)),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "{disposition}; filename=\"photo.{}\"; filename*=UTF-8''{}",
+            if target == "jpg" { "jpg" } else { &target },
+            urlencoding::encode(&filename)
+        ))
+        .map_err(AppError::internal)?,
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PhotoExportRequest {
+    photo_ids: Vec<String>,
+    format: String,
+}
+
+async fn export_photos(
+    State(state): State<AppState>,
+    Json(input): Json<PhotoExportRequest>,
+) -> ApiResult<Response> {
+    let target = normalize_format(&input.format)
+        .ok_or_else(|| AppError::bad("导出格式仅支持 PNG、JPG/JPEG、WEBP"))?;
+    if input.photo_ids.is_empty() {
+        return Err(AppError::bad("请至少选择一张图片"));
+    }
+    if input.photo_ids.len() > 500 {
+        return Err(AppError::bad("一次最多打包 500 张图片"));
+    }
+    let unique_ids = input.photo_ids.iter().cloned().collect::<HashSet<_>>();
+    if unique_ids.len() != input.photo_ids.len() {
+        return Err(AppError::bad("图片选择中存在重复项"));
+    }
+    let mut photos = Vec::with_capacity(input.photo_ids.len());
+    for photo_id in &input.photo_ids {
+        let row = sqlx::query("SELECT id,original_name,storage_key FROM photos WHERE id=?")
+            .bind(photo_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("图片不存在：{photo_id}"),
+                clear_auth_cookies: None,
+            })?;
+        photos.push((
+            row.get::<String, _>("id"),
+            row.get::<String, _>("original_name"),
+            row.get::<String, _>("storage_key"),
+        ));
+    }
+    let export_permit = timeout(
+        Duration::from_secs(5),
+        state.export_slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| AppError::too_many("当前打包任务较多，请稍后重试"))?
+    .map_err(|_| AppError::internal(anyhow!("photo export queue closed")))?;
+    let temporary_dir = std::env::temp_dir().join(format!("chronoframe-photos-{}", Uuid::new_v4()));
+    let mut temporary_guard = ExportTempGuard::new(temporary_dir.clone());
+    let build_result: Result<PathBuf> = async {
+        tokio::fs::create_dir(&temporary_dir).await?;
+        let results = stream::iter(photos.into_iter().enumerate().map(
+            |(index, (photo_id, original_name, storage_key))| {
+                let state = state.clone();
+                let target = target.clone();
+                let temporary_dir = temporary_dir.clone();
+                async move {
+                    let high = ensure_image_derivative(
+                        &state,
+                        &photo_id,
+                        &storage_key,
+                        ImageDerivative::High,
+                    )
+                    .await?;
+                    let _conversion_permit = state
+                        .conversion_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow!("图片导出工作池已关闭"))?;
+                    let worker_target = target.clone();
+                    let data = tokio::task::spawn_blocking(move || {
+                        convert_webp_derivative(&high, &worker_target)
+                    })
+                    .await
+                    .context("图片导出编码线程异常")??;
+                    let source_path = temporary_dir.join(format!("{index}.blob"));
+                    tokio::fs::write(&source_path, data).await?;
+                    Ok::<(usize, PathBuf, String), anyhow::Error>((
+                        index,
+                        source_path,
+                        exported_photo_name(&original_name, &target),
+                    ))
+                }
+            },
+        ))
+        .buffer_unordered(DEFAULT_UPLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        let mut results = results;
+        results.sort_by_key(|item| item.0);
+        let mut used_names = HashSet::new();
+        let prepared = results
+            .into_iter()
+            .map(|(_, source_path, name)| PreparedArchivePhoto {
+                source_path,
+                archive_name: unique_export_name(name, &mut used_names),
+            })
+            .collect::<Vec<_>>();
+        let archive_path = temporary_dir.join("chronoframe-selected-photos.zip");
+        tokio::task::spawn_blocking({
+            let archive_path = archive_path.clone();
+            move || write_album_zip(&archive_path, &prepared)
+        })
+        .await
+        .context("多选图片打包线程异常")??;
+        Ok(archive_path)
+    }
+    .await;
+    drop(export_permit);
+    let archive_path = build_result.map_err(AppError::internal)?;
+    let archive_size = tokio::fs::metadata(&archive_path)
+        .await
+        .map_err(AppError::internal)?
+        .len();
+    let archive = tokio::fs::File::open(&archive_path)
+        .await
+        .map_err(AppError::internal)?;
+    let stream = CleanupFileStream {
+        inner: ReaderStream::new(archive),
+        cleanup_dir: Some(temporary_guard.take()),
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&archive_size.to_string()).map_err(AppError::internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"chronoframe-selected-photos.zip\""),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -5168,27 +5605,138 @@ fn encode_image(input: &[u8], target: &str) -> Result<EncodedImage> {
     })
 }
 
-fn encode_thumbnail(input: &[u8], longest_edge: u32) -> Result<Vec<u8>> {
-    if longest_edge == 0 {
-        bail!("thumbnail edge must be positive");
-    }
-    let image = image::load_from_memory(input)?;
+fn resize_to_longest_edge(image: &image::DynamicImage, longest_edge: u32) -> image::DynamicImage {
     let width = image.width();
     let height = image.height();
     let longest = width.max(height);
-    let thumbnail = if longest > longest_edge {
-        let target_width = ((width as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
-        let target_height = ((height as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
-        image.resize_exact(
-            target_width,
-            target_height,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        image
-    };
+    if longest <= longest_edge {
+        return image.clone();
+    }
+    let target_width = ((width as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
+    let target_height = ((height as u64 * longest_edge as u64) / longest as u64).max(1) as u32;
+    image.resize_exact(
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
+fn encode_png_thumbnail_from_image(
+    image: &image::DynamicImage,
+    longest_edge: u32,
+) -> Result<Vec<u8>> {
+    if longest_edge == 0 {
+        bail!("thumbnail edge must be positive");
+    }
+    let thumbnail = resize_to_longest_edge(image, longest_edge);
     let mut output = Cursor::new(Vec::new());
     thumbnail.write_to(&mut output, ImageFormat::Png)?;
+    Ok(output.into_inner())
+}
+
+#[cfg(test)]
+fn encode_thumbnail(input: &[u8], longest_edge: u32) -> Result<Vec<u8>> {
+    let image = image::load_from_memory(input)?;
+    encode_png_thumbnail_from_image(&image, longest_edge)
+}
+
+fn encode_limited_webp_from_image(
+    image: &image::DynamicImage,
+    longest_edge: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if longest_edge == 0 || max_bytes < 1024 {
+        bail!("invalid WebP derivative limits");
+    }
+    let mut resized = resize_to_longest_edge(image, longest_edge);
+    let qualities = [
+        92.0_f32, 86.0, 80.0, 74.0, 68.0, 60.0, 52.0, 44.0, 36.0, 28.0,
+    ];
+    let mut smallest = Vec::new();
+    for _ in 0..12 {
+        let rgba = resized.to_rgba8();
+        for quality in qualities {
+            let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode(quality)
+                .to_vec();
+            if smallest.is_empty() || encoded.len() < smallest.len() {
+                smallest = encoded.clone();
+            }
+            if encoded.len() <= max_bytes {
+                return Ok(encoded);
+            }
+        }
+        if resized.width() <= 2 && resized.height() <= 2 {
+            break;
+        }
+        let next_width = ((resized.width() as f32 * 0.82).round() as u32).max(1);
+        let next_height = ((resized.height() as f32 * 0.82).round() as u32).max(1);
+        resized = resized.resize_exact(
+            next_width,
+            next_height,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    if smallest.len() <= max_bytes {
+        Ok(smallest)
+    } else {
+        bail!("无法把 WebP 派生图压缩到 {} 字节以内", max_bytes)
+    }
+}
+
+fn encode_derivative(input: &[u8], derivative: ImageDerivative) -> Result<Vec<u8>> {
+    let image = image::load_from_memory(input)?;
+    match derivative {
+        ImageDerivative::Grid => {
+            encode_png_thumbnail_from_image(&image, GRID_THUMBNAIL_LONGEST_EDGE)
+        }
+        ImageDerivative::Preview => encode_limited_webp_from_image(
+            &image,
+            VIEW_PREVIEW_LONGEST_EDGE,
+            VIEW_PREVIEW_MAX_BYTES,
+        ),
+        ImageDerivative::High => {
+            encode_limited_webp_from_image(&image, VIEW_HIGH_LONGEST_EDGE, VIEW_HIGH_MAX_BYTES)
+        }
+    }
+}
+
+fn encode_all_derivatives(input: &[u8]) -> Result<Vec<(ImageDerivative, Vec<u8>)>> {
+    let image = image::load_from_memory(input)?;
+    Ok(vec![
+        (
+            ImageDerivative::Grid,
+            encode_png_thumbnail_from_image(&image, GRID_THUMBNAIL_LONGEST_EDGE)?,
+        ),
+        (
+            ImageDerivative::Preview,
+            encode_limited_webp_from_image(
+                &image,
+                VIEW_PREVIEW_LONGEST_EDGE,
+                VIEW_PREVIEW_MAX_BYTES,
+            )?,
+        ),
+        (
+            ImageDerivative::High,
+            encode_limited_webp_from_image(&image, VIEW_HIGH_LONGEST_EDGE, VIEW_HIGH_MAX_BYTES)?,
+        ),
+    ])
+}
+
+fn convert_webp_derivative(input: &[u8], target: &str) -> Result<Vec<u8>> {
+    if target == "webp" {
+        return Ok(input.to_vec());
+    }
+    let image = image::load_from_memory_with_format(input, ImageFormat::WebP)?;
+    let mut output = Cursor::new(Vec::new());
+    match target {
+        "png" => image.write_to(&mut output, ImageFormat::Png)?,
+        "jpg" => {
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 92);
+            encoder.encode_image(&image)?;
+        }
+        _ => bail!("invalid export format"),
+    }
     Ok(output.into_inner())
 }
 fn normalize_format(value: &str) -> Option<String> {
@@ -5591,10 +6139,14 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/api/photos", get(list_photos))
+        .route("/api/photos/export", post(export_photos))
         .route("/api/photos/delete", post(delete_photos))
         .route("/api/photos/{photo_id}", delete(delete_photo))
         .route("/api/photos/{photo_id}/file", get(photo_file))
         .route("/api/photos/{photo_id}/thumbnail", get(photo_thumbnail))
+        .route("/api/photos/{photo_id}/preview", get(photo_preview))
+        .route("/api/photos/{photo_id}/high", get(photo_high))
+        .route("/api/photos/{photo_id}/render", get(photo_render))
         .route(
             "/api/thumbnails/rebuilds/latest",
             get(latest_thumbnail_rebuild),
@@ -5716,15 +6268,25 @@ mod tests {
         let state = test_state().await;
         let photo_id = Uuid::new_v4().to_string();
         let expected = encode_thumbnail(&png_fixture(64, 48), 720).unwrap();
-        let legacy_path = state.storage.legacy_thumbnail_path(&photo_id).unwrap();
-        tokio::fs::write(&legacy_path, b"legacy-webp")
-            .await
-            .unwrap();
+        let legacy_paths = state.storage.legacy_thumbnail_paths(&photo_id).unwrap();
+        for legacy_path in &legacy_paths {
+            tokio::fs::write(legacy_path, b"legacy-thumbnail")
+                .await
+                .unwrap();
+        }
         state
             .storage
             .cache_thumbnail(&photo_id, &expected)
             .await
             .unwrap();
+        let derivatives = encode_all_derivatives(&png_fixture(640, 480)).unwrap();
+        for (derivative, data) in derivatives {
+            state
+                .storage
+                .cache_derivative(&photo_id, derivative, &data)
+                .await
+                .unwrap();
+        }
         assert_eq!(
             state
                 .storage
@@ -5734,16 +6296,76 @@ mod tests {
                 .and_then(|extension| extension.to_str()),
             Some("png")
         );
-        assert!(!legacy_path.exists());
-        assert_eq!(
-            state.storage.cached_thumbnail(&photo_id).await.unwrap(),
-            Some(expected)
+        assert!(legacy_paths.iter().all(|path| !path.exists()));
+        assert!(
+            state
+                .storage
+                .cached_thumbnail(&photo_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .storage
+                .cached_derivative(&photo_id, ImageDerivative::Preview)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .storage
+                .cached_derivative(&photo_id, ImageDerivative::High)
+                .await
+                .unwrap()
+                .is_some()
         );
         state.storage.remove_cached_thumbnail(&photo_id).await;
         assert_eq!(
             state.storage.cached_thumbnail(&photo_id).await.unwrap(),
             None
         );
+        assert!(
+            state
+                .storage
+                .cached_derivative(&photo_id, ImageDerivative::Preview)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .storage
+                .cached_derivative(&photo_id, ImageDerivative::High)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn three_derivatives_have_expected_formats_dimensions_and_size_caps() {
+        let source = png_fixture(3200, 1800);
+        let derivatives = encode_all_derivatives(&source).unwrap();
+        assert_eq!(derivatives.len(), 3);
+        for (kind, data) in derivatives {
+            match kind {
+                ImageDerivative::Grid => {
+                    assert_eq!(image::guess_format(&data).unwrap(), ImageFormat::Png);
+                    let decoded = image::load_from_memory(&data).unwrap();
+                    assert_eq!((decoded.width(), decoded.height()), (320, 180));
+                }
+                ImageDerivative::Preview => {
+                    assert_eq!(image::guess_format(&data).unwrap(), ImageFormat::WebP);
+                    assert!(data.len() <= VIEW_PREVIEW_MAX_BYTES);
+                }
+                ImageDerivative::High => {
+                    assert_eq!(image::guess_format(&data).unwrap(), ImageFormat::WebP);
+                    assert!(data.len() <= VIEW_HIGH_MAX_BYTES);
+                }
+            }
+        }
     }
 
     #[test]
