@@ -17,6 +17,7 @@ const headerColumnWidth = ref(280)
 const gap = 4
 
 const displayPhotos = computed(() => hasActiveFilters.value ? filteredPhotos.value : sortedPhotos.value)
+const { isOriginalReady, markThumbnailSettled, prioritizeAround } = useGalleryImagePipeline(displayPhotos)
 const items = computed(() => displayPhotos.value.map((photo, index) => ({ photo, index, id: photo.id })))
 const keyMapper = (item: { id: string }) => item.id
 const columnWidth = computed(() => 280)
@@ -52,6 +53,7 @@ const dateRangeText = computed(() => {
 const openPhoto = (index: number) => {
   const photo = displayPhotos.value[index]
   if (!photo) return
+  prioritizeAround(index)
   viewer.openViewer(index, '/photos', displayPhotos.value)
   router.push(`/${photo.id}`)
 }
@@ -101,7 +103,13 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
           :key-mapper="keyMapper"
         >
           <template #default="{ item }">
-            <MasonryItem :photo="item.photo" :index="item.index" @open-viewer="openPhoto" />
+            <MasonryItem
+              :photo="item.photo"
+              :index="item.index"
+              :show-original="isOriginalReady(item.photo.id)"
+              @thumbnail-settled="markThumbnailSettled"
+              @open-viewer="openPhoto"
+            />
           </template>
         </MasonryWall>
       </div>
