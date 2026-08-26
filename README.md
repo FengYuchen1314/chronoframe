@@ -101,6 +101,8 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 迁移本地存储时，目标路径必须位于 Compose 持久化卷内，例如 `/app/data/storage-new`；如果填写 `/app/data` 之外的路径，容器重建后该位置不会保留。
 
+当前活动存储为 S3/R2 时，存储中心还提供“旧空间回收”：系统只分页扫描当前配置前缀下的 `albums/` 对象，不会触碰同一桶里的其他目录。数据库仍引用的母本、上传暂存账本、图片删除 outbox 和旧格式删除 outbox 会组成保护集合；最近 24 小时的对象也会进入宽限期。扫描结果只展示孤儿对象数量和预计可释放容量，不会自动删除；管理员二次确认后才以 8 并发后台清理，并在每次删除前重新核对保护集合。任务可离开页面、安全中断、继续，服务重启会标记为可恢复的中断状态。S3 凭据除读写对象外还需要 `ListBucket`（列出对象）和删除对象权限。
+
 ## 相簿打包下载与站点自定义
 
 管理员可在“相簿”页独立勾选一个或多个相簿并下载：只选一个时，ZIP 内直接放置该相簿的图片；选择多个时，下载一个外层 ZIP，每个所选相簿在其中对应一个独立 ZIP。重名文件和重名相簿会自动追加序号，文件名会过滤路径分隔符和不安全字符。
@@ -147,11 +149,13 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `GET/POST /api/storage-migrations` — 查看迁移进度或以新的存储配置开始迁移
 - `POST /api/storage-migrations/:job_id/resume`、`POST /api/storage-migrations/:job_id/cancel`
 - `POST /api/storage-migrations/:job_id/cleanup`、`POST /api/storage-migrations/:job_id/retain` — 删除或保留旧存储图片
+- `GET /api/s3-cleanups/latest`、`POST /api/s3-cleanups/scan` — 查看最近任务或扫描当前 S3 管理前缀中的孤儿对象
+- `POST /api/s3-cleanups/:job_id/delete|resume|cancel` — 确认后台清理、继续或安全中断 S3 旧空间任务
 - `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建三层派生图
 - `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断派生图重建
 
 ## 验收测试
 
-`scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中拉取 `CHRONOFRAME_IMAGE` 指定的 Actions 镜像，覆盖并发首次注册、Argon2id 哈希、Cookie/CSRF、会话过期与退出，以及本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-delete-interrupt.sh` 专门验证登录会话和管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
+`scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中拉取 `CHRONOFRAME_IMAGE` 指定的 Actions 镜像，覆盖并发首次注册、Argon2id 哈希、Cookie/CSRF、会话过期与退出，以及本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-s3-cleanup-e2e.sh` 使用隔离 MinIO 验证 24 小时宽限、管理前缀隔离、删除前引用保护和孤儿对象清理；`scripts/vps-delete-interrupt.sh` 专门验证登录会话和管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
 
 本项目基于原项目的 MIT 许可继续发布，原作者为 HoshinoSuzumi / Timothy Yin。
