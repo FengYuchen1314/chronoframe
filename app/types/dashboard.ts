@@ -76,6 +76,14 @@ export interface PhotoDeletionResult {
   failures: SourceDeletionFailure[]
 }
 
+export interface AlbumDeletionResult {
+  deleted: boolean
+  photosDeleted: number
+  objectsRemoved: number
+  cleanupPending: number
+  failures: SourceDeletionFailure[]
+}
+
 export interface StorageMigrationJob {
   id: string
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'

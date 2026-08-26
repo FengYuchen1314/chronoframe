@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import type { Album, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
+import type { Album, AlbumDeletionResult, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
 
 definePageMeta({
   layout: 'dashboard',
@@ -16,6 +16,7 @@ const photos = ref<Photo[]>([])
 const activeWorkspaceTab = ref<'photos' | 'details' | 'export'>('photos')
 const albumQuery = ref('')
 const isCreateDialogOpen = ref(false)
+const isDeleteDialogOpen = ref(false)
 const isOrderMode = ref(false)
 const newAlbumName = ref('')
 const newAlbumDescription = ref('')
@@ -36,6 +37,8 @@ const savedAlbumDateDraft = reactive({
   photoDateEnd: '',
 })
 const dateDraftAlbumId = ref('')
+const albumNameDraft = ref('')
+const savedAlbumNameDraft = ref('')
 const albumDescriptionDraft = ref('')
 const savedAlbumDescriptionDraft = ref('')
 const descriptionDraftAlbumId = ref('')
@@ -45,8 +48,9 @@ const isLoadingPhotos = ref(false)
 const isCreating = ref(false)
 const isUploading = ref(false)
 const isDeletingPhotos = ref(false)
+const isDeletingAlbum = ref(false)
 const isSavingAlbumDates = ref(false)
-const isSavingAlbumDescription = ref(false)
+const isSavingAlbumIdentity = ref(false)
 const isReorderingAlbums = ref(false)
 const isAlbumDetailReady = ref(false)
 const albumError = ref('')
@@ -76,7 +80,12 @@ const albumDescriptionDirty = computed(() =>
   descriptionDraftAlbumId.value === selectedAlbumId.value
   && albumDescriptionDraft.value !== savedAlbumDescriptionDraft.value,
 )
-const albumMetadataDirty = computed(() => albumDatesDirty.value || albumDescriptionDirty.value)
+const albumNameDirty = computed(() =>
+  descriptionDraftAlbumId.value === selectedAlbumId.value
+  && albumNameDraft.value !== savedAlbumNameDraft.value,
+)
+const albumIdentityDirty = computed(() => albumNameDirty.value || albumDescriptionDirty.value)
+const albumMetadataDirty = computed(() => albumDatesDirty.value || albumIdentityDirty.value)
 const albumHasCustomDates = computed(() => Boolean(
   selectedAlbum.value?.displayCreatedDate
   || selectedAlbum.value?.photoDateStart
@@ -86,8 +95,9 @@ const hasActiveMutation = computed(() =>
   isCreating.value
   || isUploading.value
   || isDeletingPhotos.value
+  || isDeletingAlbum.value
   || isSavingAlbumDates.value
-  || isSavingAlbumDescription.value
+  || isSavingAlbumIdentity.value
   || isReorderingAlbums.value,
 )
 const isAlbumInteractionLocked = computed(() =>
@@ -106,7 +116,7 @@ const selectedExportAlbums = computed(() =>
 
 const workspaceTabs = [
   { value: 'photos' as const, label: '图片与上传', icon: 'tabler:photo' },
-  { value: 'details' as const, label: '资料与日期', icon: 'tabler:edit' },
+  { value: 'details' as const, label: '相簿设置', icon: 'tabler:settings' },
   { value: 'export' as const, label: '打包下载', icon: 'tabler:file-zip' },
 ]
 
@@ -202,9 +212,11 @@ const applyAlbumDateDraft = (detail: AlbumDetail, force = false) => {
   savedAlbumDateDraft.photoDateEnd = photoDateEnd
 }
 
-const applyAlbumDescriptionDraft = (detail: AlbumDetail, force = false) => {
-  if (!force && descriptionDraftAlbumId.value === detail.id && albumDescriptionDirty.value) return
+const applyAlbumIdentityDraft = (detail: AlbumDetail, force = false) => {
+  if (!force && descriptionDraftAlbumId.value === detail.id && albumIdentityDirty.value) return
   descriptionDraftAlbumId.value = detail.id
+  albumNameDraft.value = detail.name
+  savedAlbumNameDraft.value = detail.name
   albumDescriptionDraft.value = detail.description || ''
   savedAlbumDescriptionDraft.value = detail.description || ''
 }
@@ -215,7 +227,8 @@ const resetAlbumDateDraft = () => {
   albumDateDraft.photoDateEnd = savedAlbumDateDraft.photoDateEnd
 }
 
-const resetAlbumDescriptionDraft = () => {
+const resetAlbumIdentityDraft = () => {
+  albumNameDraft.value = savedAlbumNameDraft.value
   albumDescriptionDraft.value = savedAlbumDescriptionDraft.value
 }
 
@@ -249,7 +262,7 @@ const loadAlbumDetail = async (albumId: string): Promise<boolean> => {
 
     photos.value = detail.photos
     applyAlbumDateDraft(detail)
-    applyAlbumDescriptionDraft(detail)
+    applyAlbumIdentityDraft(detail)
     const albumIndex = albums.value.findIndex(album => album.id === albumId)
     if (albumIndex >= 0) {
       albums.value[albumIndex] = {
@@ -343,39 +356,91 @@ const createAlbum = async () => {
   }
 }
 
-const saveAlbumDescription = async () => {
+const saveAlbumIdentity = async () => {
   if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
-  if (!albumDescriptionDirty.value || !selectedAlbumId.value) return
+  if (!albumIdentityDirty.value || !selectedAlbumId.value) return
+  const name = albumNameDraft.value.trim()
   const description = albumDescriptionDraft.value.trim()
+  if (!name || Array.from(name).length > 100) {
+    toast.add({ title: '相簿名不能为空且不能超过 100 个字符', color: 'warning' })
+    return
+  }
   if (description.length > 1000) {
     toast.add({ title: '相簿简介不能超过 1000 个字符', color: 'warning' })
     return
   }
 
-  isSavingAlbumDescription.value = true
+  isSavingAlbumIdentity.value = true
   try {
     const updated = await adminFetch<Album>(`/api/albums/${selectedAlbumId.value}`, {
       method: 'PATCH',
-      body: { description },
+      body: { name, description },
     })
     const albumIndex = albums.value.findIndex(album => album.id === updated.id)
     if (albumIndex >= 0) albums.value[albumIndex] = updated
     if (selectedAlbumId.value === updated.id) {
-      applyAlbumDescriptionDraft({ ...updated, photos: photos.value }, true)
+      applyAlbumIdentityDraft({ ...updated, photos: photos.value }, true)
     }
     toast.add({
-      title: '相簿简介已保存',
-      description: '相簿列表和相簿详情页都会显示这段简介。',
+      title: '相簿资料已保存',
+      description: '名称和简介已同步到公开相簿。',
       color: 'success',
     })
   } catch (error) {
     toast.add({
-      title: '保存相簿简介失败',
+      title: '保存相簿资料失败',
       description: getAdminApiErrorMessage(error),
       color: 'error',
     })
   } finally {
-    isSavingAlbumDescription.value = false
+    isSavingAlbumIdentity.value = false
+  }
+}
+
+const requestDeleteCurrentAlbum = () => {
+  const album = selectedAlbum.value
+  if (!album || isAlbumInteractionLocked.value) return
+  if (albumMetadataDirty.value) {
+    toast.add({ title: '请先保存或放弃相簿资料修改', color: 'warning' })
+    return
+  }
+  isDeleteDialogOpen.value = true
+}
+
+const closeDeleteAlbumDialog = () => {
+  if (isDeletingAlbum.value) return
+  isDeleteDialogOpen.value = false
+}
+
+const deleteCurrentAlbum = async () => {
+  const album = selectedAlbum.value
+  if (!album || isDeletingAlbum.value) return
+
+  isDeletingAlbum.value = true
+  isAlbumDetailReady.value = false
+  try {
+    const result = await adminFetch<AlbumDeletionResult>(`/api/albums/${album.id}`, {
+      method: 'DELETE',
+    })
+    isDeleteDialogOpen.value = false
+    selectedAlbumId.value = ''
+    await refreshAlbums()
+    toast.add({
+      title: `已删除相簿「${album.name}」`,
+      description: result.cleanupPending
+        ? `${result.photosDeleted} 张图片已移出相簿；${result.cleanupPending} 个存储对象将在后台继续清理。`
+        : `${result.photosDeleted} 张图片及其存储对象已清理。`,
+      color: result.cleanupPending ? 'warning' : 'success',
+    })
+  } catch (error) {
+    await refreshAlbums(album.id)
+    toast.add({
+      title: '删除相簿失败',
+      description: getAdminApiErrorMessage(error),
+      color: 'error',
+    })
+  } finally {
+    isDeletingAlbum.value = false
   }
 }
 
@@ -610,6 +675,7 @@ const uploadPhotos = async () => {
 }
 
 watch(selectedAlbumId, (albumId) => {
+  isDeleteDialogOpen.value = false
   clearSelectedFiles()
   selectedPhotoIds.value = []
   isSelectingPhotos.value = false
@@ -622,13 +688,15 @@ watch(selectedAlbumId, (albumId) => {
   savedAlbumDateDraft.photoDateStart = ''
   savedAlbumDateDraft.photoDateEnd = ''
   descriptionDraftAlbumId.value = albumId
+  albumNameDraft.value = ''
+  savedAlbumNameDraft.value = ''
   albumDescriptionDraft.value = ''
   savedAlbumDescriptionDraft.value = ''
   void loadAlbumDetail(albumId)
 })
 
 const confirmDiscardAlbumMetadata = () =>
-  !albumMetadataDirty.value || window.confirm('相簿简介或显示日期尚未保存，确定要放弃修改吗？')
+  !albumMetadataDirty.value || window.confirm('相簿名称、简介或显示日期尚未保存，确定要放弃修改吗？')
 
 const handleBeforeUnload = (event: BeforeUnloadEvent) => {
   if (!albumMetadataDirty.value) return
@@ -647,7 +715,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
 <template>
   <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="相簿工作台">
+      <UDashboardNavbar title="相簿管理">
         <template #right>
           <UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoadingAlbums" :disabled="isAlbumInteractionLocked" @click="refreshAlbums()">
             刷新
@@ -659,14 +727,14 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
     <template #body>
       <div class="dashboard-panel-body space-y-6">
         <DashboardPageHero
-          eyebrow="Album workspace"
-          title="先选相簿，再完成一件事"
-          description="图片必须放进相簿空间。选择一个相簿后，可在同一个工作区上传、编辑公开资料或打包下载。"
+          eyebrow="相簿管理"
+          title="相簿与图片"
+          description="先创建相簿，再上传和管理图片。选择相簿后可修改资料、调整公开日期、排序或打包下载。"
           icon="tabler:album"
         >
           <template #actions>
-            <UButton icon="tabler:plus" size="lg" @click="openCreateDialog">新建相簿</UButton>
-            <UButton color="neutral" variant="soft" icon="tabler:file-zip" size="lg" :disabled="!albums.length" @click="openExportWorkspace()">批量打包</UButton>
+            <UButton icon="tabler:plus" @click="openCreateDialog">新建相簿</UButton>
+            <UButton color="neutral" variant="soft" icon="tabler:file-zip" :disabled="!albums.length" @click="openExportWorkspace()">批量打包</UButton>
           </template>
         </DashboardPageHero>
 
@@ -742,6 +810,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                     </div>
                   </div>
                   <div class="flex shrink-0 flex-wrap gap-2">
+                    <UButton color="neutral" variant="ghost" icon="tabler:settings" @click="activeWorkspaceTab = 'details'">相簿设置</UButton>
                     <UButton color="neutral" variant="soft" icon="tabler:file-zip" @click="openExportWorkspace(true)">打包此相簿</UButton>
                     <UButton icon="tabler:upload" @click="activeWorkspaceTab = 'photos'; uploadInput?.click()">选择图片</UButton>
                   </div>
@@ -828,10 +897,15 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
               <div v-else-if="activeWorkspaceTab === 'details'" class="divide-y divide-default">
                 <section class="p-4 sm:p-6">
                   <div class="grid gap-6 xl:grid-cols-[220px_minmax(0,1fr)]">
-                    <div><span class="flex size-10 items-center justify-center rounded-xl bg-info/10 text-info"><Icon name="tabler:align-left" class="size-5" /></span><h3 class="mt-3 font-semibold text-highlighted">公开简介</h3><p class="mt-1 text-sm leading-6 text-muted">显示在相簿列表和详情页，留空保存即可隐藏。</p></div>
-                    <form class="space-y-3" @submit.prevent="saveAlbumDescription">
-                      <UTextarea v-model="albumDescriptionDraft" :rows="6" maxlength="1000" placeholder="介绍这个相簿的主题、地点或故事" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" />
-                      <div class="flex flex-wrap items-center justify-between gap-3"><span class="text-xs text-muted">{{ albumDescriptionDraft.length }} / 1000</span><div class="flex gap-2"><UButton v-if="albumDescriptionDirty" type="button" color="neutral" variant="ghost" icon="tabler:arrow-back-up" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="resetAlbumDescriptionDraft">放弃</UButton><UButton type="submit" icon="tabler:device-floppy" :loading="isSavingAlbumDescription" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || !albumDescriptionDirty">保存简介</UButton></div></div>
+                    <div><span class="flex size-10 items-center justify-center rounded-lg bg-primary/10 text-primary"><Icon name="tabler:edit" class="size-5" /></span><h3 class="mt-3 font-semibold text-highlighted">基本资料</h3><p class="mt-1 text-sm leading-6 text-muted">名称用于后台识别和公开展示；简介显示在相簿列表和详情页。</p></div>
+                    <form class="space-y-4" @submit.prevent="saveAlbumIdentity">
+                      <UFormField label="相簿名" description="1–100 个字符" required>
+                        <UInput v-model="albumNameDraft" maxlength="100" icon="tabler:album" placeholder="输入相簿名" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" />
+                      </UFormField>
+                      <UFormField label="公开简介" :description="`${albumDescriptionDraft.length} / 1000；留空保存即可隐藏`">
+                        <UTextarea v-model="albumDescriptionDraft" :rows="5" maxlength="1000" placeholder="介绍这个相簿的主题、地点或故事" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" />
+                      </UFormField>
+                      <div class="flex flex-wrap justify-end gap-2"><UButton v-if="albumIdentityDirty" type="button" color="neutral" variant="ghost" icon="tabler:arrow-back-up" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="resetAlbumIdentityDraft">放弃修改</UButton><UButton type="submit" icon="tabler:device-floppy" :loading="isSavingAlbumIdentity" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || !albumIdentityDirty || !albumNameDraft.trim()">保存基本资料</UButton></div>
                     </form>
                   </div>
                 </section>
@@ -848,6 +922,16 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
                       </div>
                       <div class="flex flex-wrap justify-end gap-2"><UButton v-if="albumDatesDirty" type="button" color="neutral" variant="ghost" icon="tabler:arrow-back-up" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="resetAlbumDateDraft">放弃</UButton><UButton type="button" color="neutral" variant="soft" icon="tabler:restore" :loading="isSavingAlbumDates && albumHasCustomDates" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || (!albumHasCustomDates && !albumDatesDirty)" @click="clearAlbumDates">恢复自动日期</UButton><UButton type="submit" icon="tabler:device-floppy" :loading="isSavingAlbumDates" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || !albumDatesDirty">保存日期</UButton></div>
                     </form>
+                  </div>
+                </section>
+
+                <section class="p-4 sm:p-6">
+                  <div class="grid gap-6 xl:grid-cols-[220px_minmax(0,1fr)]">
+                    <div><span class="flex size-10 items-center justify-center rounded-lg bg-error/10 text-error"><Icon name="tabler:trash" class="size-5" /></span><h3 class="mt-3 font-semibold text-highlighted">删除相簿</h3><p class="mt-1 text-sm leading-6 text-muted">永久删除相簿、其中的图片记录以及当前存储中的文件。</p></div>
+                    <div class="flex flex-col gap-4 rounded-xl border border-error/25 bg-error/5 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div><p class="font-medium text-highlighted">删除「{{ selectedAlbum.name }}」</p><p class="mt-1 text-sm leading-6 text-muted">{{ selectedAlbum.photoCount ? `同时永久删除 ${selectedAlbum.photoCount} 张图片。转换或迁移任务占用时会拒绝删除。` : '这是一个空相簿，可以直接删除。' }}</p></div>
+                      <UButton color="error" variant="soft" icon="tabler:trash" :loading="isDeletingAlbum" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || albumMetadataDirty" @click="requestDeleteCurrentAlbum">删除相簿</UButton>
+                    </div>
                   </div>
                 </section>
               </div>
@@ -890,7 +974,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
   <Teleport to="body">
     <Transition enter-active-class="transition duration-200" enter-from-class="opacity-0" leave-active-class="transition duration-150" leave-to-class="opacity-0">
       <div v-if="isCreateDialogOpen" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm" role="presentation" @click.self="closeCreateDialog">
-        <section role="dialog" aria-modal="true" aria-labelledby="create-album-title" class="w-full max-w-lg overflow-hidden rounded-2xl border border-default bg-default shadow-2xl">
+        <section role="dialog" aria-modal="true" aria-labelledby="create-album-title" class="w-full max-w-lg overflow-hidden rounded-xl border border-default bg-default shadow-2xl">
           <header class="flex items-start justify-between gap-4 border-b border-default px-5 py-4">
             <div class="flex items-center gap-3"><span class="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:folder-plus" class="size-5" /></span><div><h2 id="create-album-title" class="font-semibold text-highlighted">新建相簿空间</h2><p class="mt-0.5 text-sm text-muted">创建后会自动选中，可立即上传图片。</p></div></div>
             <UButton icon="tabler:x" color="neutral" variant="ghost" aria-label="关闭" :disabled="isCreating" @click="closeCreateDialog" />
@@ -900,6 +984,29 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
             <UFormField label="相簿简介" description="可稍后在资料页修改；留空也可以创建。"><UTextarea v-model="newAlbumDescription" :rows="4" maxlength="1000" placeholder="记录这个相簿的主题、地点或故事" class="w-full" :disabled="isCreating" /></UFormField>
             <div class="flex justify-end gap-2"><UButton type="button" color="neutral" variant="ghost" :disabled="isCreating" @click="closeCreateDialog">取消</UButton><UButton type="submit" icon="tabler:plus" :loading="isCreating" :disabled="!newAlbumName.trim()">创建并进入</UButton></div>
           </form>
+        </section>
+      </div>
+    </Transition>
+  </Teleport>
+
+  <Teleport to="body">
+    <Transition enter-active-class="transition duration-200" enter-from-class="opacity-0" leave-active-class="transition duration-150" leave-to-class="opacity-0">
+      <div v-if="isDeleteDialogOpen && selectedAlbum" class="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4" role="presentation" @click.self="closeDeleteAlbumDialog">
+        <section role="alertdialog" aria-modal="true" aria-labelledby="delete-album-title" class="w-full max-w-md overflow-hidden rounded-xl border border-default bg-default shadow-2xl">
+          <header class="flex items-start gap-3 border-b border-default px-5 py-4">
+            <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-error/10 text-error"><Icon name="tabler:trash" class="size-5" /></span>
+            <div class="min-w-0 flex-1"><h2 id="delete-album-title" class="font-semibold text-highlighted">删除相簿</h2><p class="mt-1 text-sm text-muted">此操作不能撤销</p></div>
+            <UButton icon="tabler:x" color="neutral" variant="ghost" aria-label="关闭" :disabled="isDeletingAlbum" @click="closeDeleteAlbumDialog" />
+          </header>
+          <div class="space-y-4 p-5">
+            <p class="text-sm leading-6 text-toned">确定永久删除相簿 <strong class="text-highlighted">「{{ selectedAlbum.name }}」</strong> 吗？</p>
+            <div class="rounded-lg border border-error/20 bg-error/5 px-4 py-3 text-sm leading-6 text-muted">
+              <p v-if="selectedAlbum.photoCount">相簿中的 <strong class="text-highlighted">{{ selectedAlbum.photoCount }} 张图片</strong>及其当前存储对象会一并删除。</p>
+              <p v-else>这是一个空相簿，不会删除图片文件。</p>
+              <p class="mt-1">若图片正被转换或存储迁移任务占用，系统会拒绝删除并保留原数据。</p>
+            </div>
+            <div class="flex justify-end gap-2"><UButton color="neutral" variant="ghost" :disabled="isDeletingAlbum" @click="closeDeleteAlbumDialog">取消</UButton><UButton color="error" icon="tabler:trash" :loading="isDeletingAlbum" @click="deleteCurrentAlbum">确认永久删除</UButton></div>
+          </div>
         </section>
       </div>
     </Transition>

@@ -136,7 +136,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
 <template>
   <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
     <template #header>
-      <UDashboardNavbar title="站点外观">
+      <UDashboardNavbar title="网站设置">
         <template #right>
           <UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading" :disabled="isSaving" @click="loadSettings">重新读取</UButton>
         </template>
@@ -145,8 +145,8 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
 
     <template #body>
       <div class="dashboard-panel-body space-y-6">
-        <DashboardPageHero eyebrow="Public site" title="让公开相簿带上你的名字" description="网站名称、标语、作者、头像和默认主题都保存在后台数据库中，保存后立即用于公开页面。" icon="tabler:palette">
-          <template #actions><UButton to="/" target="_blank" color="neutral" variant="soft" size="lg" icon="tabler:external-link">查看公开页面</UButton></template>
+        <DashboardPageHero eyebrow="网站设置" title="公开站点信息" description="集中设置网站名称、标语、作者、头像和默认主题；保存后立即用于公开页面。" icon="tabler:world-cog">
+          <template #actions><UButton to="/" target="_blank" color="neutral" variant="soft" icon="tabler:external-link">查看公开页面</UButton></template>
         </DashboardPageHero>
 
         <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="站点设置加载失败" :description="loadError" />
@@ -180,11 +180,10 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
           <aside class="dashboard-section overflow-hidden xl:sticky xl:top-4">
             <div class="border-b border-default px-5 py-4"><h2 class="font-semibold text-highlighted">即时预览</h2><p class="mt-1 text-sm text-muted">保存前先确认公开站点身份</p></div>
             <div class="p-5">
-              <div class="relative overflow-hidden rounded-2xl border border-primary/20 bg-gradient-to-br from-primary/10 via-default to-info/10 p-5">
-                <div class="pointer-events-none absolute -right-10 -top-10 size-32 rounded-full bg-primary/20 blur-2xl" />
-                <div class="relative">
-                  <img v-if="!avatarPreviewFailed" :src="previewAvatarUrl" alt="头像预览" class="size-16 rounded-2xl bg-default object-cover shadow-md ring-1 ring-default" @error="avatarPreviewFailed = true">
-                  <span v-else class="flex size-16 items-center justify-center rounded-2xl bg-elevated text-muted"><Icon name="tabler:photo-off" class="size-7" /></span>
+              <div class="rounded-xl border border-default bg-muted p-5">
+                <div>
+                  <img v-if="!avatarPreviewFailed" :src="previewAvatarUrl" alt="头像预览" class="size-14 rounded-xl bg-default object-cover ring-1 ring-default" @error="avatarPreviewFailed = true">
+                  <span v-else class="flex size-14 items-center justify-center rounded-xl bg-elevated text-muted"><Icon name="tabler:photo-off" class="size-6" /></span>
                   <h3 class="mt-5 break-words text-2xl font-semibold tracking-tight text-highlighted">{{ form.title.trim() || '网站名称' }}</h3>
                   <p class="mt-2 break-words text-sm leading-6 text-muted">{{ form.slogan.trim() || '这里会显示网站标语' }}</p>
                   <div class="mt-6 flex items-center gap-2 border-t border-default/60 pt-4 text-xs text-muted"><Icon name="tabler:copyright" class="size-4" /><span>{{ form.author.trim() || form.title.trim() || '作者' }}</span></div>
@@ -196,7 +195,7 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnl
           </aside>
         </div>
 
-        <div class="sticky bottom-3 z-10 flex flex-col gap-3 rounded-2xl border border-default bg-default/90 p-3 shadow-lg backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
+        <div class="dashboard-toolbar sticky bottom-3 z-10 shadow-md">
           <p class="flex items-center gap-2 text-sm" :class="isDirty ? 'text-warning' : 'text-muted'"><Icon :name="isDirty ? 'tabler:edit-circle' : 'tabler:circle-check'" class="size-5" />{{ isDirty ? '有未保存的更改，公开页面尚未更新' : '当前设置已保存' }}</p>
           <div class="flex justify-end gap-2"><UButton color="neutral" variant="ghost" :disabled="!isDirty || isLoading || isSaving" @click="resetForm">放弃修改</UButton><UButton form="site-settings-form" type="submit" icon="tabler:device-floppy" :loading="isSaving" :disabled="!isDirty || isLoading">保存并发布</UButton></div>
         </div>
