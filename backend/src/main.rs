@@ -70,6 +70,7 @@ struct AppState {
     jobs: Arc<DashMap<String, CancellationToken>>,
     storage_tasks: Arc<DashMap<String, CancellationToken>>,
     thumbnail_tasks: Arc<DashMap<String, CancellationToken>>,
+    s3_cleanup_tasks: Arc<DashMap<String, CancellationToken>>,
     storage_mutation_gate: Arc<tokio::sync::RwLock<()>>,
     conversion_slots: Arc<tokio::sync::Semaphore>,
     export_slots: Arc<tokio::sync::Semaphore>,
@@ -85,6 +86,8 @@ const DEFAULT_UPLOAD_CONCURRENCY: usize = 7;
 const DEFAULT_CONVERSION_CONCURRENCY: usize = 7;
 const DEFAULT_SOURCE_DELETE_CONCURRENCY: usize = 7;
 const DEFAULT_THUMBNAIL_CONCURRENCY: usize = 7;
+const DEFAULT_S3_CLEANUP_CONCURRENCY: usize = 8;
+const S3_ORPHAN_GRACE_SECONDS: i64 = 24 * 60 * 60;
 const GRID_THUMBNAIL_LONGEST_EDGE: u32 = 320;
 const VIEW_PREVIEW_LONGEST_EDGE: u32 = 2560;
 const VIEW_PREVIEW_MAX_BYTES: usize = 1_500_000;
@@ -497,6 +500,14 @@ struct S3Store {
     prefix: String,
 }
 
+#[derive(Clone, Debug)]
+struct S3ManagedObject {
+    physical_key: String,
+    logical_key: String,
+    byte_size: i64,
+    last_modified: i64,
+}
+
 impl S3Store {
     fn key(&self, key: &str) -> Result<String> {
         if key
@@ -510,6 +521,90 @@ impl S3Store {
         } else {
             format!("{}/{key}", self.prefix)
         })
+    }
+
+    fn managed_prefix(&self) -> String {
+        if self.prefix.is_empty() {
+            "albums/".to_string()
+        } else {
+            format!("{}/albums/", self.prefix)
+        }
+    }
+
+    fn logical_key(&self, physical_key: &str) -> Option<String> {
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.prefix)
+        };
+        physical_key
+            .strip_prefix(&prefix)
+            .filter(|key| key.starts_with("albums/"))
+            .map(str::to_string)
+    }
+
+    async fn list_managed_objects_page(
+        &self,
+        continuation_token: Option<&str>,
+    ) -> Result<(Vec<S3ManagedObject>, Option<String>)> {
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.managed_prefix());
+        if let Some(token) = continuation_token {
+            request = request.continuation_token(token);
+        }
+        let page = timeout(STORAGE_IO_TIMEOUT, request.send())
+            .await
+            .context("S3 对象列表请求超时")??;
+        let mut objects = Vec::with_capacity(page.contents().len());
+        for object in page.contents() {
+            let Some(physical_key) = object.key() else {
+                continue;
+            };
+            let Some(logical_key) = self.logical_key(physical_key) else {
+                continue;
+            };
+            objects.push(S3ManagedObject {
+                physical_key: physical_key.to_string(),
+                logical_key,
+                byte_size: object.size().unwrap_or_default().max(0),
+                // Missing timestamps are treated as new, so an unusual S3 implementation can
+                // never make an unknown object eligible for deletion.
+                last_modified: object
+                    .last_modified()
+                    .map(|value| value.secs())
+                    .unwrap_or(i64::MAX),
+            });
+        }
+        let next = if page.is_truncated() == Some(true) {
+            Some(
+                page.next_continuation_token()
+                    .context("S3 返回了截断列表但没有下一页标记")?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        Ok((objects, next))
+    }
+
+    async fn delete_physical_object(&self, physical_key: &str) -> Result<()> {
+        if self.logical_key(physical_key).is_none() {
+            bail!("拒绝删除 ChronoFrame 管理前缀之外的 S3 对象");
+        }
+        timeout(
+            STORAGE_IO_TIMEOUT,
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(physical_key)
+                .send(),
+        )
+        .await
+        .context("S3 旧对象删除超时")??;
+        Ok(())
     }
 }
 
@@ -1136,6 +1231,35 @@ impl StorageService {
         candidate.validate()?;
         Ok(candidate)
     }
+    async fn build_s3_store(candidate: &StorageCandidate) -> Result<Arc<S3Store>> {
+        if candidate.backend != "s3" {
+            bail!("当前活动存储不是 S3");
+        }
+        let shared = timeout(
+            STORAGE_IO_TIMEOUT,
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(candidate.s3_region.clone()))
+                .credentials_provider(Credentials::new(
+                    candidate.s3_access_key.clone(),
+                    candidate.s3_secret_key.clone(),
+                    None,
+                    None,
+                    "chronoframe-settings",
+                ))
+                .endpoint_url(candidate.s3_endpoint.clone())
+                .load(),
+        )
+        .await
+        .context("S3 客户端初始化超时")?;
+        let config = S3ConfigBuilder::from(&shared)
+            .force_path_style(true)
+            .build();
+        Ok(Arc::new(S3Store {
+            client: S3Client::from_conf(config),
+            bucket: candidate.s3_bucket.clone(),
+            prefix: candidate.s3_prefix.clone(),
+        }))
+    }
     async fn build_store(candidate: &StorageCandidate) -> Result<Arc<dyn BlobStore>> {
         match candidate.backend.as_str() {
             "local" => {
@@ -1167,30 +1291,8 @@ impl StorageService {
                 }))
             }
             "s3" => {
-                let shared = timeout(
-                    STORAGE_IO_TIMEOUT,
-                    aws_config::defaults(BehaviorVersion::latest())
-                        .region(Region::new(candidate.s3_region.clone()))
-                        .credentials_provider(Credentials::new(
-                            candidate.s3_access_key.clone(),
-                            candidate.s3_secret_key.clone(),
-                            None,
-                            None,
-                            "chronoframe-settings",
-                        ))
-                        .endpoint_url(candidate.s3_endpoint.clone())
-                        .load(),
-                )
-                .await
-                .context("S3 客户端初始化超时")?;
-                let config = S3ConfigBuilder::from(&shared)
-                    .force_path_style(true)
-                    .build();
-                Ok(Arc::new(S3Store {
-                    client: S3Client::from_conf(config),
-                    bucket: candidate.s3_bucket.clone(),
-                    prefix: candidate.s3_prefix.clone(),
-                }))
+                let store: Arc<dyn BlobStore> = Self::build_s3_store(candidate).await?;
+                Ok(store)
             }
             value => bail!("未知存储配置：{value}"),
         }
@@ -1459,6 +1561,28 @@ struct ThumbnailRebuildJob {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct S3CleanupJob {
+    id: String,
+    status: String,
+    phase: String,
+    scanned_objects: i64,
+    protected_objects: i64,
+    total: i64,
+    completed: i64,
+    deleted: i64,
+    failed: i64,
+    skipped: i64,
+    bytes_found: i64,
+    bytes_deleted: i64,
+    worker_count: i64,
+    managed_prefix: String,
+    created_at: i64,
+    updated_at: i64,
+    error: Option<String>,
+}
+
 fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
     Album {
         id: row.get("id"),
@@ -1538,6 +1662,27 @@ fn thumbnail_job_from(row: &sqlx::sqlite::SqliteRow) -> ThumbnailRebuildJob {
         cancelled: row.get("cancelled"),
         cache_files_removed: row.get("cache_files_removed"),
         worker_count: row.get("worker_count"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        error: row.get("error"),
+    }
+}
+fn s3_cleanup_job_from(row: &sqlx::sqlite::SqliteRow) -> S3CleanupJob {
+    S3CleanupJob {
+        id: row.get("id"),
+        status: row.get("status"),
+        phase: row.get("phase"),
+        scanned_objects: row.get("scanned_objects"),
+        protected_objects: row.get("protected_objects"),
+        total: row.get("total"),
+        completed: row.get("completed"),
+        deleted: row.get("deleted"),
+        failed: row.get("failed"),
+        skipped: row.get("skipped"),
+        bytes_found: row.get("bytes_found"),
+        bytes_deleted: row.get("bytes_deleted"),
+        worker_count: row.get("worker_count"),
+        managed_prefix: row.get("managed_prefix"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         error: row.get("error"),
@@ -3116,6 +3261,523 @@ async fn retain_old_storage(
         return Err(AppError::bad("此任务当前不能选择保留旧存储"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+const S3_CLEANUP_JOB_COLUMNS: &str = "id,status,phase,scanned_objects,protected_objects,total,completed,deleted,failed,skipped,bytes_found,bytes_deleted,worker_count,managed_prefix,created_at,updated_at,error";
+
+async fn protected_storage_keys(db: &SqlitePool) -> Result<HashSet<String>> {
+    let mut keys = HashSet::new();
+    for query in [
+        "SELECT storage_key FROM photos",
+        "SELECT storage_key FROM photo_deletion_outbox",
+    ] {
+        keys.extend(sqlx::query_scalar::<_, String>(query).fetch_all(db).await?);
+    }
+    for key in sqlx::query_scalar::<_, String>("SELECT key FROM pending_blobs")
+        .fetch_all(db)
+        .await?
+    {
+        keys.insert(staging_key(&key));
+        keys.insert(key);
+    }
+    for row in sqlx::query("SELECT source_key,target_key FROM source_deletion_outbox")
+        .fetch_all(db)
+        .await?
+    {
+        let source_key: String = row.get("source_key");
+        let target_key: String = row.get("target_key");
+        keys.insert(staging_key(&source_key));
+        keys.insert(source_key);
+        keys.insert(staging_key(&target_key));
+        keys.insert(target_key);
+    }
+    Ok(keys)
+}
+
+fn s3_cleanup_candidate(
+    object: &S3ManagedObject,
+    protected: &HashSet<String>,
+    cutoff: i64,
+) -> bool {
+    object.last_modified <= cutoff && !protected.contains(&object.logical_key)
+}
+
+async fn refresh_s3_cleanup_counts(db: &SqlitePool, job_id: &str) -> Result<()> {
+    sqlx::query("UPDATE s3_cleanup_jobs SET completed=(SELECT COUNT(*) FROM s3_cleanup_items WHERE job_id=? AND status IN ('deleted','failed','protected')),deleted=(SELECT COUNT(*) FROM s3_cleanup_items WHERE job_id=? AND status='deleted'),failed=(SELECT COUNT(*) FROM s3_cleanup_items WHERE job_id=? AND status='failed'),skipped=(SELECT COUNT(*) FROM s3_cleanup_items WHERE job_id=? AND status='protected'),bytes_deleted=COALESCE((SELECT SUM(byte_size) FROM s3_cleanup_items WHERE job_id=? AND status='deleted'),0),updated_at=? WHERE id=?")
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(job_id)
+        .bind(now())
+        .bind(job_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn run_s3_cleanup_scan(
+    state: AppState,
+    job_id: String,
+    candidate: StorageCandidate,
+    token: CancellationToken,
+    _mutation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> Result<()> {
+    let store = StorageService::build_s3_store(&candidate).await?;
+    let protected = protected_storage_keys(&state.db).await?;
+    let cutoff = now() - S3_ORPHAN_GRACE_SECONDS;
+    sqlx::query("DELETE FROM s3_cleanup_items WHERE job_id=?")
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    let mut continuation_token: Option<String> = None;
+    let mut scanned_objects = 0_i64;
+    let mut protected_objects = 0_i64;
+    let mut total = 0_i64;
+    let mut bytes_found = 0_i64;
+    loop {
+        if token.is_cancelled() {
+            sqlx::query("UPDATE s3_cleanup_jobs SET status='cancelled',updated_at=?,error='管理员安全中断 S3 扫描' WHERE id=?")
+                .bind(now())
+                .bind(&job_id)
+                .execute(&state.db)
+                .await?;
+            return Ok(());
+        }
+        let (objects, next) = store
+            .list_managed_objects_page(continuation_token.as_deref())
+            .await?;
+        if token.is_cancelled() {
+            sqlx::query("UPDATE s3_cleanup_jobs SET status='cancelled',updated_at=?,error='管理员安全中断 S3 扫描' WHERE id=?")
+                .bind(now())
+                .bind(&job_id)
+                .execute(&state.db)
+                .await?;
+            return Ok(());
+        }
+        let page_count = objects.len() as i64;
+        let candidates = objects
+            .into_iter()
+            .filter(|object| s3_cleanup_candidate(object, &protected, cutoff))
+            .collect::<Vec<_>>();
+        let page_bytes = candidates
+            .iter()
+            .map(|object| object.byte_size)
+            .sum::<i64>();
+        let mut tx = state.db.begin().await?;
+        for object in &candidates {
+            sqlx::query("INSERT INTO s3_cleanup_items(id,job_id,object_key,logical_key,byte_size,last_modified,status) VALUES(?,?,?,?,?,?,'queued')")
+                .bind(Uuid::new_v4().to_string())
+                .bind(&job_id)
+                .bind(&object.physical_key)
+                .bind(&object.logical_key)
+                .bind(object.byte_size)
+                .bind(object.last_modified)
+                .execute(&mut *tx)
+                .await?;
+        }
+        scanned_objects += page_count;
+        protected_objects += page_count - candidates.len() as i64;
+        total += candidates.len() as i64;
+        bytes_found += page_bytes;
+        sqlx::query("UPDATE s3_cleanup_jobs SET scanned_objects=?,protected_objects=?,total=?,bytes_found=?,updated_at=? WHERE id=? AND status='running'")
+            .bind(scanned_objects)
+            .bind(protected_objects)
+            .bind(total)
+            .bind(bytes_found)
+            .bind(now())
+            .bind(&job_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        continuation_token = next;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+    sqlx::query("UPDATE s3_cleanup_jobs SET status='ready',phase='ready',scanned_objects=?,protected_objects=?,total=?,completed=0,deleted=0,failed=0,skipped=0,bytes_found=?,bytes_deleted=0,updated_at=?,error=NULL WHERE id=?")
+        .bind(scanned_objects)
+        .bind(protected_objects)
+        .bind(total)
+        .bind(bytes_found)
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+async fn run_s3_cleanup_delete(
+    state: AppState,
+    job_id: String,
+    candidate: StorageCandidate,
+    token: CancellationToken,
+    _mutation_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> Result<()> {
+    let store = StorageService::build_s3_store(&candidate).await?;
+    let protected = Arc::new(protected_storage_keys(&state.db).await?);
+    let rows = sqlx::query("SELECT id,object_key,logical_key FROM s3_cleanup_items WHERE job_id=? AND status='queued' ORDER BY id")
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await?;
+    let items = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("object_key"),
+                row.get::<String, _>("logical_key"),
+            )
+        })
+        .collect::<Vec<_>>();
+    stream::iter(items)
+        .for_each_concurrent(
+            DEFAULT_S3_CLEANUP_CONCURRENCY,
+            |(item_id, object_key, logical_key)| {
+                let state = state.clone();
+                let store = store.clone();
+                let token = token.clone();
+                let protected = protected.clone();
+                let job_id = job_id.clone();
+                async move {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    let changed = sqlx::query("UPDATE s3_cleanup_items SET status='deleting',error=NULL WHERE id=? AND job_id=? AND status='queued'")
+                        .bind(&item_id)
+                        .bind(&job_id)
+                        .execute(&state.db)
+                        .await
+                        .map(|result| result.rows_affected())
+                        .unwrap_or_default();
+                    if changed != 1 {
+                        return;
+                    }
+                    if protected.contains(&logical_key) {
+                        let _ = sqlx::query("UPDATE s3_cleanup_items SET status='protected',error='删除前发现数据库引用，已跳过' WHERE id=?")
+                            .bind(&item_id)
+                            .execute(&state.db)
+                            .await;
+                    } else if token.is_cancelled() {
+                        let _ = sqlx::query("UPDATE s3_cleanup_items SET status='queued' WHERE id=? AND status='deleting'")
+                            .bind(&item_id)
+                            .execute(&state.db)
+                            .await;
+                    } else {
+                        match store.delete_physical_object(&object_key).await {
+                            Ok(()) => {
+                                let _ = sqlx::query("UPDATE s3_cleanup_items SET status='deleted',error=NULL WHERE id=?")
+                                    .bind(&item_id)
+                                    .execute(&state.db)
+                                    .await;
+                            }
+                            Err(error) => {
+                                warn!(job_id, object_key, "S3 orphan cleanup failed: {error:#}");
+                                let _ = sqlx::query("UPDATE s3_cleanup_items SET status='failed',error=? WHERE id=?")
+                                    .bind(format!("{error:#}"))
+                                    .bind(&item_id)
+                                    .execute(&state.db)
+                                    .await;
+                            }
+                        }
+                    }
+                    let _ = refresh_s3_cleanup_counts(&state.db, &job_id).await;
+                }
+            },
+        )
+        .await;
+    sqlx::query("UPDATE s3_cleanup_items SET status='queued',error=COALESCE(error,'任务中断，等待继续') WHERE job_id=? AND status='deleting'")
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    refresh_s3_cleanup_counts(&state.db, &job_id).await?;
+    let row = sqlx::query("SELECT total,completed,failed,skipped FROM s3_cleanup_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await?;
+    let total: i64 = row.get("total");
+    let completed: i64 = row.get("completed");
+    let failed: i64 = row.get("failed");
+    let skipped: i64 = row.get("skipped");
+    let (status, error) = if token.is_cancelled() {
+        ("cancelled", Some("管理员安全中断 S3 清理".to_string()))
+    } else if failed > 0 || completed != total {
+        (
+            "failed",
+            Some("部分 S3 旧对象删除失败，可检查连接后继续".to_string()),
+        )
+    } else if skipped > 0 {
+        (
+            "completed",
+            Some(format!(
+                "{skipped} 个对象在删除前发现数据库引用，已安全跳过"
+            )),
+        )
+    } else {
+        ("completed", None)
+    };
+    sqlx::query("UPDATE s3_cleanup_jobs SET status=?,updated_at=?,error=? WHERE id=?")
+        .bind(status)
+        .bind(now())
+        .bind(error)
+        .bind(&job_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+fn spawn_s3_cleanup_scan(
+    state: AppState,
+    job_id: String,
+    candidate: StorageCandidate,
+    guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) {
+    let token = CancellationToken::new();
+    state.s3_cleanup_tasks.insert(job_id.clone(), token.clone());
+    tokio::spawn(async move {
+        let inner_state = state.clone();
+        let inner_job_id = job_id.clone();
+        let outcome = tokio::spawn(async move {
+            run_s3_cleanup_scan(inner_state, inner_job_id, candidate, token, guard).await
+        })
+        .await;
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("S3 扫描执行器异常退出：{error}")),
+        };
+        if let Some(reason) = failure {
+            error!(job_id, "S3 orphan scan failed: {reason}");
+            let _ = sqlx::query("UPDATE s3_cleanup_jobs SET status='failed',updated_at=?,error=? WHERE id=? AND status='running'")
+                .bind(now())
+                .bind(reason)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await;
+        }
+        state.s3_cleanup_tasks.remove(&job_id);
+    });
+}
+
+fn spawn_s3_cleanup_delete(
+    state: AppState,
+    job_id: String,
+    candidate: StorageCandidate,
+    guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+) {
+    let token = CancellationToken::new();
+    state.s3_cleanup_tasks.insert(job_id.clone(), token.clone());
+    tokio::spawn(async move {
+        let inner_state = state.clone();
+        let inner_job_id = job_id.clone();
+        let outcome = tokio::spawn(async move {
+            run_s3_cleanup_delete(inner_state, inner_job_id, candidate, token, guard).await
+        })
+        .await;
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("S3 清理执行器异常退出：{error}")),
+        };
+        if let Some(reason) = failure {
+            error!(job_id, "S3 orphan cleanup failed: {reason}");
+            let _ = refresh_s3_cleanup_counts(&state.db, &job_id).await;
+            let _ = sqlx::query("UPDATE s3_cleanup_jobs SET status='failed',updated_at=?,error=? WHERE id=? AND status='running'")
+                .bind(now())
+                .bind(reason)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await;
+        }
+        state.s3_cleanup_tasks.remove(&job_id);
+    });
+}
+
+async fn latest_s3_cleanup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Option<S3CleanupJob>>> {
+    require_admin(&headers, &state, false).await?;
+    let sql = format!(
+        "SELECT {S3_CLEANUP_JOB_COLUMNS} FROM s3_cleanup_jobs ORDER BY created_at DESC LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(row.as_ref().map(s3_cleanup_job_from)))
+}
+
+async fn start_s3_cleanup_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<S3CleanupJob>)> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let candidate = state
+        .storage
+        .current_candidate()
+        .await
+        .map_err(AppError::internal)?;
+    if candidate.backend != "s3" {
+        return Err(AppError::bad("只有当前活动存储为 S3 时才能扫描旧空间"));
+    }
+    let timestamp = now();
+    let job_id = Uuid::new_v4().to_string();
+    let managed_prefix = if candidate.s3_prefix.is_empty() {
+        "albums/".to_string()
+    } else {
+        format!("{}/albums/", candidate.s3_prefix)
+    };
+    let mut tx = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query("UPDATE s3_cleanup_jobs SET status='cancelled',updated_at=?,error='已被新的扫描结果替代' WHERE status='ready'")
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO s3_cleanup_jobs(id,status,phase,worker_count,location_key,managed_prefix,created_at,updated_at) VALUES(?,'running','scanning',?,?,?,?,?)")
+        .bind(&job_id)
+        .bind(DEFAULT_S3_CLEANUP_CONCURRENCY as i64)
+        .bind(candidate.location_key())
+        .bind(managed_prefix)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| AppError::conflict(format!("无法开始 S3 扫描：{error}")))?;
+    tx.commit().await.map_err(AppError::internal)?;
+    let sql = format!("SELECT {S3_CLEANUP_JOB_COLUMNS} FROM s3_cleanup_jobs WHERE id=?");
+    let row = sqlx::query(&sql)
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let job = s3_cleanup_job_from(&row);
+    spawn_s3_cleanup_scan(state, job_id, candidate, guard);
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+async fn start_s3_cleanup_delete(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let row = sqlx::query("SELECT status,phase,location_key FROM s3_cleanup_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad("S3 清理任务不存在"))?;
+    if row.get::<String, _>("status") != "ready" || row.get::<String, _>("phase") != "ready" {
+        return Err(AppError::bad("请先完成一次 S3 旧空间扫描"));
+    }
+    let candidate = state
+        .storage
+        .current_candidate()
+        .await
+        .map_err(AppError::internal)?;
+    if candidate.backend != "s3" || candidate.location_key() != row.get::<String, _>("location_key")
+    {
+        return Err(AppError::conflict("S3 存储位置已改变，请重新扫描后再清理"));
+    }
+    sqlx::query("UPDATE s3_cleanup_jobs SET status='running',phase='deleting',updated_at=?,error=NULL WHERE id=?")
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    spawn_s3_cleanup_delete(state, job_id, candidate, guard);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn cancel_s3_cleanup(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let token = state
+        .s3_cleanup_tasks
+        .get(&job_id)
+        .ok_or_else(|| AppError::bad("S3 扫描或清理任务不在运行中"))?;
+    token.cancel();
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn resume_s3_cleanup(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    require_admin(&headers, &state, true).await?;
+    let guard = state
+        .storage_mutation_gate
+        .clone()
+        .try_write_owned()
+        .map_err(|_| AppError::conflict("仍有上传、转换、删除或存储任务正在运行"))?;
+    let row = sqlx::query("SELECT status,phase,location_key FROM s3_cleanup_jobs WHERE id=?")
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad("S3 清理任务不存在"))?;
+    let status: String = row.get("status");
+    let phase: String = row.get("phase");
+    if !matches!(status.as_str(), "failed" | "cancelled" | "interrupted") {
+        return Err(AppError::bad("此 S3 清理任务当前不能继续"));
+    }
+    let candidate = state
+        .storage
+        .current_candidate()
+        .await
+        .map_err(AppError::internal)?;
+    if candidate.backend != "s3" || candidate.location_key() != row.get::<String, _>("location_key")
+    {
+        return Err(AppError::conflict("S3 存储位置已改变，请重新扫描"));
+    }
+    if phase == "deleting" {
+        sqlx::query("UPDATE s3_cleanup_items SET status='queued',error=NULL WHERE job_id=? AND status IN ('failed','deleting')")
+            .bind(&job_id)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        sqlx::query(
+            "UPDATE s3_cleanup_jobs SET status='running',updated_at=?,error=NULL WHERE id=?",
+        )
+        .bind(now())
+        .bind(&job_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+        refresh_s3_cleanup_counts(&state.db, &job_id)
+            .await
+            .map_err(AppError::internal)?;
+        spawn_s3_cleanup_delete(state, job_id, candidate, guard);
+    } else {
+        sqlx::query("DELETE FROM s3_cleanup_items WHERE job_id=?")
+            .bind(&job_id)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        sqlx::query("UPDATE s3_cleanup_jobs SET status='running',phase='scanning',scanned_objects=0,protected_objects=0,total=0,completed=0,deleted=0,failed=0,skipped=0,bytes_found=0,bytes_deleted=0,updated_at=?,error=NULL WHERE id=?")
+            .bind(now())
+            .bind(&job_id)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        spawn_s3_cleanup_scan(state, job_id, candidate, guard);
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn read_site_settings(db: &SqlitePool) -> ApiResult<SiteSettings> {
@@ -5774,6 +6436,9 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 async fn setup_database(pool: &SqlitePool) -> Result<()> {
     sqlx::query("PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS administrators (id INTEGER PRIMARY KEY CHECK(id=1),username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY,administrator_id INTEGER NOT NULL REFERENCES administrators(id) ON DELETE CASCADE CHECK(administrator_id=1),csrf_hash TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at); CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,display_created_date TEXT,photo_date_start TEXT,photo_date_end TEXT,position INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY,album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,original_name TEXT NOT NULL,storage_key TEXT NOT NULL UNIQUE,format TEXT NOT NULL CHECK(format IN ('png','jpg','webp')),content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,width INTEGER NOT NULL DEFAULT 0,height INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS pending_blobs (key TEXT PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS photo_deletion_outbox (photo_id TEXT PRIMARY KEY,storage_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS conversion_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,target_format TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sources_deleted_at INTEGER); CREATE TABLE IF NOT EXISTS conversion_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,target_photo_id TEXT REFERENCES photos(id) ON DELETE SET NULL,status TEXT NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS source_deletion_outbox (job_id TEXT NOT NULL REFERENCES conversion_jobs(id) ON DELETE CASCADE,source_photo_id TEXT NOT NULL,source_key TEXT NOT NULL,target_key TEXT NOT NULL,target_format TEXT NOT NULL,target_size INTEGER NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,next_retry_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,source_photo_id)); CREATE TABLE IF NOT EXISTS storage_migration_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,source_backend TEXT NOT NULL,target_backend TEXT NOT NULL,total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cleanup_status TEXT NOT NULL DEFAULT 'not_ready',cleanup_completed INTEGER NOT NULL DEFAULT 0,cleanup_failed INTEGER NOT NULL DEFAULT 0,source_config TEXT NOT NULL,target_config TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,activated_at INTEGER,error TEXT); CREATE TABLE IF NOT EXISTS storage_migration_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES storage_migration_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,content_type TEXT NOT NULL,byte_size INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',sha256 TEXT,error TEXT,source_deleted_at INTEGER,cleanup_error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_storage_migration_items_job_status ON storage_migration_items(job_id,status); CREATE TABLE IF NOT EXISTS thumbnail_rebuild_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,phase TEXT NOT NULL DEFAULT 'queued',total INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0,succeeded INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,cache_files_removed INTEGER NOT NULL DEFAULT 0,worker_count INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS thumbnail_rebuild_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES thumbnail_rebuild_jobs(id) ON DELETE CASCADE,photo_id TEXT NOT NULL,storage_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT,UNIQUE(job_id,photo_id)); CREATE INDEX IF NOT EXISTS idx_thumbnail_rebuild_items_job_status ON thumbnail_rebuild_items(job_id,status); CREATE UNIQUE INDEX IF NOT EXISTS idx_thumbnail_rebuild_one_active ON thumbnail_rebuild_jobs((1)) WHERE status IN ('queued','running');").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS s3_cleanup_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,phase TEXT NOT NULL,scanned_objects INTEGER NOT NULL DEFAULT 0,protected_objects INTEGER NOT NULL DEFAULT 0,total INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,bytes_found INTEGER NOT NULL DEFAULT 0,bytes_deleted INTEGER NOT NULL DEFAULT 0,worker_count INTEGER NOT NULL,location_key TEXT NOT NULL,managed_prefix TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS s3_cleanup_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES s3_cleanup_jobs(id) ON DELETE CASCADE,object_key TEXT NOT NULL,logical_key TEXT NOT NULL,byte_size INTEGER NOT NULL,last_modified INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT,UNIQUE(job_id,object_key)); CREATE INDEX IF NOT EXISTS idx_s3_cleanup_items_job_status ON s3_cleanup_items(job_id,status); CREATE UNIQUE INDEX IF NOT EXISTS idx_s3_cleanup_one_active ON s3_cleanup_jobs((1)) WHERE status='running';")
+        .execute(pool)
+        .await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -5906,6 +6571,13 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await?;
     sqlx::query("UPDATE thumbnail_rebuild_jobs SET status='interrupted',completed=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status IN ('succeeded','failed','skipped','cancelled')),succeeded=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='succeeded'),failed=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='failed'),skipped=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='skipped'),cancelled=(SELECT COUNT(*) FROM thumbnail_rebuild_items i WHERE i.job_id=thumbnail_rebuild_jobs.id AND i.status='cancelled'),updated_at=?,error='服务器重启，缩略图重建已自动排队恢复' WHERE status IN ('queued','running')")
+        .bind(now())
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE s3_cleanup_items SET status='queued',error='服务器重启，删除任务已安全中断' WHERE status='deleting'")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE s3_cleanup_jobs SET status='interrupted',updated_at=?,error='服务器重启，S3 扫描或清理已安全中断，可手动继续' WHERE status='running'")
         .bind(now())
         .execute(pool)
         .await?;
@@ -6068,6 +6740,7 @@ async fn main() -> Result<()> {
         jobs: Arc::new(DashMap::new()),
         storage_tasks: Arc::new(DashMap::new()),
         thumbnail_tasks: Arc::new(DashMap::new()),
+        s3_cleanup_tasks: Arc::new(DashMap::new()),
         storage_mutation_gate,
         conversion_slots: Arc::new(tokio::sync::Semaphore::new(config.workers)),
         export_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -6121,6 +6794,14 @@ async fn main() -> Result<()> {
             "/api/storage-migrations/{job_id}/retain",
             post(retain_old_storage),
         )
+        .route("/api/s3-cleanups/latest", get(latest_s3_cleanup))
+        .route("/api/s3-cleanups/scan", post(start_s3_cleanup_scan))
+        .route(
+            "/api/s3-cleanups/{job_id}/delete",
+            post(start_s3_cleanup_delete),
+        )
+        .route("/api/s3-cleanups/{job_id}/cancel", post(cancel_s3_cleanup))
+        .route("/api/s3-cleanups/{job_id}/resume", post(resume_s3_cleanup))
         .route(
             "/api/settings/site",
             get(get_site_settings).put(save_site_settings),
@@ -6213,6 +6894,7 @@ mod tests {
             jobs: Arc::new(DashMap::new()),
             storage_tasks: Arc::new(DashMap::new()),
             thumbnail_tasks: Arc::new(DashMap::new()),
+            s3_cleanup_tasks: Arc::new(DashMap::new()),
             storage_mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             conversion_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -6261,6 +6943,64 @@ mod tests {
         let thumbnail = encode_thumbnail(&png_fixture(120, 80), 720).unwrap();
         let decoded = image::load_from_memory(&thumbnail).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (120, 80));
+    }
+
+    #[test]
+    fn s3_cleanup_only_selects_old_unreferenced_managed_objects() {
+        let mut protected = HashSet::new();
+        protected.insert("albums/album/original/live.webp".to_string());
+        let old = now() - S3_ORPHAN_GRACE_SECONDS - 1;
+        let recent = now() - S3_ORPHAN_GRACE_SECONDS + 1;
+        let object = |logical_key: &str, last_modified: i64| S3ManagedObject {
+            physical_key: format!("chronoframe/{logical_key}"),
+            logical_key: logical_key.to_string(),
+            byte_size: 42,
+            last_modified,
+        };
+        assert!(!s3_cleanup_candidate(
+            &object("albums/album/original/live.webp", old),
+            &protected,
+            now() - S3_ORPHAN_GRACE_SECONDS,
+        ));
+        assert!(!s3_cleanup_candidate(
+            &object("albums/album/original/recent.webp", recent),
+            &protected,
+            now() - S3_ORPHAN_GRACE_SECONDS,
+        ));
+        assert!(s3_cleanup_candidate(
+            &object("albums/album/original/orphan.webp", old),
+            &protected,
+            now() - S3_ORPHAN_GRACE_SECONDS,
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_database_makes_interrupted_s3_cleanup_resumable() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_database(&pool).await.unwrap();
+        sqlx::query("INSERT INTO s3_cleanup_jobs(id,status,phase,total,worker_count,location_key,managed_prefix,created_at,updated_at) VALUES('cleanup','running','deleting',1,8,'s3:test','chronoframe/albums/',1,1); INSERT INTO s3_cleanup_items(id,job_id,object_key,logical_key,byte_size,last_modified,status) VALUES('item','cleanup','chronoframe/albums/a/original/x.webp','albums/a/original/x.webp',10,1,'deleting');")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        setup_database(&pool).await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM s3_cleanup_jobs WHERE id='cleanup'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let item_status: String =
+            sqlx::query_scalar("SELECT status FROM s3_cleanup_items WHERE id='item'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "interrupted");
+        assert_eq!(item_status, "queued");
     }
 
     #[tokio::test]
