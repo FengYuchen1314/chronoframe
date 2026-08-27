@@ -2,10 +2,9 @@
 import { motion } from 'motion-v'
 import type { GalleryPhoto, RustAlbumDetailPayload } from '~~/shared/types/photo'
 
+definePageMeta({ key: route => route.path })
 const route = useRoute()
-const router = useRouter()
 const { t } = useI18n()
-const { photos: globalPhotos } = usePhotos()
 const albumId = computed(() => String(route.params.id || ''))
 const { data, status, error } = useAsyncData(
   'album-detail',
@@ -13,13 +12,12 @@ const { data, status, error } = useAsyncData(
   { server: false, watch: [albumId] },
 )
 watch(albumId, () => { data.value = undefined }, { flush: 'sync' })
-const album = computed(() => data.value ? adaptRustAlbumDetail(data.value, globalPhotos.value) : null)
-const viewer = useViewerState()
+const album = computed(() => data.value ? adaptRustAlbumDetail(data.value) : null)
 const isMobile = useMediaQuery('(max-width: 768px)')
 const showTop = ref(false)
 const albumPhotos = computed(() => album.value?.photos || [])
+const { openPhoto } = useViewerRoute(albumPhotos, () => `/albums/${albumId.value}`)
 const items = computed(() => albumPhotos.value.map((photo, index) => ({ id: photo.id, photo, index })))
-const keyMapper = (item: { id: string }) => item.id
 const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
 const dateRange = computed(() => {
   if (album.value?.photoDateStart && album.value.photoDateEnd) {
@@ -80,12 +78,6 @@ const selectAll = () => {
   replaceSelection(albumPhotos.value.map(photo => photo.id))
 }
 
-const openPhoto = (index: number) => {
-  const photo = album.value?.photos[index]
-  if (!photo || !album.value) return
-  viewer.openViewer(index, `/albums/${album.value.id}`, album.value.photos)
-  router.push(`/${photo.id}`)
-}
 const handleActivate = (index: number, event: MouseEvent | KeyboardEvent) => {
   if (selectionMode.value) toggleSelection(index, event)
   else openPhoto(index)
@@ -138,15 +130,13 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
 
       <section class="container mx-auto px-0.5 pb-10 pt-5 sm:px-4 sm:py-8 lg:px-8" @contextmenu="onEmptyContextMenu">
         <div v-if="!items.length" class="grid min-h-64 place-items-center text-center text-neutral-500"><div><Icon name="tabler:library-photo" class="mx-auto mb-3 size-14" /><p>{{ t('album.emptyAlbumTitle') }}</p></div></div>
-        <MasonryWall
+        <MasonryGallery
           v-else
           :items="items"
           :column-width="280"
           :gap="4"
           :min-columns="2"
           :max-columns="isMobile ? 2 : 8"
-          :ssr-columns="2"
-          :key-mapper="keyMapper"
         >
           <template #default="{ item }">
             <MasonryItem
@@ -159,7 +149,7 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
               @context-action="openActionMenu"
             />
           </template>
-        </MasonryWall>
+        </MasonryGallery>
       </section>
     </template>
 

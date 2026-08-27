@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { AnimatePresence, motion } from 'motion-v'
 import type { GalleryPhoto } from '~~/shared/types/photo'
+import { createViewerPreloader } from '~~/shared/utils/viewerPreloader'
 
 const props = defineProps<{
   photos: GalleryPhoto[]
   currentIndex: number
   isOpen: boolean
+  closing?: boolean
 }>()
 const emit = defineEmits<{ close: []; indexChange: [number] }>()
 
@@ -47,10 +49,8 @@ let gesturePointerId: number | null = null
 let longPressTimer: ReturnType<typeof setTimeout> | null = null
 let dragFrame: number | null = null
 let pendingDragX = 0
-const viewerPreloads = new Map<string, HTMLImageElement>()
 const viewerReadyOriginalIds = shallowRef(new Set<string>())
-let viewerPreloadQueue: GalleryPhoto[] = []
-let activeViewerPreloads = 0
+const viewerPreloader = createViewerPreloader(ids => { viewerReadyOriginalIds.value = ids }, () => new Image())
 
 const currentPhoto = computed(() => props.photos[props.currentIndex])
 const mobileSlides = computed(() => {
@@ -64,55 +64,6 @@ const mobileSlides = computed(() => {
   return result
 })
 
-const clearViewerPreloads = () => {
-  for (const image of viewerPreloads.values()) {
-    image.onload = null
-    image.onerror = null
-    if (!image.complete) image.src = ''
-  }
-  viewerPreloads.clear()
-  viewerPreloadQueue = []
-  activeViewerPreloads = 0
-}
-
-const markViewerOriginalReady = (photoId: string) => {
-  if (viewerReadyOriginalIds.value.has(photoId)) return
-  const ready = new Set(viewerReadyOriginalIds.value)
-  ready.add(photoId)
-  viewerReadyOriginalIds.value = ready
-}
-const pumpViewerPreloads = () => {
-  if (!import.meta.client || !props.isOpen) return
-  while (activeViewerPreloads < 2 && viewerPreloadQueue.length) {
-    const photo = viewerPreloadQueue.shift()
-    if (!photo || viewerReadyOriginalIds.value.has(photo.id) || viewerPreloads.has(photo.id)) continue
-    const image = new Image()
-    image.decoding = 'async'
-    image.fetchPriority = 'high'
-    activeViewerPreloads += 1
-    const finish = (ready: boolean) => {
-      viewerPreloads.delete(photo.id)
-      activeViewerPreloads = Math.max(0, activeViewerPreloads - 1)
-      if (ready) markViewerOriginalReady(photo.id)
-      pumpViewerPreloads()
-    }
-    image.onload = () => finish(true)
-    image.onerror = () => finish(false)
-    viewerPreloads.set(photo.id, image)
-    image.src = photo.previewUrl
-  }
-}
-const preloadViewerWindow = () => {
-  if (!import.meta.client || !props.isOpen) return
-  viewerPreloadQueue = []
-  for (const distance of [1, 2]) {
-    for (const index of [props.currentIndex - distance, props.currentIndex + distance]) {
-      const photo = props.photos[index]
-      if (photo) viewerPreloadQueue.push(photo)
-    }
-  }
-  pumpViewerPreloads()
-}
 const mobileSlideSrc = (photo: GalleryPhoto, index: number) =>
   index === visualIndex.value
     ? (showHigh.value ? photo.highUrl : photo.previewUrl)
@@ -177,6 +128,7 @@ const resetTransform = () => {
   dragY.value = 0
   pendingDragX = 0
   trackAnimating.value = false
+  isSliding.value = false
   dismissAnimating.value = false
   zoomSettling.value = false
   gestureMode.value = 'idle'
@@ -185,7 +137,7 @@ const resetTransform = () => {
   clearDragFrame()
 }
 const close = () => {
-  if (!props.isOpen || closeRequested.value || isSliding.value) return
+  if (!props.isOpen || props.closing || closeRequested.value) return
   closeRequested.value = true
   clearInteractionTimers()
   emit('close')
@@ -518,12 +470,10 @@ const onPointerCancel = (event: PointerEvent) => {
   if (dragY.value) settleVertical()
   if (scale.value > 1) settleZoom()
 }
-const onCurrentImageLoad = (event: Event) => {
-  const image = event.currentTarget as HTMLImageElement
+const onCurrentImageLoad = (image: HTMLImageElement) => {
   naturalSize.width = image.naturalWidth
   naturalSize.height = image.naturalHeight
-  if (currentPhoto.value) markViewerOriginalReady(currentPhoto.value.id)
-  preloadViewerWindow()
+  if (currentPhoto.value) viewerPreloader.markReady(currentPhoto.value.id)
 }
 const maybeShowGestureHint = () => {
   if (!import.meta.client || !props.isOpen || !isMobile.value || showGestureHint.value) return
@@ -554,6 +504,8 @@ watch([() => props.isOpen, isMobile], ([open]) => {
 })
 watch(() => props.isOpen, open => {
   closeRequested.value = false
+  showHigh.value = false
+  actionMenu.open = false
   if (import.meta.client) {
     if (open) {
       previousBodyOverflow = document.body.style.overflow
@@ -563,17 +515,17 @@ watch(() => props.isOpen, open => {
     }
   }
   if (!open) {
-    clearViewerPreloads()
+    viewerPreloader.clear()
     showGestureHint.value = false
     clearInteractionTimers()
     resetTransform()
   }
 })
 watch(
-  [() => props.isOpen, () => props.currentIndex, () => props.photos.map(photo => photo.id).join('\u0000')],
+  [() => props.isOpen, () => props.currentIndex, () => props.photos],
   ([open]) => {
-    clearViewerPreloads()
-    if (!open) viewerReadyOriginalIds.value = new Set()
+    if (open) viewerPreloader.setWindow(props.photos, props.currentIndex)
+    else viewerPreloader.clear()
   },
   { immediate: true },
 )
@@ -592,7 +544,7 @@ watch(() => props.currentIndex, (index) => {
   naturalSize.height = currentPhoto.value?.height || 0
 }, { flush: 'sync' })
 onBeforeUnmount(() => {
-  clearViewerPreloads()
+  viewerPreloader.clear()
   clearInteractionTimers()
   activePointers.clear()
   if (import.meta.client) document.body.style.overflow = previousBodyOverflow
@@ -601,29 +553,27 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <AnimatePresence>
-      <motion.div
+      <div
         v-if="isOpen && currentPhoto"
-        class="viewer-no-select fixed inset-0 z-[100] h-[100dvh] overflow-hidden bg-black text-white"
-        :initial="{ opacity: 0 }"
-        :animate="{ opacity: 1 }"
-        :exit="{ opacity: 0 }"
-        :transition="{ duration: 0.18 }"
+        class="viewer-overlay viewer-no-select fixed inset-0 z-[100] h-[100dvh] overflow-hidden text-white"
+        :class="{ 'viewer-is-closing': closing }"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="currentPhoto.title || '图片查看器'"
         :style="{ backgroundColor: `rgb(0 0 0 / ${backdropOpacity})` }"
       >
         <div ref="viewerPane" class="relative h-full w-full overflow-hidden" @click="onDesktopPaneClick" @dblclick="onDesktopDoubleClick" @contextmenu.prevent.stop="openViewerActionMenu" @selectstart.prevent @dragstart.prevent @wheel.prevent="onWheel">
-          <motion.div
+          <div
+            v-if="!isMobile"
             :key="`desktop-${currentPhoto.id}`"
             data-viewer-current="true"
-            class="hidden h-full w-full md:block"
-            :initial="{ opacity: 0.35, scale: 0.992 }"
-            :animate="{ opacity: 1, scale }"
-            :transition="{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }"
+            class="viewer-stage h-full w-full"
+            :style="mobileImageStyle"
           >
             <PhotoProgressiveImage :src="currentDisplayUrl" :placeholder-src="showHigh ? currentPhoto.previewUrl : currentPhoto.thumbnailUrl" :alt="currentPhoto.title || $t('ui.photo.altFallback')" fit="contain" loading="eager" fetch-priority="high" class="h-full w-full bg-black" @load="onCurrentImageLoad" />
-          </motion.div>
+          </div>
 
-          <div class="absolute inset-0 overflow-hidden md:hidden" style="touch-action: none" :style="mobileStageStyle" @pointerdown="onPointerStart" @pointermove="onPointerMove" @pointerup.prevent="onPointerEnd" @pointercancel="onPointerCancel">
+          <div v-else class="viewer-stage absolute inset-0 overflow-hidden" style="touch-action: none" :style="mobileStageStyle" @pointerdown="onPointerStart" @pointermove="onPointerMove" @pointerup.prevent="onPointerEnd" @pointercancel="onPointerCancel">
             <div class="absolute inset-0 will-change-transform" :style="mobileTrackStyle">
               <div v-for="slide in mobileSlides" :key="slide.photo.id" class="absolute inset-y-0 w-full" :style="{ left: `${slide.index * 100}%` }">
                 <PhotoProgressiveImage
@@ -672,7 +622,7 @@ onBeforeUnmount(() => {
           <div class="pointer-events-none absolute bottom-24 left-1/2 z-30 hidden -translate-x-1/2 rounded-full bg-black/35 px-3 py-1 text-xs text-white/75 backdrop-blur md:block">{{ currentIndex + 1 }} / {{ photos.length }}<span v-if="scale > 1" class="ml-2">{{ Math.round(scale * 100) }}%</span></div>
           <div class="viewer-mobile-counter pointer-events-none absolute bottom-0 left-1/2 z-40 -translate-x-1/2 rounded-full bg-black/35 px-3 py-1 text-xs text-white/75 backdrop-blur md:hidden" :class="dragY ? 'opacity-0' : 'opacity-100'">{{ currentIndex + 1 }} / {{ photos.length }}<span v-if="scale > 1" class="ml-2">{{ Math.round(scale * 100) }}%</span></div>
 
-          <PhotoGalleryThumbnail class="absolute inset-x-0 bottom-0 z-20 hidden md:block" :photos="photos" :current-index="currentIndex" @click.stop @dblclick.stop @index-change="emit('indexChange', $event)" />
+          <PhotoGalleryThumbnail v-if="!isMobile" class="absolute inset-x-0 bottom-0 z-20 hidden md:block" :photos="photos" :current-index="currentIndex" @click.stop @dblclick.stop @index-change="emit('indexChange', $event)" />
 
           <button
             v-if="!showHigh"
@@ -687,12 +637,16 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <PhotoActionMenu :open="actionMenu.open" :x="actionMenu.x" :y="actionMenu.y" :photo="currentPhoto" @close="actionMenu.open = false" />
-      </motion.div>
-    </AnimatePresence>
+      </div>
   </Teleport>
 </template>
 
 <style scoped>
+.viewer-overlay { transition: opacity 160ms ease-out; }
+.viewer-is-closing { opacity: 0; pointer-events: none; }
+.viewer-is-closing .viewer-stage { visibility: hidden; }
+@media (prefers-reduced-motion: reduce) { .viewer-overlay { transition: none; } }
+
 .viewer-top { padding-top: max(0.75rem, env(safe-area-inset-top)); }
 .viewer-no-select, .viewer-no-select * { -webkit-user-select: none !important; user-select: none !important; }
 .viewer-no-select img { -webkit-user-drag: none; }
