@@ -4,11 +4,9 @@ import type { AsyncDataRequestStatus } from '#app'
 import type { GalleryPhoto } from '~~/shared/types/photo'
 
 defineProps<{ photos: GalleryPhoto[]; status: AsyncDataRequestStatus }>()
-const router = useRouter()
 const isMobile = useMediaQuery('(max-width: 768px)')
 const { filteredPhotos, hasActiveFilters } = usePhotoFilters()
 const { sortedPhotos } = usePhotoSort()
-const viewer = useViewerState()
 const showTop = ref(false)
 const masonryWrapper = ref<HTMLElement>()
 const headerRef = ref<HTMLElement>()
@@ -17,8 +15,8 @@ const headerColumnWidth = ref(280)
 const gap = 4
 
 const displayPhotos = computed(() => hasActiveFilters.value ? filteredPhotos.value : sortedPhotos.value)
+const { openPhoto } = useViewerRoute(displayPhotos, '/photos')
 const items = computed(() => displayPhotos.value.map((photo, index) => ({ photo, index, id: photo.id })))
-const keyMapper = (item: { id: string }) => item.id
 const columnWidth = computed(() => 280)
 const maxColumns = computed(() => isMobile.value ? 2 : 8)
 const headerOffset = computed(() => isMobile.value ? 0 : headerHeight.value + gap)
@@ -106,13 +104,6 @@ const dateRangeText = computed(() => {
   return `${formatGalleryDate(dates.at(-1)!.toISOString())} – ${formatGalleryDate(dates[0]!.toISOString())}`
 })
 
-const openPhoto = (index: number) => {
-  const photo = displayPhotos.value[index]
-  if (!photo) return
-  viewer.openViewer(index, '/photos', displayPhotos.value)
-  router.push(`/${photo.id}`)
-}
-
 const onScroll = () => { showTop.value = window.scrollY > 500 }
 const scrollToTop = () => window.scrollTo({ top: 0, behavior: 'smooth' })
 onMounted(() => window.addEventListener('scroll', onScroll, { passive: true }))
@@ -155,7 +146,7 @@ watch(() => displayPhotos.value.map(photo => photo.id).join('\u0000'), () => {
         <div v-else-if="!displayPhotos.length" class="grid min-h-[35vh] place-items-center text-center text-neutral-500" :style="!isMobile ? { paddingTop: `${headerOffset}px` } : undefined">
           <div><Icon name="tabler:photo-off" class="mx-auto mb-3 size-10" /><p>{{ $t('ui.stats.noPhotosTip') }}</p></div>
         </div>
-        <MasonryWall
+        <MasonryGallery
           v-else
           class="masonry-wall masonry-wall-with-header"
           :items="items"
@@ -163,8 +154,7 @@ watch(() => displayPhotos.value.map(photo => photo.id).join('\u0000'), () => {
           :gap="gap"
           :min-columns="2"
           :max-columns="maxColumns"
-          :ssr-columns="2"
-          :key-mapper="keyMapper"
+          :first-column-offset="headerOffset"
         >
           <template #default="{ item }">
             <MasonryItem
@@ -177,7 +167,7 @@ watch(() => displayPhotos.value.map(photo => photo.id).join('\u0000'), () => {
               @context-action="openActionMenu"
             />
           </template>
-        </MasonryWall>
+        </MasonryGallery>
       </div>
     </div>
 
@@ -206,7 +196,6 @@ watch(() => displayPhotos.value.map(photo => photo.id).join('\u0000'), () => {
 <style scoped>
 .masonry-header-wrapper { z-index: 1; }
 .masonry-header-desktop { left: 0; position: absolute; top: 0; }
-.masonry-wall-with-header :deep(.masonry-column:first-child) { padding-top: var(--masonry-header-offset, 0px); }
 .masonry-wall-with-header :deep(.masonry-column:first-child .masonry-item:first-child) { margin-top: 0; }
 .masonry-back-to-top { bottom: max(1rem, env(safe-area-inset-bottom)); }
 </style>

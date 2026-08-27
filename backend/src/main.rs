@@ -4483,6 +4483,23 @@ async fn list_photos(State(state): State<AppState>) -> ApiResult<Json<Vec<Photo>
     Ok(Json(rows.iter().map(photo_from).collect()))
 }
 
+async fn photo_detail(
+    State(state): State<AppState>,
+    AxumPath(photo_id): AxumPath<String>,
+) -> ApiResult<Json<Photo>> {
+    let row = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE id=?")
+        .bind(photo_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError {
+            status: StatusCode::NOT_FOUND,
+            message: "图片不存在".into(),
+            clear_auth_cookies: None,
+        })?;
+    Ok(Json(photo_from(&row)))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeletePhotosInput {
@@ -6822,7 +6839,10 @@ async fn main() -> Result<()> {
         .route("/api/photos", get(list_photos))
         .route("/api/photos/export", post(export_photos))
         .route("/api/photos/delete", post(delete_photos))
-        .route("/api/photos/{photo_id}", delete(delete_photo))
+        .route(
+            "/api/photos/{photo_id}",
+            get(photo_detail).delete(delete_photo),
+        )
         .route("/api/photos/{photo_id}/file", get(photo_file))
         .route("/api/photos/{photo_id}/thumbnail", get(photo_thumbnail))
         .route("/api/photos/{photo_id}/preview", get(photo_preview))
@@ -7438,6 +7458,30 @@ mod tests {
         assert!(normalize_album_name(Some(" \t ".into())).is_err());
         assert!(normalize_album_name(Some("相".repeat(100))).is_ok());
         assert!(normalize_album_name(Some("相".repeat(101))).is_err());
+    }
+
+    #[tokio::test]
+    async fn single_photo_metadata_returns_only_the_requested_photo() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO albums(id,name,created_at) VALUES('album','Album',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for id in ["first", "second"] {
+            sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,created_at) VALUES(?,'album',?,?,'png','image/png',12,1)")
+                .bind(id).bind(id).bind(format!("albums/album/{id}.png"))
+                .execute(&state.db).await.unwrap();
+        }
+        let Json(photo) = photo_detail(State(state.clone()), AxumPath("second".into()))
+            .await
+            .unwrap();
+        assert_eq!(photo.id, "second");
+        assert_eq!(photo.album_id, "album");
+        let error = photo_detail(State(state), AxumPath("missing".into()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

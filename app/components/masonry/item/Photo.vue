@@ -14,6 +14,14 @@ const emit = defineEmits<{
 }>()
 
 const aspectRatio = computed(() => props.photo.aspectRatio || 1.2)
+const card = ref<HTMLElement>()
+const nearViewport = ref(false)
+const { stop: stopObserving } = useIntersectionObserver(card, entries => {
+  if (entries.some(entry => entry.isIntersecting)) {
+    nearViewport.value = true
+    stopObserving()
+  }
+}, { rootMargin: '320px 0px' })
 const camera = computed(() => [props.photo.exif?.Make, props.photo.exif?.Model].filter(Boolean).join(' '))
 let longPressTimer: ReturnType<typeof setTimeout> | null = null
 let longPressStart = { x: 0, y: 0 }
@@ -55,6 +63,7 @@ onBeforeUnmount(clearLongPress)
 
 <template>
   <div
+    ref="card"
     role="button"
     tabindex="0"
     class="group relative block w-full touch-manipulation overflow-hidden bg-neutral-200 text-left transition-all active:opacity-85 dark:bg-neutral-800"
@@ -71,11 +80,12 @@ onBeforeUnmount(clearLongPress)
     @pointercancel="clearLongPress"
   >
     <PhotoProgressiveImage
+      v-if="nearViewport"
       :src="photo.thumbnailUrl"
       :fallback-src="photo.previewUrl"
       :alt="photo.title"
-      :loading="index < 18 ? 'eager' : 'lazy'"
-      :fetch-priority="index < 8 ? 'high' : 'auto'"
+      loading="eager"
+      :fetch-priority="index < 8 ? 'high' : 'low'"
       fit="cover"
       class="absolute inset-0 h-full w-full transition-transform duration-500 group-hover:scale-[1.035]"
     />
