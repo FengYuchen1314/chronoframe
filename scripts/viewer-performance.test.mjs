@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { returnTransform, thumbnailWindow, viewerNeighborIndices, VIEWER_RETURN_DURATION } from '../shared/utils/viewerPerformance.ts'
 import { createViewerPreloader } from '../shared/utils/viewerPreloader.ts'
 import { masonryLayout } from '../shared/utils/masonryLayout.ts'
+import { animationDeadline } from '../app/utils/animationDeadline.ts'
 
 const photos = Array.from({ length: 1000 }, (_, id) => ({ id: `${id}`, previewUrl: `/photos/${id}/preview` }))
 const harness = () => {
@@ -37,6 +38,16 @@ test('return is a single bounded transform, never a layout-property tween', () =
   assert.equal(returnTransform({ left: 0, top: 0, width: 0, height: 1 }, { left: 0, top: 0, width: 2, height: 2 }), null)
   assert.equal(returnTransform({ left: NaN, top: 0, width: 1, height: 1 }, { left: 0, top: 0, width: 2, height: 2 }), null)
   assert.ok(VIEWER_RETURN_DURATION <= 250)
+})
+
+test('a stalled browser animation cannot leave the viewer waiting indefinitely', async () => {
+  const neverFinishes = new Promise(() => {})
+  await animationDeadline(neverFinishes, 20)
+})
+
+test('finished and cancelled animations settle without waiting for the deadline', async () => {
+  await animationDeadline(Promise.resolve(), 60000)
+  await animationDeadline(Promise.reject(new Error('cancelled')), 60000)
 })
 
 test('thumbnail strip work is bounded by the viewport, not album length', () => {
