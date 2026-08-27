@@ -43,7 +43,7 @@
   --leading-normal: normal;
 }
 
-html { background: var(--ui-bg); }
+html { background: var(--ui-bg); scrollbar-gutter: stable; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--ui-bg); color: var(--ui-text); }
 button, a { -webkit-tap-highlight-color: transparent; }
 .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
