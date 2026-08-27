@@ -1,4 +1,5 @@
 import { returnTransform, VIEWER_RETURN_DURATION } from '~~/shared/utils/viewerPerformance'
+import { animationDeadline } from './animationDeadline'
 
 const containedImageRect = (image: HTMLImageElement) => {
   const bounds = image.getBoundingClientRect()
@@ -16,7 +17,7 @@ export function createViewerReturnAnimation(photoId: string) {
   const source = images.find(image => image.hasAttribute('data-progressive-full') && image.complete && image.naturalWidth > 0 && getComputedStyle(image).opacity !== '0')
     || images.find(image => image.hasAttribute('data-progressive-placeholder') && image.complete && image.naturalWidth > 0)
   const target = document.querySelector<HTMLElement>(`[data-photo-id="${CSS.escape(photoId)}"]`)
-  if (!source || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null
+  if (!source || document.hidden || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null
 
   const sourceRect = containedImageRect(source)
   let targetRect = target?.getBoundingClientRect()
@@ -48,7 +49,8 @@ export function createViewerReturnAnimation(photoId: string) {
     { duration: transform ? VIEWER_RETURN_DURATION : 160, easing: 'cubic-bezier(.2,.75,.25,1)', fill: 'forwards' },
   )
   return {
-    finished: animation.finished.catch(() => undefined),
+    // Never make leaving the viewer depend indefinitely on compositor events.
+    finished: animationDeadline(animation.finished),
     cleanup: () => {
       animation.cancel()
       clone.remove()

@@ -46,7 +46,7 @@ const handleClose = async (updateRoute = true) => {
     // The background gallery is already ready. Only the overlay fades while a
     // clone returns in one transform; no network, remount, or second correction.
     if (returnAnimation) await returnAnimation.finished
-    else if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    else if (!document.hidden && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       await new Promise(resolve => setTimeout(resolve, 160))
     }
     if (updateRoute && route.query.photo === photo?.id) {
