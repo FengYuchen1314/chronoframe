@@ -511,6 +511,14 @@ fn check_cancel(token: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+fn archive_photo_name(original: &str, format: &str, used: &mut HashSet<String>) -> String {
+    // Sanitize/truncate first; append the required extension afterwards so it cannot be lost.
+    unique_export_name(
+        renamed(&sanitize_export_name(original, "image"), format),
+        used,
+    )
+}
+
 fn encode_download(
     input: &[u8],
     format: &str,
@@ -674,10 +682,7 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
         .into_iter()
         .enumerate()
         .map(|(index, photo)| {
-            let name = unique_export_name(
-                sanitize_export_name(&renamed(&photo.original_name, &format), "image"),
-                &mut names,
-            );
+            let name = archive_photo_name(&photo.original_name, &format, &mut names);
             (index, photo, name)
         })
         .collect::<Vec<_>>();
@@ -737,6 +742,19 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_archive_names_keep_the_requested_extension_and_remain_unique() {
+        let mut used = HashSet::new();
+        for format in ["png", "jpg", "jpeg", "webp"] {
+            let name = format!("../folder/{}.png", "long-name".repeat(40));
+            let first = archive_photo_name(&name, format, &mut used);
+            let second = archive_photo_name(&name, format, &mut used);
+            assert!(first.ends_with(&format!(".{format}")));
+            assert!(second.ends_with(&format!(".{format}")));
+            assert!(!first.contains('/'));
+            assert_ne!(first, second);
+        }
+    }
     #[test]
     fn limits_formats_and_path_validation() {
         let input = SettingsInput {
