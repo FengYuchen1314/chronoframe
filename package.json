@@ -26,6 +26,7 @@
     "@vueuse/core": "^14.3.0",
     "@vueuse/nuxt": "14.3.0",
     "@yeger/vue-masonry-wall": "^6.1.1",
+    "ant-design-vue": "4.2.6",
     "dayjs": "^1.11.21",
     "dayjs-nuxt": "2.1.11",
     "motion-v": "^2.3.0",

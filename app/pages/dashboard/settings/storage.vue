@@ -1,4 +1,5 @@
 <script lang="ts" setup>
+import { Alert as AAlert, Button as AButton, Card as ACard, Form as AForm, FormItem as AFormItem, Input as AInput, InputPassword as AInputPassword, RadioGroup as ARadioGroup, Space as ASpace, Tag as ATag, Progress as AProgress, Tabs as ATabs, TabPane as ATabPane, Descriptions as ADescriptions, DescriptionsItem as ADescriptionsItem } from 'ant-design-vue'
 import type {
   Album,
   S3CleanupJob,
@@ -15,7 +16,7 @@ definePageMeta({
 
 useHead({ title: '存储设置' })
 
-const toast = useToast()
+const toast = useAdminNotice()
 const { adminFetch } = useAdminApi()
 
 const backendOptions: Array<{ label: string, value: StorageBackend, icon: string }> = [
@@ -263,13 +264,13 @@ const thumbnailStatusText = computed(() => {
   }[job.status] || job.status
 })
 
-const thumbnailStatusColor = computed((): 'neutral' | 'success' | 'error' | 'warning' | 'primary' => {
+const thumbnailStatusColor = computed((): 'default' | 'success' | 'error' | 'warning' | 'processing' => {
   const status = latestThumbnailJob.value?.status
-  if (!status) return 'neutral'
+  if (!status) return 'default'
   if (status === 'completed') return 'success'
   if (status === 'failed') return 'error'
   if (status === 'cancelled' || status === 'interrupted') return 'warning'
-  return 'primary'
+  return 'processing'
 })
 
 const runThumbnailTaskAction = async (action: 'start' | 'cancel' | 'resume') => {
@@ -315,19 +316,19 @@ const s3CleanupStatusText = computed(() => {
   }[job.status] || job.status
 })
 
-const s3CleanupStatusColor = computed((): 'neutral' | 'success' | 'error' | 'warning' | 'primary' => {
+const s3CleanupStatusColor = computed((): 'default' | 'success' | 'error' | 'warning' | 'processing' => {
   const status = latestS3Cleanup.value?.status
-  if (!status) return 'neutral'
+  if (!status) return 'default'
   if (status === 'completed' || (status === 'ready' && latestS3Cleanup.value?.total === 0)) return 'success'
   if (status === 'failed') return 'error'
   if (status === 'cancelled' || status === 'interrupted' || status === 'ready') return 'warning'
-  return 'primary'
+  return 'processing'
 })
 
 const runS3CleanupAction = async (action: 'scan' | 'delete' | 'cancel' | 'resume') => {
   if (isS3CleanupAction.value) return
   const job = latestS3Cleanup.value
-  if (action === 'delete' && job && !window.confirm(`确定删除扫描到的 ${job.total} 个 S3 旧对象吗？\n\n预计释放 ${formatBytes(job.bytesFound)}。只会处理 ${job.managedPrefix}，删除前还会重新核对数据库引用；删除不能撤销。`)) return
+  if (action === 'delete' && job && !await toast.confirm(`确定删除扫描到的 ${job.total} 个 S3 旧对象吗？\n\n预计释放 ${formatBytes(job.bytesFound)}。只会处理 ${job.managedPrefix}，删除前还会重新核对数据库引用；删除不能撤销。`)) return
   isS3CleanupAction.value = true
   try {
     const endpoint = action === 'scan'
@@ -369,11 +370,11 @@ const migrationStatusText = (job: StorageMigrationJob) => {
   }[job.status] || job.status
 }
 
-const migrationStatusColor = (job: StorageMigrationJob): 'success' | 'error' | 'warning' | 'primary' => {
+const migrationStatusColor = (job: StorageMigrationJob): 'success' | 'error' | 'warning' | 'processing' => {
   if (job.cleanupStatus === 'cleaned' || job.cleanupStatus === 'retained') return 'success'
   if (job.status === 'failed' || job.cleanupStatus === 'failed') return 'error'
   if (job.status === 'cancelled' || job.status === 'interrupted' || job.cleanupStatus === 'interrupted') return 'warning'
-  return 'primary'
+  return 'processing'
 }
 
 const runStorageTaskAction = async (
@@ -381,8 +382,8 @@ const runStorageTaskAction = async (
   action: 'resume' | 'cancel' | 'cleanup' | 'retain',
 ) => {
   if (isStorageTaskAction.value) return
-  if (action === 'cleanup' && !window.confirm(`确定删除迁移前 ${job.sourceBackend.toUpperCase()} 存储中的全部旧图片吗？\n\n系统会逐张校验当前存储中的副本后再删除，但删除动作不能撤销。`)) return
-  if (action === 'retain' && !window.confirm('确定保留旧存储中的图片吗？\n\n系统会结束本次迁移流程，不会删除旧副本。')) return
+  if (action === 'cleanup' && !await toast.confirm(`确定删除迁移前 ${job.sourceBackend.toUpperCase()} 存储中的全部旧图片吗？\n\n系统会逐张校验当前存储中的副本后再删除，但删除动作不能撤销。`)) return
+  if (action === 'retain' && !await toast.confirm('确定保留旧存储中的图片吗？\n\n系统会结束本次迁移流程，不会删除旧副本。')) return
   isStorageTaskAction.value = true
   try {
     await adminFetch(`/api/storage-migrations/${job.id}/${action}`, { method: 'POST' })
@@ -432,7 +433,7 @@ const saveSettings = async () => {
   if (isTesting.value || isSaving.value) return
   if (
     migrationRequired.value
-    && !window.confirm(`确认将 ${storedPhotoCount.value} 张图片迁移到新的存储位置？\n\n迁移会在后台复制并读回校验；完成后才切换存储。随后请在本页确认删除旧空间，或明确选择保留备份。`)
+    && !await toast.confirm(`确认将 ${storedPhotoCount.value} 张图片迁移到新的存储位置？\n\n迁移会在后台复制并读回校验；完成后才切换存储。随后请在本页确认删除旧空间，或明确选择保留备份。`)
   ) return
 
   const payload = buildPayload()
@@ -500,186 +501,81 @@ onBeforeUnmount(() => {
   clearSensitiveInputs()
   if (maintenancePoll !== null) window.clearTimeout(maintenancePoll)
 })
+const storageTab = ref('connection')
+onBeforeRouteLeave(() => !isDirty.value || toast.confirm('存储设置尚未保存，确定放弃修改并离开吗？'))
 </script>
 
 <template>
-  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
-    <template #header>
-      <UDashboardNavbar title="存储设置">
-        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading || isLoadingMigrations || isLoadingThumbnailJob || isLoadingS3Cleanup" @click="loadSettings(); loadMigrations(); loadThumbnailJob(); loadS3Cleanup()">重新读取</UButton></template>
-      </UDashboardNavbar>
-    </template>
-
-    <template #body>
-      <div class="dashboard-panel-body space-y-6">
-        <DashboardPageHero eyebrow="存储设置" title="图片存储与迁移" description="配置本地、WebDAV 或 S3，并在同一页测试连接、切换后端和查看迁移进度。所有配置均保存在后台数据库。" icon="tabler:database-cog">
-          <template #actions><UBadge color="success" variant="soft"><Icon :name="backendIcons[savedBackend]" class="mr-1 size-4" />当前：{{ backendOptions.find(item => item.value === savedBackend)?.label }}</UBadge></template>
-        </DashboardPageHero>
-
-        <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="存储设置加载失败" :description="loadError" />
-        <UAlert v-if="migrationLoadError && !latestMigration" color="warning" variant="subtle" icon="tabler:refresh-alert" title="迁移记录暂时未更新" :description="`${migrationLoadError}；页面会自动重试。`" />
-        <UAlert v-if="lastTest" color="success" variant="subtle" icon="tabler:circle-check" title="最近一次连接验证通过" :description="lastTestDescription" />
-
-        <section class="dashboard-section overflow-hidden">
-          <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:photo-cog" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">三层图片缓存</h2><p class="mt-1 text-sm text-muted">为旧图库重建 320px PNG、≤1.5 MB WebP 和 ≤5 MB WebP</p></div></div>
-            <UBadge :color="thumbnailStatusColor" variant="soft">{{ thumbnailStatusText }}</UBadge>
-          </header>
-          <div class="space-y-4 p-5 sm:p-6">
-            <UAlert v-if="thumbnailLoadError" color="warning" variant="subtle" icon="tabler:refresh-alert" title="缓存进度暂时未更新" :description="`${thumbnailLoadError}；页面会自动重试。`" />
-            <template v-if="latestThumbnailJob">
-              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">{{ latestThumbnailJob.phase === 'clearing' && latestThumbnailJob.status === 'running' ? '正在清理旧缓存' : '生成进度' }}</span><strong class="text-highlighted">{{ latestThumbnailJob.completed }} / {{ latestThumbnailJob.total }}（{{ thumbnailProgress }}%）</strong></div>
-              <UProgress :model-value="thumbnailProgress" />
-              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted"><span>成功 {{ latestThumbnailJob.succeeded }}</span><span>失败 {{ latestThumbnailJob.failed }}</span><span>跳过 {{ latestThumbnailJob.skipped }}</span><span>已清理文件 {{ latestThumbnailJob.cacheFilesRemoved }}</span><span>并发 {{ latestThumbnailJob.workerCount }}</span></div>
-              <UAlert v-if="latestThumbnailJob.error" color="warning" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestThumbnailJob.error" />
-            </template>
-            <p v-else class="text-sm leading-6 text-muted">三层派生图缓存在服务器本地，不会删除存储后端里的原始母本。任务会根据 CPU 自动调整并发（至少 7，最多 32），可以关闭页面，服务重启后会自动恢复。</p>
-            <div class="flex flex-wrap justify-end gap-2">
-              <UButton v-if="thumbnailTaskActive" color="warning" variant="soft" icon="tabler:player-stop" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('cancel')">安全中断</UButton>
-              <UButton v-else-if="latestThumbnailJob && ['failed', 'cancelled', 'interrupted'].includes(latestThumbnailJob.status)" icon="tabler:player-play" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('resume')">继续重建</UButton>
-              <UButton v-else icon="tabler:refresh" :loading="isThumbnailTaskAction" :disabled="storageBusy" @click="runThumbnailTaskAction('start')">清空并重新生成</UButton>
+  <div>
+    <DashboardPageHeader title="存储与维护" description="原图存储配置保存在数据库中；迁移和清理任务在后台运行。"><ATag color="success">{{ backendOptions.find(item => item.value === savedBackend)?.label }}</ATag><AButton :loading="isLoading" @click="loadSettings(); loadMigrations(); loadThumbnailJob(); loadS3Cleanup()">刷新</AButton></DashboardPageHeader>
+    <AAlert v-if="loadError" type="error" show-icon :message="loadError" class="mb-5" />
+    <ATabs v-model:active-key="storageTab">
+      <ATabPane key="connection" tab="存储连接">
+        <ACard title="原图存储配置" style="max-width:1060px">
+          <AAlert v-if="lastTest" type="success" show-icon message="连接测试通过" :description="lastTestDescription" class="mb-5" />
+          <AForm layout="vertical" :model="form" @finish="saveSettings">
+            <AFormItem label="存储类型" name="backend"><ARadioGroup :value="form.backend" :options="backendOptions" :disabled="isLoading || isSaving || isTesting || storageBusy" @change="changeBackend($event.target.value)" /></AFormItem>
+            <template v-if="form.backend === 'local'"><AFormItem label="本地存储路径" name="localPath" extra="容器内路径，建议保持在 /app/data 下，随数据目录持久化。"><AInput v-model:value="form.localPath" /></AFormItem></template>
+            <div v-else-if="form.backend === 'webdav'" class="admin-form-grid">
+              <AFormItem label="WebDAV URL" name="webdavUrl" required><AInput v-model:value="form.webdavUrl" placeholder="https://dav.example.com" /></AFormItem>
+              <AFormItem label="目录前缀" name="webdavPrefix"><AInput v-model:value="form.webdavPrefix" /></AFormItem>
+              <AFormItem label="用户名" name="webdavUsername"><AInput v-model:value="form.webdavUsername" autocomplete="off" /></AFormItem>
+              <AFormItem label="密码" :extra="webdavPasswordSet ? '已配置，留空保持不变。' : '首次使用请填写。'"><AInputPassword v-model:value="webdavPassword" autocomplete="new-password" /></AFormItem>
             </div>
-          </div>
-        </section>
-
-        <section v-if="savedBackend === 's3'" class="dashboard-section overflow-hidden">
-          <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:cloud-data-connection" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">S3 旧空间回收</h2><p class="mt-1 text-sm text-muted">查找失败上传、旧版本和数据库不再引用的对象</p></div></div>
-            <UBadge :color="s3CleanupStatusColor" variant="soft">{{ s3CleanupStatusText }}</UBadge>
-          </header>
-          <div class="space-y-4 p-5 sm:p-6">
-            <UAlert v-if="s3CleanupLoadError" color="warning" variant="subtle" icon="tabler:refresh-alert" title="S3 清理进度暂时未更新" :description="`${s3CleanupLoadError}；页面会自动重试。`" />
-            <div class="rounded-xl border border-info/20 bg-info/10 p-4 text-sm leading-6 text-info">
-              <p class="font-medium">先扫描，确认后才删除</p>
-              <p class="mt-1 text-xs">范围严格限制为当前桶的 <code>{{ latestS3Cleanup?.managedPrefix || `${form.s3Prefix || ''}${form.s3Prefix ? '/' : ''}albums/` }}</code>。相簿母本、上传暂存账本和删除队列中的对象都会受保护；最近 24 小时的新对象也不会进入清单。</p>
+            <div v-else class="admin-form-grid">
+              <AFormItem label="S3 Endpoint" name="s3Endpoint" required extra="R2 使用账户的 S3 API 地址，不包含桶名。"><AInput v-model:value="form.s3Endpoint" placeholder="https://account-id.r2.cloudflarestorage.com" /></AFormItem>
+              <AFormItem label="区域" name="s3Region" required extra="Cloudflare R2 填 auto"><AInput v-model:value="form.s3Region" /></AFormItem>
+              <AFormItem label="桶名" name="s3Bucket" required><AInput v-model:value="form.s3Bucket" /></AFormItem>
+              <AFormItem label="存储前缀" name="s3Prefix" extra="不要以 / 开头"><AInput v-model:value="form.s3Prefix" /></AFormItem>
+              <AFormItem label="Access Key" name="s3AccessKey" required><AInput v-model:value="form.s3AccessKey" autocomplete="off" /></AFormItem>
+              <AFormItem label="Secret Key" :extra="s3SecretKeySet ? '已配置，留空保持不变。' : '首次使用请填写。'"><AInputPassword v-model:value="s3SecretKey" autocomplete="new-password" /></AFormItem>
             </div>
-            <template v-if="latestS3Cleanup">
-              <div v-if="latestS3Cleanup.status === 'running' && latestS3Cleanup.phase === 'scanning'" class="flex items-center gap-3 rounded-xl bg-elevated p-4 text-sm text-muted"><Icon name="tabler:loader-2" class="size-5 animate-spin text-primary" /><span>正在分页读取 S3 对象列表。可安全中断，单页请求最多等待 30 秒。</span></div>
-              <template v-else>
-                <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                  <div class="rounded-xl bg-elevated p-4"><p class="text-xs text-muted">已扫描</p><p class="mt-1 text-lg font-semibold text-highlighted">{{ latestS3Cleanup.scannedObjects }}</p></div>
-                  <div class="rounded-xl bg-elevated p-4"><p class="text-xs text-muted">受保护 / 宽限期</p><p class="mt-1 text-lg font-semibold text-highlighted">{{ latestS3Cleanup.protectedObjects }}</p></div>
-                  <div class="rounded-xl bg-elevated p-4"><p class="text-xs text-muted">待回收对象</p><p class="mt-1 text-lg font-semibold text-highlighted">{{ latestS3Cleanup.total }}</p></div>
-                  <div class="rounded-xl bg-elevated p-4"><p class="text-xs text-muted">预计释放</p><p class="mt-1 text-lg font-semibold text-highlighted">{{ formatBytes(latestS3Cleanup.bytesFound) }}</p></div>
-                </div>
-                <div v-if="latestS3Cleanup.phase === 'deleting' || latestS3Cleanup.status === 'completed'">
-                  <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">清理进度</span><strong class="text-highlighted">{{ latestS3Cleanup.completed }} / {{ latestS3Cleanup.total }}（{{ s3CleanupProgress }}%）</strong></div>
-                  <UProgress :model-value="s3CleanupProgress" />
-                  <p class="mt-2 text-xs text-muted">已删除 {{ latestS3Cleanup.deleted }} · 失败 {{ latestS3Cleanup.failed }} · 删除前受保护 {{ latestS3Cleanup.skipped }} · 已释放 {{ formatBytes(latestS3Cleanup.bytesDeleted) }} · 并发 {{ latestS3Cleanup.workerCount }}</p>
-                </div>
-              </template>
-              <UAlert v-if="latestS3Cleanup.error" :color="latestS3Cleanup.status === 'completed' ? 'warning' : 'error'" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestS3Cleanup.error" />
-            </template>
-            <p v-else class="text-sm leading-6 text-muted">首次使用需要 S3 凭据具备列出和删除对象权限。扫描不会读取图片内容，也不会删除任何对象。</p>
-            <div class="flex flex-wrap justify-end gap-2">
-              <UButton v-if="s3CleanupActive" color="warning" variant="soft" icon="tabler:player-stop" :loading="isS3CleanupAction" @click="runS3CleanupAction('cancel')">安全中断</UButton>
-              <UButton v-else-if="latestS3Cleanup && ['failed', 'cancelled', 'interrupted'].includes(latestS3Cleanup.status)" icon="tabler:player-play" :loading="isS3CleanupAction" :disabled="Boolean(activeStorageTask) || Boolean(thumbnailTaskActive)" @click="runS3CleanupAction('resume')">继续任务</UButton>
-              <UButton v-if="latestS3Cleanup?.status === 'ready' && latestS3Cleanup.total > 0" color="error" icon="tabler:trash" :loading="isS3CleanupAction" :disabled="Boolean(activeStorageTask) || Boolean(thumbnailTaskActive)" @click="runS3CleanupAction('delete')">确认清理 {{ latestS3Cleanup.total }} 个对象</UButton>
-              <UButton v-if="!s3CleanupActive" color="neutral" variant="soft" icon="tabler:radar" :loading="isS3CleanupAction" :disabled="Boolean(activeStorageTask) || Boolean(thumbnailTaskActive)" @click="runS3CleanupAction('scan')">{{ latestS3Cleanup ? '重新扫描' : '扫描旧对象' }}</UButton>
-            </div>
-          </div>
-        </section>
-
-        <section v-if="latestMigration" class="dashboard-section overflow-hidden">
-          <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-            <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:transfer" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">存储迁移</h2><p class="mt-1 text-sm text-muted">{{ latestMigration.sourceBackend.toUpperCase() }} → {{ latestMigration.targetBackend.toUpperCase() }} · {{ latestMigration.total }} 张图片</p></div></div>
-            <UBadge :color="migrationStatusColor(latestMigration)" variant="soft">{{ migrationStatusText(latestMigration) }}</UBadge>
-          </header>
-          <div class="space-y-4 p-5 sm:p-6">
-            <UAlert v-if="migrationLoadError" color="warning" variant="subtle" icon="tabler:refresh-alert" title="迁移进度暂时未更新" :description="`${migrationLoadError}；页面会自动重试。`" />
-            <div v-if="latestMigration.cleanupStatus === 'cleaning' || ['cleaned', 'retained'].includes(latestMigration.cleanupStatus)">
-              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">旧存储处理进度</span><strong class="text-highlighted">{{ latestMigration.cleanupCompleted }} / {{ latestMigration.total }}</strong></div>
-              <UProgress :model-value="latestMigration.total ? Math.round(latestMigration.cleanupCompleted / latestMigration.total * 100) : 0" />
-            </div>
-            <div v-else>
-              <div class="mb-2 flex items-center justify-between text-sm"><span class="text-muted">复制并校验进度</span><strong class="text-highlighted">{{ latestMigration.completed }} / {{ latestMigration.total }}（{{ migrationProgress }}%）</strong></div>
-              <UProgress :model-value="migrationProgress" />
-              <p class="mt-2 text-xs text-muted">成功 {{ latestMigration.succeeded }} · 失败 {{ latestMigration.failed }} · 已中断 {{ latestMigration.cancelled }}</p>
-            </div>
-            <UAlert v-if="latestMigration.error" color="warning" variant="subtle" icon="tabler:alert-triangle" title="任务提示" :description="latestMigration.error" />
-            <div v-if="latestMigration.status === 'completed' && ['pending', 'failed', 'interrupted'].includes(latestMigration.cleanupStatus)" class="rounded-xl border border-warning/20 bg-warning/10 p-4">
-              <p class="font-medium text-warning">新存储已启用，旧存储尚未处理</p>
-              <p class="mt-1 text-xs leading-5 text-muted">删除前会再次读回并校验新存储中的每张图片。也可以选择保留旧副本作为备份。</p>
-            </div>
-            <div class="flex flex-wrap justify-end gap-2">
-              <UButton v-if="['queued', 'running'].includes(latestMigration.status) || latestMigration.cleanupStatus === 'cleaning'" color="warning" variant="soft" icon="tabler:player-stop" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cancel')">安全中断</UButton>
-              <UButton v-if="['failed', 'cancelled', 'interrupted'].includes(latestMigration.status)" icon="tabler:player-play" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'resume')">继续迁移</UButton>
-              <template v-if="latestMigration.status === 'completed' && ['pending', 'failed', 'interrupted'].includes(latestMigration.cleanupStatus)">
-                <UButton color="neutral" variant="soft" icon="tabler:archive" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'retain')">保留旧存储</UButton>
-                <UButton color="error" icon="tabler:trash" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cleanup')">删除旧存储图片</UButton>
-              </template>
-            </div>
-          </div>
-        </section>
-
-        <div class="grid items-start gap-5 xl:grid-cols-[300px_minmax(0,1fr)]">
-          <aside class="space-y-4 xl:sticky xl:top-4">
-            <section class="dashboard-section overflow-hidden">
-              <div class="border-b border-default px-4 py-4"><h2 class="font-semibold text-highlighted">1. 选择存储类型</h2><p class="mt-1 text-sm text-muted">选择后只填写对应配置</p></div>
-              <div class="space-y-2 p-2">
-                <button v-for="option in backendOptions" :key="option.value" type="button" class="flex w-full items-center gap-3 rounded-xl border p-3 text-left transition" :class="form.backend === option.value ? 'border-primary/30 bg-primary/10' : 'border-transparent hover:bg-elevated'" :disabled="isLoading || isTesting || isSaving || storageBusy" @click="changeBackend(option.value)">
-                  <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="form.backend === option.value ? 'bg-primary text-inverted' : 'bg-elevated text-muted'"><Icon :name="option.icon" class="size-5" /></span>
-                  <span class="min-w-0 flex-1"><span class="block text-sm font-medium text-highlighted">{{ option.label }}</span><span class="mt-0.5 block text-xs leading-5 text-muted">{{ backendDescriptions[option.value] }}</span></span>
-                  <Icon v-if="form.backend === option.value" name="tabler:check" class="size-4 shrink-0 text-primary" />
-                </button>
-              </div>
-            </section>
-
-            <section class="dashboard-section p-4">
-              <div class="flex items-start gap-3"><span class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-success/10 text-success"><Icon name="tabler:shield-lock" class="size-5" /></span><div><h3 class="text-sm font-semibold text-highlighted">密钥不会回显</h3><p class="mt-1 text-xs leading-5 text-muted">后端只返回是否已设置。密码和 Secret Key 不会写入浏览器存储或 URL。</p></div></div>
-            </section>
-
-            <section v-if="storageTargetChanged" class="rounded-xl border border-warning/20 bg-warning/10 p-4 text-sm text-warning">
-              <p class="flex items-center gap-2 font-medium"><Icon name="tabler:alert-triangle" class="size-4" />存储目标发生变化</p><p class="mt-2 text-xs leading-5">{{ storedPhotoCount ? `保存后会迁移 ${storedPhotoCount} 张图片，全部校验成功才切换。` : '当前没有图片，可以直接切换。' }}</p>
-            </section>
-          </aside>
-
-          <section class="dashboard-section overflow-hidden">
-            <header class="flex flex-wrap items-start justify-between gap-3 border-b border-default px-5 py-4 sm:px-6">
-              <div class="flex items-start gap-3"><span class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon :name="backendIcons[form.backend]" class="size-5" /></span><div><h2 class="font-semibold text-highlighted">2. 配置 {{ backendOptions.find(item => item.value === form.backend)?.label }}</h2><p class="mt-1 text-sm text-muted">原始上传文件、迁移和删除会使用这里的配置；三层浏览图保存在应用数据目录</p></div></div>
-              <UBadge v-if="form.backend === savedBackend" color="success" variant="soft">当前已启用</UBadge>
-            </header>
-
-            <div v-if="isLoading" class="space-y-4 p-6"><USkeleton class="h-5 w-36" /><USkeleton class="h-11 w-full" /><USkeleton class="h-11 w-full" /><USkeleton class="h-11 w-full" /></div>
-
-            <div v-else class="p-5 sm:p-6">
-              <section v-if="form.backend === 'local'" class="space-y-5">
-                <div class="rounded-xl bg-elevated p-4 text-sm leading-6 text-muted"><p class="font-medium text-highlighted">适合单机 Compose 部署</p><p class="mt-1">建议保持 <code class="rounded bg-default px-1.5 py-0.5 text-xs">./data/storage</code>，图片会和数据库一起位于当前部署目录的持久化数据中。</p></div>
-                <UFormField label="本地存储路径" description="该路径由 Rust 服务进程读写。" required><UInput v-model="form.localPath" icon="tabler:folder" size="lg" placeholder="./data/storage" class="w-full" /></UFormField>
-              </section>
-
-              <section v-else-if="form.backend === 'webdav'" class="space-y-5">
-                <UFormField label="WebDAV 地址" description="必须是完整的 http:// 或 https:// URL。" required><UInput v-model="form.webdavUrl" type="url" icon="tabler:link" size="lg" placeholder="https://dav.example.com/remote.php/dav/files/user/" class="w-full" /></UFormField>
-                <div class="grid gap-5 sm:grid-cols-2">
-                  <UFormField label="用户名" required><UInput v-model="form.webdavUsername" autocomplete="username" icon="tabler:user" class="w-full" /></UFormField>
-                  <UFormField label="密码" :description="webdavPasswordSet ? '已安全保存；留空继续使用原密码。' : '首次启用时必须输入。'" :required="!webdavPasswordSet"><UInput v-model="webdavPassword" type="password" autocomplete="new-password" icon="tabler:key" :placeholder="webdavPasswordSet ? '留空沿用已保存密码' : '输入 WebDAV 密码'" class="w-full" /></UFormField>
-                </div>
-                <UFormField label="存储前缀" description="不要以 / 开头，用于隔离 ChronoFrame 对象。"><UInput v-model="form.webdavPrefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" /></UFormField>
-              </section>
-
-              <section v-else class="space-y-5">
-                <div class="rounded-xl border border-info/20 bg-info/10 p-4 text-sm leading-6 text-info"><p class="font-medium">Cloudflare R2 提示</p><p class="mt-1 text-xs">Endpoint 只填写到账户级 <code>/</code> 根地址，不要把桶名附在 URL 后；R2 区域通常填写 <code>auto</code>。</p></div>
-                <div class="grid gap-5 sm:grid-cols-2">
-                  <UFormField label="S3 Endpoint" description="完整 HTTP(S) URL，不包含桶名。" required><UInput v-model="form.s3Endpoint" type="url" icon="tabler:link" placeholder="https://account-id.r2.cloudflarestorage.com" class="w-full" /></UFormField>
-                  <UFormField label="区域" required><UInput v-model="form.s3Region" icon="tabler:world" placeholder="auto 或 us-east-1" class="w-full" /></UFormField>
-                  <UFormField label="桶名" required><UInput v-model="form.s3Bucket" icon="tabler:bucket" placeholder="chronoframe" class="w-full" /></UFormField>
-                  <UFormField label="存储前缀" description="不要以 / 开头。"><UInput v-model="form.s3Prefix" icon="tabler:folder" placeholder="chronoframe" class="w-full" /></UFormField>
-                  <UFormField label="Access Key" required><UInput v-model="form.s3AccessKey" autocomplete="username" icon="tabler:id" class="w-full" /></UFormField>
-                  <UFormField label="Secret Key" :description="s3SecretKeySet ? '已安全保存；留空继续使用原密钥。' : '首次启用时必须输入。'" :required="!s3SecretKeySet"><UInput v-model="s3SecretKey" type="password" autocomplete="new-password" icon="tabler:key" :placeholder="s3SecretKeySet ? '留空沿用已保存密钥' : '输入 Secret Key'" class="w-full" /></UFormField>
-                </div>
-              </section>
-            </div>
-
-            <footer class="border-t border-default bg-muted/50 p-4 sm:px-6">
-              <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <p class="flex items-center gap-2 text-sm" :class="isDirty ? 'text-warning' : 'text-muted'"><Icon :name="isDirty ? 'tabler:edit-circle' : 'tabler:circle-check'" class="size-5" />{{ isDirty ? '配置有未保存的更改' : '当前配置已保存' }}</p>
-                <div class="flex flex-wrap justify-end gap-2"><UButton color="neutral" variant="outline" icon="tabler:plug-connected" :loading="isTesting" :disabled="isSaving || storageBusy" @click="testConnection">只测试连接</UButton><UButton :icon="migrationRequired ? 'tabler:transfer' : 'tabler:device-floppy'" :loading="isSaving" :disabled="isTesting || !isDirty || storageBusy" @click="saveSettings">{{ migrationRequired ? '开始安全迁移' : '验证、保存并启用' }}</UButton></div>
-              </div>
-              <p class="mt-3 text-xs leading-5 text-muted">测试或保存请求发出后，密码和 Secret Key 输入框会立即清空。</p>
-            </footer>
-          </section>
-        </div>
-      </div>
-    </template>
-  </UDashboardPanel>
+            <AAlert v-if="storageBusy" type="warning" show-icon message="存储任务正在运行，请完成或中断任务后再修改连接。" class="mb-5" />
+            <AAlert v-else-if="migrationRequired" type="info" show-icon :message="'已存在 ' + storedPhotoCount + ' 张图片，将先复制校验，再切换到新存储。'" class="mb-5" />
+            <ASpace wrap><AButton type="primary" html-type="submit" :loading="isSaving" :disabled="isTesting || !isDirty || storageBusy">{{ migrationRequired ? '开始安全迁移' : '保存并启用' }}</AButton><AButton :loading="isTesting" :disabled="isSaving || storageBusy" @click="testConnection">测试连接</AButton><AButton :disabled="!isDirty || isSaving" @click="loadSettings">重置</AButton></ASpace>
+            <p class="admin-help mt-4">测试不会保存配置。密码和 Secret Key 发送后立即清空，不会写入浏览器存储。相册 ZIP 与此处配置无关，始终保存在本地。</p>
+          </AForm>
+        </ACard>
+      </ATabPane>
+      <ATabPane key="migration" tab="存储迁移">
+        <AAlert v-if="migrationLoadError" type="warning" :message="migrationLoadError" show-icon class="mb-5" />
+        <AAlert v-if="!latestMigration" type="info" message="暂无迁移记录。修改存储连接并保存后，会自动创建迁移任务。" show-icon />
+        <ACard v-else title="最近一次迁移">
+          <template #extra><ATag :color="migrationStatusColor(latestMigration)">{{ migrationStatusText(latestMigration) }}</ATag></template>
+          <ADescriptions :column="3"><ADescriptionsItem label="来源">{{ latestMigration.sourceBackend.toUpperCase() }}</ADescriptionsItem><ADescriptionsItem label="目标">{{ latestMigration.targetBackend.toUpperCase() }}</ADescriptionsItem><ADescriptionsItem label="图片">{{ latestMigration.total }}</ADescriptionsItem></ADescriptions>
+          <AProgress :percent="latestMigration.cleanupStatus === 'cleaning' ? (latestMigration.total ? Math.round(latestMigration.cleanupCompleted / latestMigration.total * 100) : 0) : migrationProgress" />
+          <p class="admin-help mt-2 mb-4">成功 {{ latestMigration.succeeded }} · 失败 {{ latestMigration.failed }} · 旧对象已清理 {{ latestMigration.cleanupCompleted }}</p>
+          <AAlert v-if="latestMigration.error" type="warning" :message="latestMigration.error" class="mb-4" />
+          <AAlert v-if="latestMigration.status === 'completed' && ['pending','failed','interrupted'].includes(latestMigration.cleanupStatus)" type="warning" show-icon message="新存储已启用，请决定是否删除旧存储中的副本。" class="mb-4" />
+          <ASpace wrap>
+            <AButton v-if="['queued','running'].includes(latestMigration.status) || latestMigration.cleanupStatus === 'cleaning'" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cancel')">安全中断</AButton>
+            <AButton v-if="['failed','cancelled','interrupted'].includes(latestMigration.status)" type="primary" :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'resume')">继续迁移</AButton>
+            <template v-if="latestMigration.status === 'completed' && ['pending','failed','interrupted'].includes(latestMigration.cleanupStatus)"><AButton danger :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'cleanup')">删除旧存储图片</AButton><AButton :loading="isStorageTaskAction" @click="runStorageTaskAction(latestMigration, 'retain')">保留旧副本</AButton></template>
+          </ASpace>
+        </ACard>
+      </ATabPane>
+      <ATabPane key="cache" tab="图片缓存">
+        <ACard title="重建三层浏览图">
+          <template #extra><ATag :color="thumbnailStatusColor">{{ thumbnailStatusText }}</ATag></template>
+          <p class="admin-help mb-5">生成 320px PNG、≤1.5 MB WebP 预览和 ≤5 MB WebP 高清图。此操作不改变原图，也不删除下载 ZIP。</p>
+          <AAlert v-if="thumbnailLoadError" type="warning" :message="thumbnailLoadError" class="mb-4" />
+          <template v-if="latestThumbnailJob"><AProgress :percent="thumbnailProgress" /><p class="admin-help mt-2 mb-5">{{ latestThumbnailJob.completed }} / {{ latestThumbnailJob.total }} · 成功 {{ latestThumbnailJob.succeeded }} · 失败 {{ latestThumbnailJob.failed }} · 并发 {{ latestThumbnailJob.workerCount }}</p><AAlert v-if="latestThumbnailJob.error" type="warning" :message="latestThumbnailJob.error" class="mb-4" /></template>
+          <ASpace><AButton v-if="thumbnailTaskActive" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('cancel')">安全中断</AButton><AButton v-else type="primary" :loading="isThumbnailTaskAction" :disabled="storageBusy" @click="runThumbnailTaskAction('start')">清空并重新生成</AButton><AButton v-if="latestThumbnailJob && ['failed','cancelled','interrupted'].includes(latestThumbnailJob.status)" :loading="isThumbnailTaskAction" @click="runThumbnailTaskAction('resume')">继续上次任务</AButton></ASpace>
+        </ACard>
+      </ATabPane>
+      <ATabPane key="cleanup" tab="S3 空间清理">
+        <ACard title="清理失去引用的旧对象">
+          <template #extra><ATag :color="s3CleanupStatusColor">{{ s3CleanupStatusText }}</ATag></template>
+          <AAlert type="info" show-icon message="先扫描，再由管理员确认删除" description="仅处理 ChronoFrame 管理前缀，保护数据库引用和 24 小时内的新对象。不会删除本地 ZIP。" class="mb-5" />
+          <AAlert v-if="s3CleanupLoadError" type="warning" :message="s3CleanupLoadError" class="mb-4" />
+          <template v-if="latestS3Cleanup">
+            <ADescriptions :column="3"><ADescriptionsItem label="已扫描对象">{{ latestS3Cleanup.scannedObjects }}</ADescriptionsItem><ADescriptionsItem label="候选旧对象">{{ latestS3Cleanup.total }}</ADescriptionsItem><ADescriptionsItem label="预计释放">{{ formatBytes(latestS3Cleanup.bytesFound) }}</ADescriptionsItem></ADescriptions>
+            <AProgress :percent="s3CleanupProgress" /><p class="admin-help mt-2 mb-5">已删除 {{ latestS3Cleanup.deleted }} · 已释放 {{ formatBytes(latestS3Cleanup.bytesDeleted) }} · 失败 {{ latestS3Cleanup.failed }}</p>
+            <AAlert v-if="latestS3Cleanup.error" type="warning" :message="latestS3Cleanup.error" class="mb-4" />
+          </template>
+          <ASpace wrap><AButton v-if="s3CleanupActive" :loading="isS3CleanupAction" @click="runS3CleanupAction('cancel')">安全中断</AButton><AButton v-else type="primary" :disabled="savedBackend !== 's3' || storageBusy" :loading="isS3CleanupAction" @click="runS3CleanupAction('scan')">扫描旧对象</AButton><AButton v-if="latestS3Cleanup?.status === 'ready' && latestS3Cleanup.total > 0" danger :loading="isS3CleanupAction" @click="runS3CleanupAction('delete')">确认删除旧对象</AButton><AButton v-if="latestS3Cleanup && ['failed','cancelled','interrupted'].includes(latestS3Cleanup.status)" :loading="isS3CleanupAction" @click="runS3CleanupAction('resume')">继续任务</AButton></ASpace>
+        </ACard>
+      </ATabPane>
+    </ATabs>
+  </div>
 </template>

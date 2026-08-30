@@ -5,6 +5,7 @@ import type { RustAlbum } from '~~/shared/types/photo'
 const { t } = useI18n()
 const { settings: siteSettings } = useSiteSettings()
 const { photos } = usePhotos()
+const { downloads } = usePublicAlbumDownloads()
 const { data, status } = useFetch<RustAlbum[]>('/api/albums', {
   server: false,
   default: () => [],
@@ -77,14 +78,14 @@ useHead({ title: t('title.albums') })
       <div v-else-if="!albums.length" class="grid min-h-64 place-items-center text-center text-neutral-500"><div><Icon name="tabler:library-photo" class="mx-auto mb-3 size-12" /><p>{{ t('dashboard.albums.noAlbums') }}</p></div></div>
 
       <div v-else class="grid grid-cols-1 gap-10 sm:grid-cols-2 sm:gap-16 lg:grid-cols-3 xl:grid-cols-4">
-        <NuxtLink
+        <article
           v-for="album in albums"
           :key="album.id"
-          :to="`/albums/${album.id}`"
-          class="group block rounded-2xl outline-none transition-transform active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-primary"
+          class="group relative"
           @mouseenter="hoveredAlbum = album.id"
           @mouseleave="hoveredAlbum = null"
         >
+          <NuxtLink :to="`/albums/${album.id}`" class="block rounded-2xl outline-none transition-transform active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-primary">
           <div class="relative mb-4 h-52 sm:h-48">
             <motion.div
               v-for="(photo, index) in album.photos.slice(0, 3)"
@@ -113,7 +114,9 @@ useHead({ title: t('title.albums') })
             <p v-if="album.description" class="mt-1 line-clamp-2 text-sm leading-relaxed text-neutral-600 dark:text-neutral-400">{{ album.description }}</p>
             <p class="mt-1.5 text-sm text-neutral-500">{{ album.displayCreatedDate ? formatGalleryCalendarDate(album.displayCreatedDate) : formatGalleryDate(album.createdAt) }}</p>
           </div>
-        </NuxtLink>
+          </NuxtLink>
+          <AlbumDownloadButton class="absolute right-2 top-2 z-10" :download="downloads.find(item => item.albumId === album.id)" />
+        </article>
       </div>
     </section>
   </main>
