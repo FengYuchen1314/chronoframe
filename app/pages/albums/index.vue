@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { motion } from 'motion-v'
 import type { RustAlbum } from '~~/shared/types/photo'
+import { albumCoverStack } from '~~/shared/utils/albumCover'
 
 const { t } = useI18n()
 const { settings: siteSettings } = useSiteSettings()
 const { photos } = usePhotos()
 const { downloads } = usePublicAlbumDownloads()
 const { data, status } = useFetch<RustAlbum[]>('/api/albums', {
+  key: 'public-albums',
   server: false,
   default: () => [],
 })
@@ -88,7 +90,7 @@ useHead({ title: t('title.albums') })
           <NuxtLink :to="`/albums/${album.id}`" class="block rounded-2xl outline-none transition-transform active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-primary">
           <div class="relative mb-4 h-52 sm:h-48">
             <motion.div
-              v-for="(photo, index) in album.photos.slice(0, 3)"
+              v-for="(photo, index) in albumCoverStack(album)"
               :key="photo.id"
               class="absolute inset-0 overflow-hidden rounded-xl bg-white shadow-lg dark:bg-neutral-800"
               :initial="{ ...transform(index, false), opacity: 1 - index * 0.12 }"
@@ -100,7 +102,7 @@ useHead({ title: t('title.albums') })
               <motion.div v-if="index > 0" class="absolute inset-0 bg-black/15" :animate="{ opacity: hoveredAlbum === album.id ? 0 : 1 }" />
             </motion.div>
 
-            <div v-if="!album.photos.length" class="absolute inset-0 flex flex-col items-center justify-center gap-3 rounded-xl border border-neutral-200 bg-linear-to-br from-neutral-100 to-neutral-50 shadow-lg transition-shadow group-hover:shadow-xl dark:border-neutral-600 dark:from-neutral-700 dark:to-neutral-800">
+            <div v-if="!album.coverUrl && !album.photos.length" class="absolute inset-0 flex flex-col items-center justify-center gap-3 rounded-xl border border-neutral-200 bg-linear-to-br from-neutral-100 to-neutral-50 shadow-lg transition-shadow group-hover:shadow-xl dark:border-neutral-600 dark:from-neutral-700 dark:to-neutral-800">
               <Icon name="tabler:library-photo" class="size-10 text-neutral-400" />
               <p class="text-sm font-medium text-neutral-600 dark:text-neutral-300">{{ t('ui.album.noImage') }}</p>
             </div>

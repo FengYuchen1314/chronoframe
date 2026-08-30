@@ -19,7 +19,6 @@ const showTop = ref(false)
 const albumPhotos = computed(() => album.value?.photos || [])
 const { openPhoto } = useViewerRoute(albumPhotos, () => `/albums/${albumId.value}`)
 const items = computed(() => albumPhotos.value.map((photo, index) => ({ id: photo.id, photo, index })))
-const cover = computed(() => album.value?.photos.find(photo => photo.id === album.value?.coverPhotoId) || album.value?.photos[0])
 const dateRange = computed(() => {
   if (album.value?.photoDateStart && album.value.photoDateEnd) {
     const start = formatGalleryCalendarDate(album.value.photoDateStart)
@@ -108,8 +107,8 @@ useHead({ title: computed(() => album.value?.title || t('title.albums')) })
     <div v-if="status === 'idle' || status === 'pending'" class="grid min-h-[60vh] place-items-center"><Icon name="tabler:loader-2" class="size-8 animate-spin text-primary" /></div>
 
     <template v-else-if="album">
-      <div v-if="cover" class="absolute inset-x-0 top-0 -z-10 h-[320px] overflow-hidden sm:h-[500px]">
-        <PhotoProgressiveImage :src="cover.thumbnailUrl" :alt="album.title" loading="eager" fetch-priority="high" fit="cover" class="h-full w-full scale-110 opacity-40 saturate-150 dark:opacity-20" />
+      <div v-if="album.coverUrl" class="absolute inset-x-0 top-0 -z-10 h-[320px] overflow-hidden sm:h-[500px]">
+        <PhotoProgressiveImage :src="album.coverUrl" :alt="album.title" loading="eager" fetch-priority="high" fit="cover" class="h-full w-full scale-110 opacity-40 saturate-150 dark:opacity-20" />
         <div class="absolute -inset-1 bg-linear-to-b from-transparent via-white/50 to-white backdrop-blur-xl sm:backdrop-blur-2xl dark:via-neutral-900/50 dark:to-neutral-900" />
       </div>
 

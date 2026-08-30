@@ -68,6 +68,8 @@ export interface RustAlbum {
   position?: number | null
   photoCount?: number | null
   photos?: RustPhoto[] | null
+  coverPhotoId?: string | null
+  coverUrl?: string | null
 }
 
 export interface RustAlbumDetailPayload {
@@ -83,6 +85,8 @@ export interface RustAlbumDetailPayload {
   photoDateEnd?: string | null
   position?: number | null
   photoCount?: number | null
+  coverPhotoId?: string | null
+  coverUrl?: string | null
 }
 
 export interface GalleryAlbum {
@@ -98,4 +102,5 @@ export interface GalleryAlbum {
   photos: GalleryPhoto[]
   photoIds: string[]
   coverPhotoId: string | null
+  coverUrl: string | null
 }

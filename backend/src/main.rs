@@ -60,6 +60,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
+mod album_covers;
 mod album_downloads;
 
 #[derive(Clone)]
@@ -1472,6 +1473,8 @@ struct Album {
     photo_date_end: Option<String>,
     position: i64,
     photo_count: i64,
+    #[serde(flatten)]
+    cover: album_covers::Cover,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1597,6 +1600,7 @@ fn album_from(row: &sqlx::sqlite::SqliteRow) -> Album {
         photo_date_end: row.get("photo_date_end"),
         position: row.get("position"),
         photo_count: row.get("photo_count"),
+        cover: album_covers::from_row(row),
     }
 }
 fn photo_from(row: &sqlx::sqlite::SqliteRow) -> Photo {
@@ -3958,23 +3962,32 @@ fn validate_photo_date_range(start: &Option<String>, end: &Option<String>) -> Ap
 }
 
 async fn list_albums(State(state): State<AppState>) -> ApiResult<Json<Vec<Album>>> {
-    let rows = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id GROUP BY a.id ORDER BY a.position ASC,a.created_at DESC,a.id ASC").fetch_all(&state.db).await.map_err(AppError::internal)?;
+    let rows = sqlx::query(&format!(
+        "{} GROUP BY a.id ORDER BY a.position ASC,a.created_at DESC,a.id ASC",
+        album_covers::ALBUM_SELECT
+    ))
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::internal)?;
     Ok(Json(rows.iter().map(album_from).collect()))
 }
 async fn album_detail(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
 ) -> ApiResult<Json<AlbumDetail>> {
-    let row = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
-        .bind(&album_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError {
-            status: StatusCode::NOT_FOUND,
-            message: "相簿不存在".into(),
-            clear_auth_cookies: None,
-        })?;
+    let row = sqlx::query(&format!(
+        "{} WHERE a.id=? GROUP BY a.id",
+        album_covers::ALBUM_SELECT
+    ))
+    .bind(&album_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?
+    .ok_or_else(|| AppError {
+        status: StatusCode::NOT_FOUND,
+        message: "相簿不存在".into(),
+        clear_auth_cookies: None,
+    })?;
     let photos = sqlx::query("SELECT id,album_id,original_name,storage_key,format,content_type,byte_size,width,height,created_at FROM photos WHERE album_id=? ORDER BY created_at DESC,id DESC")
         .bind(&album_id)
         .fetch_all(&state.db)
@@ -4007,6 +4020,11 @@ async fn create_album(
         photo_date_end: None,
         position,
         photo_count: 0,
+        cover: album_covers::Cover {
+            cover_source: "auto",
+            cover_photo_id: None,
+            cover_url: None,
+        },
     };
     sqlx::query("INSERT INTO albums(id,name,description,created_at,position) VALUES(?,?,?,?,?)")
         .bind(&album.id)
@@ -4094,11 +4112,14 @@ async fn patch_album(
         .await
         .map_err(AppError::internal)?;
 
-    let row = sqlx::query("SELECT a.id,a.name,a.description,a.created_at,a.display_created_date,a.photo_date_start,a.photo_date_end,a.position,COUNT(p.id) photo_count FROM albums a LEFT JOIN photos p ON p.album_id=a.id WHERE a.id=? GROUP BY a.id")
-        .bind(&album_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(AppError::internal)?;
+    let row = sqlx::query(&format!(
+        "{} WHERE a.id=? GROUP BY a.id",
+        album_covers::ALBUM_SELECT
+    ))
+    .bind(&album_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::internal)?;
     Ok(Json(album_from(&row)))
 }
 
@@ -6459,6 +6480,7 @@ async fn setup_database(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS s3_cleanup_jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,phase TEXT NOT NULL,scanned_objects INTEGER NOT NULL DEFAULT 0,protected_objects INTEGER NOT NULL DEFAULT 0,total INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,bytes_found INTEGER NOT NULL DEFAULT 0,bytes_deleted INTEGER NOT NULL DEFAULT 0,worker_count INTEGER NOT NULL,location_key TEXT NOT NULL,managed_prefix TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,error TEXT); CREATE TABLE IF NOT EXISTS s3_cleanup_items (id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES s3_cleanup_jobs(id) ON DELETE CASCADE,object_key TEXT NOT NULL,logical_key TEXT NOT NULL,byte_size INTEGER NOT NULL,last_modified INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT,UNIQUE(job_id,object_key)); CREATE INDEX IF NOT EXISTS idx_s3_cleanup_items_job_status ON s3_cleanup_items(job_id,status); CREATE UNIQUE INDEX IF NOT EXISTS idx_s3_cleanup_one_active ON s3_cleanup_jobs((1)) WHERE status='running';")
         .execute(pool)
         .await?;
+    album_covers::setup(pool).await?;
     let album_columns: HashSet<String> = sqlx::query("PRAGMA table_info(albums)")
         .fetch_all(pool)
         .await?
@@ -6835,6 +6857,17 @@ async fn main() -> Result<()> {
         .route("/api/albums", get(list_albums).post(create_album))
         .route("/api/albums/order", post(reorder_albums))
         .route("/api/albums/export", get(export_albums))
+        .route(
+            "/api/albums/{album_id}/cover",
+            post(album_covers::upload)
+                .put(album_covers::select)
+                .delete(album_covers::reset)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/albums/{album_id}/cover/{version}",
+            get(album_covers::serve),
+        )
         .route(
             "/api/albums/{album_id}",
             get(album_detail).patch(patch_album).delete(delete_album),

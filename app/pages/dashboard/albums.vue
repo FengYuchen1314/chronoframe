@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { Alert as AAlert, Button as AButton, Card as ACard, DatePicker as ADatePicker, Form as AForm, FormItem as AFormItem, Input as AInput, InputSearch as AInputSearch, Textarea as ATextarea, Modal as AModal, Table as ATable, Tabs as ATabs, TabPane as ATabPane, Space as ASpace, Tag as ATag, Progress as AProgress, UploadDragger as AUploadDragger, Image as AImage, Checkbox as ACheckbox } from 'ant-design-vue'
-import type { Album, AlbumDeletionResult, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
+import type { Album, AlbumCover, AlbumDeletionResult, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
 
 definePageMeta({
   layout: 'dashboard',
@@ -55,6 +55,11 @@ const isDeletingAlbum = ref(false)
 const isSavingAlbumDates = ref(false)
 const isSavingAlbumIdentity = ref(false)
 const isReorderingAlbums = ref(false)
+const isSavingCover = ref(false)
+const applyAlbumCover = (id: string, cover: AlbumCover) => {
+  const album = albums.value.find(item => item.id === id)
+  if (album) Object.assign(album, cover)
+}
 const isAlbumDetailReady = ref(false)
 const uploadCompleted = ref(0)
 const uploadTotal = ref(0)
@@ -104,6 +109,7 @@ const hasActiveMutation = computed(() =>
   || isDeletingAlbum.value
   || isSavingAlbumDates.value
   || isSavingAlbumIdentity.value
+  || isSavingCover.value
   || isReorderingAlbums.value,
 )
 const isAlbumInteractionLocked = computed(() =>
@@ -281,6 +287,9 @@ const loadAlbumDetail = async (albumId: string): Promise<boolean> => {
         photoDateEnd: detail.photoDateEnd,
         position: detail.position,
         photoCount: detail.photoCount,
+        coverSource: detail.coverSource,
+        coverPhotoId: detail.coverPhotoId,
+        coverUrl: detail.coverUrl,
       }
     }
     isAlbumDetailReady.value = true
@@ -738,12 +747,13 @@ const confirmDiscardAlbumMetadata = () =>
   !albumMetadataDirty.value || toast.confirm('相簿名称、简介或显示日期尚未保存，确定要放弃修改吗？')
 
 const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-  if (!albumMetadataDirty.value && !isUploading.value) return
+  if (!albumMetadataDirty.value && !isUploading.value && !isSavingCover.value) return
   event.preventDefault()
   event.returnValue = true
 }
 
 onBeforeRouteLeave(() => {
+  if (isSavingCover.value) { toast.add({ title: '封面正在保存，请稍候', color: 'warning' }); return false }
   if (isUploading.value) { toast.add({ title: '图片正在上传，请等待完成后离开', color: 'warning' }); return false }
   return confirmDiscardAlbumMetadata()
 })
@@ -814,6 +824,7 @@ const queueFile = (file: File) => { selectedFiles.value.push(file); return false
       </ATabPane>
       <ATabPane key="details" tab="相册设置">
         <div class="admin-stack" style="max-width:960px">
+          <DashboardAlbumCoverEditor :key="selectedAlbum.id" :album="selectedAlbum" :photos="photos" :disabled="isAlbumInteractionLocked || !isAlbumDetailReady" @saved="applyAlbumCover" @busy="isSavingCover = $event" />
           <ACard title="基本信息"><AForm layout="vertical" @finish="saveAlbumIdentity">
             <AFormItem label="相册名称" html-for="album-name" required><AInput id="album-name" v-model:value="albumNameDraft" :maxlength="100" :disabled="!isAlbumDetailReady" /></AFormItem>
             <AFormItem label="相册简介" html-for="album-description" extra="显示在相册首页和详情页"><ATextarea id="album-description" v-model:value="albumDescriptionDraft" :maxlength="1000" show-count :rows="4" :disabled="!isAlbumDetailReady" /></AFormItem>
