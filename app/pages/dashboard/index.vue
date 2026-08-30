@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Alert as AAlert, Button as AButton, Card as ACard, Statistic as AStatistic, Table as ATable, Tag as ATag, Space as ASpace } from 'ant-design-vue'
 import type { Album, Photo, StorageBackend, StorageSettings } from '~/types/dashboard'
 
 definePageMeta({ layout: 'dashboard' })
@@ -38,46 +39,26 @@ const refreshAll = async () => {
   }
 }
 onMounted(refreshAll)
+const columns = [{ title: '相册名称', dataIndex: 'name' }, { title: '图片数量', dataIndex: 'photoCount', width: 120 }, { title: '简介', dataIndex: 'description', ellipsis: true }, { title: '操作', key: 'actions', width: 160 }]
 </script>
 
 <template>
-  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
-    <template #header>
-      <UDashboardNavbar title="工作台">
-        <template #right><UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoading" @click="refreshAll">刷新</UButton></template>
-      </UDashboardNavbar>
-    </template>
-    <template #body>
-      <div class="dashboard-panel-body flex flex-col gap-6">
-        <UAlert v-if="loadError" color="error" variant="subtle" icon="tabler:alert-circle" title="概览数据加载失败" :description="loadError" />
-        <DashboardPageHero eyebrow="工作台" title="相簿与图片概览" description="上传后自动生成三层浏览图；前台浏览不再直接读取体积庞大的原始文件。" icon="tabler:layout-dashboard">
-          <template #actions><UButton to="/dashboard/albums" icon="tabler:plus">新建相簿</UButton><UButton to="/dashboard/settings/storage" color="neutral" variant="soft" icon="tabler:photo-cog">派生图维护</UButton></template>
-        </DashboardPageHero>
-        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <DashboardMetricCard label="相簿空间" :value="albums.length" icon="tabler:album" tone="info" hint="进入相簿工作台" to="/dashboard/albums" />
-          <DashboardMetricCard label="图片总数" :value="photos.length" icon="tabler:photo" tone="success" :hint="formatBytes(totalBytes)" to="/dashboard/albums" />
-          <DashboardMetricCard label="浏览层级" value="3 层" icon="tabler:layers-subtract" tone="warning" hint="PNG / 1.5 MB / 5 MB" to="/dashboard/settings/storage" />
-          <DashboardMetricCard label="当前存储" :value="storage ? storageLabels[storage.backend] : '—'" icon="tabler:database" tone="neutral" hint="配置保存在后台" to="/dashboard/settings/storage" />
-        </div>
-        <div class="grid grid-cols-1 gap-4 xl:grid-cols-5">
-          <section class="dashboard-section overflow-hidden xl:col-span-3">
-            <div class="border-b border-default px-5 py-4"><h2 class="font-semibold text-highlighted">图片交付链路</h2><p class="mt-1 text-sm text-muted">每张图片上传后并发生成，失败时访问接口也会自动补齐</p></div>
-            <div class="grid gap-3 p-5 sm:grid-cols-3">
-              <div class="rounded-xl bg-elevated p-4"><Icon name="tabler:photo" class="size-6 text-primary" /><p class="mt-3 font-medium">网格缩略图</p><p class="mt-1 text-xs leading-5 text-muted">320px PNG，优先铺满相簿页面。</p></div>
-              <div class="rounded-xl bg-elevated p-4"><Icon name="tabler:photo-search" class="size-6 text-info" /><p class="mt-3 font-medium">默认查看图</p><p class="mt-1 text-xs leading-5 text-muted">WebP 严格不超过 1.5 MB。</p></div>
-              <div class="rounded-xl bg-elevated p-4"><Icon name="tabler:zoom-in-area" class="size-6 text-success" /><p class="mt-3 font-medium">手动高清图</p><p class="mt-1 text-xs leading-5 text-muted">点击后加载，WebP 不超过 5 MB。</p></div>
-            </div>
-          </section>
-          <section class="dashboard-section overflow-hidden xl:col-span-2">
-            <div class="border-b border-default px-5 py-4"><h2 class="font-semibold text-highlighted">常用操作</h2><p class="mt-1 text-sm text-muted">日常管理只保留高频入口</p></div>
-            <div class="space-y-2 p-3">
-              <NuxtLink to="/dashboard/albums" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated"><span class="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:folder-plus" class="size-5" /></span><span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">创建相簿并上传</span><span class="mt-0.5 block text-xs text-muted">上传时自动处理三层浏览图</span></span><Icon name="tabler:chevron-right" class="size-4 text-dimmed" /></NuxtLink>
-              <NuxtLink to="/dashboard/settings/storage" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated"><span class="flex size-10 items-center justify-center rounded-xl bg-warning/10 text-warning"><Icon name="tabler:refresh" class="size-5" /></span><span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">重建全站派生图</span><span class="mt-0.5 block text-xs text-muted">为旧版本图片补齐三层缓存</span></span><Icon name="tabler:chevron-right" class="size-4 text-dimmed" /></NuxtLink>
-              <NuxtLink to="/dashboard/settings/general" class="group flex items-center gap-3 rounded-xl p-3 transition hover:bg-elevated"><span class="flex size-10 items-center justify-center rounded-xl bg-info/10 text-info"><Icon name="tabler:palette" class="size-5" /></span><span class="min-w-0 flex-1"><span class="block font-medium text-highlighted">网站外观</span><span class="mt-0.5 block text-xs text-muted">修改名称、标语、头像和主题</span></span><Icon name="tabler:chevron-right" class="size-4 text-dimmed" /></NuxtLink>
-            </div>
-          </section>
-        </div>
+  <div>
+    <DashboardPageHeader title="概览" description="查看相册、图片和存储状态，快速进入日常管理。"><AButton :loading="isLoading" @click="refreshAll">刷新</AButton><NuxtLink to="/dashboard/albums"><AButton type="primary">管理相册</AButton></NuxtLink></DashboardPageHeader>
+    <div class="admin-stack">
+      <AAlert v-if="loadError" type="error" show-icon :message="loadError" />
+      <div class="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
+        <ACard><AStatistic title="相册总数" :value="albums.length" /></ACard>
+        <ACard><AStatistic title="图片总数" :value="photos.length" /></ACard>
+        <ACard><AStatistic title="原图总大小" :value="formatBytes(totalBytes)" /></ACard>
+        <ACard><AStatistic title="当前图片存储" :value="storage ? storageLabels[storage.backend] : '—'" :value-style="{ fontSize: 22 }" /></ACard>
       </div>
-    </template>
-  </UDashboardPanel>
+      <ACard title="相册">
+        <ATable :columns="columns" :data-source="albums" row-key="id" :loading="isLoading" :pagination="{ pageSize: 8, showSizeChanger: false }" :scroll="{ x: 600 }">
+          <template #bodyCell="{ column, record }"><template v-if="column.key === 'actions'"><ASpace><NuxtLink :to="'/albums/' + record.id" target="_blank">查看</NuxtLink><NuxtLink :to="'/dashboard/downloads?album=' + record.id">下载设置</NuxtLink></ASpace></template></template>
+        </ATable>
+      </ACard>
+      <ACard title="常用操作"><ASpace wrap :size="16"><NuxtLink to="/dashboard/downloads"><AButton>管理本地 ZIP</AButton></NuxtLink><NuxtLink to="/dashboard/settings/storage"><AButton>存储与缓存维护</AButton></NuxtLink><NuxtLink to="/dashboard/settings/general"><AButton>修改网站信息</AButton></NuxtLink></ASpace><p class="admin-help mt-4">图片原件使用当前存储；三层浏览缓存及相册下载 ZIP 始终存放在服务器本地数据目录。</p></ACard>
+    </div>
+  </div>
 </template>

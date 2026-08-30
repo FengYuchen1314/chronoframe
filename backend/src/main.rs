@@ -60,6 +60,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
+mod album_downloads;
+
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
@@ -79,6 +81,7 @@ struct AppState {
     thumbnail_workers: usize,
     password_hash_slots: Arc<tokio::sync::Semaphore>,
     photo_graph_lock: Arc<tokio::sync::Mutex<()>>,
+    downloads: Arc<album_downloads::Service>,
 }
 
 const STORAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -6671,6 +6674,7 @@ async fn main() -> Result<()> {
         .connect(&config.database_url)
         .await?;
     setup_database(&db).await?;
+    album_downloads::setup(&db).await?;
     let master_key = load_or_create_master_key(&config.master_key_file).await?;
     let storage = StorageService::new(db.clone(), master_key, config.thumbnail_cache_dir.clone());
     let photo_graph_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -6766,13 +6770,18 @@ async fn main() -> Result<()> {
         thumbnail_workers,
         password_hash_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         photo_graph_lock,
+        downloads: Arc::new(album_downloads::Service::new(
+            config.thumbnail_cache_dir.with_file_name("album-downloads"),
+        )),
     };
+    album_downloads::start(state.clone()).await?;
     // A persisted administrator rebuild takes precedence over the opportunistic startup backfill.
     // Its phase and item states make a restart safe even if it happened while clearing the cache.
     if !recover_thumbnail_rebuild(state.clone()).await {
         spawn_thumbnail_backfill(state.clone());
     }
     let api = Router::new()
+        .merge(album_downloads::routes())
         .route("/api/auth/status", get(auth_status))
         .route(
             "/api/auth/register",
@@ -6893,19 +6902,23 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    async fn test_state() -> AppState {
+    pub(super) async fn test_state() -> AppState {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         setup_database(&db).await.unwrap();
+        album_downloads::setup(&db).await.unwrap();
         let thumbnail_cache_dir =
             std::env::temp_dir().join(format!("chronoframe-test-thumbnails-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&thumbnail_cache_dir)
             .await
             .unwrap();
         AppState {
+            downloads: Arc::new(album_downloads::Service::new(
+                thumbnail_cache_dir.join("album-downloads"),
+            )),
             storage: StorageService::new(db.clone(), [7u8; 32], thumbnail_cache_dir),
             db,
             secure_cookies: Some(false),

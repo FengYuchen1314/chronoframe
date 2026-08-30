@@ -1,4 +1,5 @@
 <script lang="ts" setup>
+import { Alert as AAlert, Button as AButton, Card as ACard, DatePicker as ADatePicker, Form as AForm, FormItem as AFormItem, Input as AInput, InputSearch as AInputSearch, Textarea as ATextarea, Modal as AModal, Table as ATable, Tabs as ATabs, TabPane as ATabPane, Space as ASpace, Tag as ATag, Progress as AProgress, UploadDragger as AUploadDragger, Image as AImage, Checkbox as ACheckbox } from 'ant-design-vue'
 import type { Album, AlbumDeletionResult, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
 
 definePageMeta({
@@ -7,7 +8,7 @@ definePageMeta({
 
 useHead({ title: '相簿' })
 
-const toast = useToast()
+const toast = useAdminNotice()
 const { adminFetch } = useAdminApi()
 
 const UPLOAD_CONCURRENCY = 7
@@ -310,7 +311,7 @@ const refreshAlbums = async (preferredAlbumId?: string): Promise<boolean> => {
     const candidateId = preferredAlbumId || selectedAlbumId.value
     const nextSelectedId = nextAlbums.some(album => album.id === candidateId)
       ? candidateId
-      : (nextAlbums[0]?.id || '')
+      : ''
 
     if (nextSelectedId === selectedAlbumId.value) {
       return await loadAlbumDetail(nextSelectedId)
@@ -590,7 +591,7 @@ const leavePhotoSelection = () => {
 const deleteSelectedPhotos = async () => {
   if (isDeletingPhotos.value || !selectedPhotoIds.value.length) return
   const count = selectedPhotoIds.value.length
-  if (!window.confirm(`确定永久删除选中的 ${count} 张图片吗？\n\n图片会从当前存储（包括 S3/R2 或 WebDAV）删除，不能撤销。`)) return
+  if (!await toast.confirm(`确定永久删除选中的 ${count} 张图片吗？\n\n图片会从当前存储（包括 S3/R2 或 WebDAV）删除，不能撤销。`)) return
   const albumId = selectedAlbumId.value
   isDeletingPhotos.value = true
   isAlbumDetailReady.value = false
@@ -734,322 +735,114 @@ watch(selectedAlbumId, (albumId) => {
 })
 
 const confirmDiscardAlbumMetadata = () =>
-  !albumMetadataDirty.value || window.confirm('相簿名称、简介或显示日期尚未保存，确定要放弃修改吗？')
+  !albumMetadataDirty.value || toast.confirm('相簿名称、简介或显示日期尚未保存，确定要放弃修改吗？')
 
 const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-  if (!albumMetadataDirty.value) return
+  if (!albumMetadataDirty.value && !isUploading.value) return
   event.preventDefault()
   event.returnValue = true
 }
 
-onBeforeRouteLeave(() => confirmDiscardAlbumMetadata())
+onBeforeRouteLeave(() => {
+  if (isUploading.value) { toast.add({ title: '图片正在上传，请等待完成后离开', color: 'warning' }); return false }
+  return confirmDiscardAlbumMetadata()
+})
 onMounted(() => {
   window.addEventListener('beforeunload', handleBeforeUnload)
   void refreshAlbums()
 })
 onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnload))
+const albumColumns = [{ title: '排序', key: 'order', width: 105 }, { title: '相册名称', dataIndex: 'name' }, { title: '图片', dataIndex: 'photoCount', width: 90 }, { title: '简介', dataIndex: 'description', ellipsis: true }, { title: '操作', key: 'actions', width: 250 }]
+const photoColumns = [{ title: '预览', key: 'preview', width: 90 }, { title: '文件名', dataIndex: 'originalName', ellipsis: true }, { title: '格式', dataIndex: 'format', width: 90 }, { title: '尺寸', key: 'dimensions', width: 130 }, { title: '大小', key: 'size', width: 110 }]
+const photoSelection = computed(() => ({ selectedRowKeys: selectedPhotoIds.value, onChange: (keys: (string | number)[]) => { selectedPhotoIds.value = keys.map(String) }, getCheckboxProps: () => ({ disabled: isDeletingPhotos.value || isUploading.value }) }))
+const queueFile = (file: File) => { selectedFiles.value.push(file); return false }
 </script>
 
 <template>
-  <UDashboardPanel :ui="{ body: 'p-0 sm:p-0' }">
-    <template #header>
-      <UDashboardNavbar title="相簿管理">
-        <template #right>
-          <UButton icon="tabler:refresh" color="neutral" variant="ghost" :loading="isLoadingAlbums" :disabled="isAlbumInteractionLocked" @click="refreshAlbums()">
-            刷新
-          </UButton>
+  <div>
+    <DashboardPageHeader :title="selectedAlbum ? selectedAlbum.name : '相册管理'" :description="selectedAlbum ? '管理图片、相册资料和公开下载' : '创建相册、调整展示顺序并管理图片'">
+      <AButton v-if="selectedAlbum" :disabled="isAlbumInteractionLocked" @click="selectAlbum('')">返回列表</AButton>
+      <AButton :loading="isLoadingAlbums" :disabled="hasActiveMutation" @click="refreshAlbums()">刷新</AButton>
+      <AButton v-if="!selectedAlbum" type="primary" @click="openCreateDialog">新建相册</AButton>
+      <template v-else>
+        <NuxtLink :to="'/dashboard/downloads?album=' + selectedAlbumId"><AButton>下载设置</AButton></NuxtLink>
+        <NuxtLink :to="'/albums/' + selectedAlbumId" target="_blank"><AButton>查看相册</AButton></NuxtLink>
+        <AButton danger :disabled="isAlbumInteractionLocked" @click="requestDeleteCurrentAlbum">删除相册</AButton>
+      </template>
+    </DashboardPageHeader>
+    <AAlert v-if="albumError || photoError" class="mb-5" type="error" show-icon :message="albumError || photoError" />
+    <ACard v-if="!selectedAlbum">
+      <div class="admin-toolbar"><AInputSearch v-model:value="albumQuery" placeholder="搜索相册名称或简介" allow-clear style="width:320px;max-width:100%" /><span class="admin-help">共 {{ albums.length }} 个相册 · 上下箭头调整公开展示顺序</span></div>
+      <ATable :columns="albumColumns" :data-source="filteredAlbums" row-key="id" :loading="isLoadingAlbums" :pagination="{ pageSize: 20, showSizeChanger: true }" :scroll="{ x: 900 }">
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'order'"><ASpace :size="0"><AButton type="text" :aria-label="'上移 ' + record.name" :disabled="albums[0]?.id === record.id || isAlbumInteractionLocked" @click="moveAlbum(record.id, -1)"><Icon name="tabler:arrow-up" /></AButton><AButton type="text" :aria-label="'下移 ' + record.name" :disabled="albums.at(-1)?.id === record.id || isAlbumInteractionLocked" @click="moveAlbum(record.id, 1)"><Icon name="tabler:arrow-down" /></AButton></ASpace></template>
+          <template v-else-if="column.dataIndex === 'name'"><AButton type="link" style="padding:0" @click="selectAlbum(record.id); activeWorkspaceTab = 'photos'">{{ record.name }}</AButton></template>
+          <template v-else-if="column.key === 'actions'"><ASpace><AButton type="link" size="small" @click="selectAlbum(record.id); activeWorkspaceTab = 'photos'">图片</AButton><AButton type="link" size="small" @click="selectAlbum(record.id); activeWorkspaceTab = 'details'">编辑</AButton><NuxtLink :to="'/dashboard/downloads?album=' + record.id">下载设置</NuxtLink></ASpace></template>
         </template>
-      </UDashboardNavbar>
-    </template>
+      </ATable>
+      <div class="mt-4"><AButton @click="activeWorkspaceTab = 'export'">管理员批量导出</AButton></div>
+    </ACard>
 
-    <template #body>
-      <div class="dashboard-panel-body space-y-6">
-        <DashboardPageHero
-          eyebrow="相簿管理"
-          title="相簿与图片"
-          description="先创建相簿，再上传和管理图片。选择相簿后可修改资料、调整公开日期、排序或打包下载。"
-          icon="tabler:album"
-        >
-          <template #actions>
-            <UButton icon="tabler:plus" @click="openCreateDialog">新建相簿</UButton>
-            <UButton color="neutral" variant="soft" icon="tabler:file-zip" :disabled="!albums.length" @click="openExportWorkspace()">批量打包</UButton>
-          </template>
-        </DashboardPageHero>
-
-        <UAlert v-if="albumError" color="error" variant="subtle" icon="tabler:alert-circle" title="相簿加载失败" :description="albumError" />
-
-        <div class="grid min-h-[680px] grid-cols-1 gap-5 lg:grid-cols-[290px_minmax(0,1fr)]">
-          <aside class="dashboard-section flex min-h-0 flex-col overflow-hidden lg:sticky lg:top-4 lg:max-h-[calc(100svh-7rem)]">
-            <div class="border-b border-default p-4">
-              <div class="flex items-center justify-between gap-3">
-                <div>
-                  <h2 class="font-semibold text-highlighted">我的相簿</h2>
-                  <p class="mt-0.5 text-xs text-muted">{{ albums.length }} 个空间</p>
-                </div>
-                <UButton :color="isOrderMode ? 'primary' : 'neutral'" :variant="isOrderMode ? 'soft' : 'ghost'" size="sm" icon="tabler:sort-ascending" :disabled="isAlbumInteractionLocked || albumMetadataDirty" @click="isOrderMode = !isOrderMode; albumQuery = ''">
-                  {{ isOrderMode ? '完成' : '排序' }}
-                </UButton>
-              </div>
-              <UInput v-if="!isOrderMode" v-model="albumQuery" icon="tabler:search" placeholder="搜索相簿" class="mt-3 w-full" />
-              <p v-else class="mt-3 rounded-lg bg-primary/10 px-3 py-2 text-xs leading-5 text-primary">用箭头调整公开页面中的前后顺序。</p>
+    <ATabs v-if="selectedAlbum" v-model:active-key="activeWorkspaceTab" class="mt-2">
+      <ATabPane key="photos" tab="图片与上传">
+        <div class="admin-stack">
+          <ACard title="上传图片">
+            <AUploadDragger multiple accept=".png,.jpg,.jpeg,.webp" :file-list="[]" :show-upload-list="false" :before-upload="queueFile" :disabled="isUploading || !isAlbumDetailReady">
+              <p class="ant-upload-drag-icon"><Icon name="tabler:cloud-upload" style="font-size:36px;color:#1677ff" /></p>
+              <p class="ant-upload-text">点击或拖动图片到这里</p>
+              <p class="ant-upload-hint">支持 PNG、JPG / JPEG、WebP，默认 7 并发上传</p>
+            </AUploadDragger>
+            <div v-if="selectedFiles.length || isUploading" class="mt-4">
+              <div class="admin-toolbar"><span>已选择 {{ selectedFiles.length }} 张 · {{ formatBytes(selectedBytes) }}</span><ASpace><AButton :disabled="isUploading" @click="clearSelectedFiles">清空</AButton><AButton type="primary" :loading="isUploading" :disabled="!selectedFiles.length" @click="uploadPhotos">开始上传</AButton></ASpace></div>
+              <AProgress v-if="isUploading" :percent="uploadTotal ? Math.round(uploadCompleted / uploadTotal * 100) : 0" />
+              <p v-if="isUploading" class="admin-help">{{ uploadCompleted }} / {{ uploadTotal }} · {{ uploadActiveCount }} 个文件正在上传，请保持当前页面打开</p>
+              <p v-else class="admin-help" style="overflow-wrap:anywhere">{{ selectedFiles.slice(0, 5).map(file => file.name).join('、') }}{{ selectedFiles.length > 5 ? ' 等' : '' }}</p>
             </div>
-
-            <div v-if="isLoadingAlbums && !albums.length" class="space-y-2 p-3">
-              <USkeleton v-for="index in 5" :key="index" class="h-16 w-full rounded-xl" />
-            </div>
-
-            <div v-else-if="filteredAlbums.length" class="custom-scrollbar min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
-              <div
-                v-for="album in filteredAlbums"
-                :key="album.id"
-                class="group flex items-center rounded-xl border transition"
-                :class="selectedAlbumId === album.id ? 'border-primary/20 bg-primary/10 shadow-sm' : 'border-transparent hover:bg-elevated'"
-              >
-                <button type="button" class="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left" :disabled="isAlbumInteractionLocked || isOrderMode" @click="selectAlbum(album.id)">
-                  <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="selectedAlbumId === album.id ? 'bg-primary text-inverted' : 'bg-elevated text-muted'">
-                    <Icon name="tabler:photo" class="size-5" />
-                  </span>
-                  <span class="min-w-0 flex-1">
-                    <span class="block truncate text-sm font-medium text-highlighted">{{ album.name }}</span>
-                    <span class="mt-0.5 block text-xs text-muted">{{ album.photoCount }} 张图片</span>
-                  </span>
-                </button>
-                <div v-if="isOrderMode" class="flex shrink-0 items-center pr-2">
-                  <UButton icon="tabler:arrow-up" color="neutral" variant="ghost" size="xs" aria-label="向前移动" :disabled="albums[0]?.id === album.id || isAlbumInteractionLocked" @click="moveAlbum(album.id, -1)" />
-                  <UButton icon="tabler:arrow-down" color="neutral" variant="ghost" size="xs" aria-label="向后移动" :disabled="albums.at(-1)?.id === album.id || isAlbumInteractionLocked" @click="moveAlbum(album.id, 1)" />
-                </div>
-                <Icon v-else-if="selectedAlbumId === album.id" name="tabler:chevron-right" class="mr-3 size-4 shrink-0 text-primary" />
-              </div>
-            </div>
-
-            <div v-else class="flex min-h-56 flex-1 flex-col items-center justify-center px-5 text-center">
-              <span class="flex size-12 items-center justify-center rounded-2xl bg-elevated text-muted"><Icon :name="albums.length ? 'tabler:search-off' : 'tabler:folder-plus'" class="size-6" /></span>
-              <p class="mt-3 font-medium text-highlighted">{{ albums.length ? '没有匹配的相簿' : '先创建一个相簿' }}</p>
-              <p class="mt-1 text-sm text-muted">{{ albums.length ? '换个关键词试试。' : '创建空间后才可以上传图片。' }}</p>
-            </div>
-
-            <div class="border-t border-default p-3">
-              <UButton block color="neutral" variant="soft" icon="tabler:plus" :disabled="hasActiveMutation" @click="openCreateDialog">新建相簿</UButton>
-            </div>
-          </aside>
-
-          <main class="min-w-0">
-            <section v-if="selectedAlbum" class="dashboard-section overflow-hidden">
-              <header class="border-b border-default px-4 pt-5 sm:px-6">
-                <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                  <div class="flex min-w-0 items-start gap-3">
-                    <span class="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary"><Icon name="tabler:album" class="size-6" /></span>
-                    <div class="min-w-0">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <h2 class="truncate text-xl font-semibold text-highlighted">{{ selectedAlbum.name }}</h2>
-                        <UBadge color="success" variant="soft">当前空间</UBadge>
-                      </div>
-                      <p class="mt-1 text-sm text-muted">{{ selectedAlbum.photoCount }} 张图片 · 创建于 {{ selectedAlbum.displayCreatedDate || timestampToDateInput(selectedAlbum.createdAt) }}</p>
-                    </div>
-                  </div>
-                  <div class="flex shrink-0 flex-wrap gap-2">
-                    <UButton color="neutral" variant="ghost" icon="tabler:settings" @click="activeWorkspaceTab = 'details'">相簿设置</UButton>
-                    <UButton color="neutral" variant="soft" icon="tabler:file-zip" @click="openExportWorkspace(true)">打包此相簿</UButton>
-                    <UButton icon="tabler:upload" @click="activeWorkspaceTab = 'photos'; uploadInput?.click()">选择图片</UButton>
-                  </div>
-                </div>
-
-                <nav class="custom-scrollbar mt-5 flex gap-1 overflow-x-auto" aria-label="相簿操作">
-                  <button
-                    v-for="tab in workspaceTabs"
-                    :key="tab.value"
-                    type="button"
-                    class="flex shrink-0 items-center gap-2 border-b-2 px-3 py-3 text-sm font-medium transition"
-                    :class="activeWorkspaceTab === tab.value ? 'border-primary text-primary' : 'border-transparent text-muted hover:text-highlighted'"
-                    @click="activeWorkspaceTab = tab.value"
-                  >
-                    <Icon :name="tab.icon" class="size-4" />{{ tab.label }}
-                    <span v-if="tab.value === 'photos'" class="rounded-full bg-elevated px-1.5 py-0.5 text-[10px]">{{ photos.length }}</span>
-                    <span v-if="tab.value === 'export' && exportAlbumIds.length" class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">{{ exportAlbumIds.length }}</span>
-                  </button>
-                </nav>
-              </header>
-
-              <div v-if="activeWorkspaceTab === 'photos'" class="space-y-6 p-4 sm:p-6">
-                <section class="rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 sm:p-5">
-                  <input ref="uploadInput" type="file" multiple accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" class="hidden" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @change="handleFileSelection" />
-                  <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="flex items-center gap-3">
-                      <span class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary text-inverted"><Icon name="tabler:cloud-upload" class="size-6" /></span>
-                      <div>
-                        <p class="font-medium text-highlighted">上传到「{{ selectedAlbum.name }}」</p>
-                        <p class="mt-1 text-xs leading-5 text-muted">PNG、JPG/JPEG、WEBP · 7 路上传，入库后立即并发生成三层浏览图</p>
-                      </div>
-                    </div>
-                    <UButton color="neutral" variant="outline" icon="tabler:photo-plus" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="uploadInput?.click()">选择图片</UButton>
-                  </div>
-
-                  <div v-if="selectedFiles.length" class="mt-4 flex flex-col gap-3 rounded-xl border border-primary/15 bg-default p-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="min-w-0 text-sm">
-                      <div class="flex items-center gap-2"><Icon name="tabler:files" class="size-4 shrink-0 text-primary" /><span>已选择 <strong>{{ selectedFiles.length }}</strong> 张，共 {{ formatBytes(selectedBytes) }}</span></div>
-                      <p v-if="isUploading" class="mt-1 pl-6 text-xs text-muted">7 路异步上传中 · 已完成 {{ uploadCompleted }} / {{ uploadTotal }} · 当前 {{ uploadActiveCount }} 张</p>
-                    </div>
-                    <div class="flex gap-2">
-                      <UButton size="sm" color="neutral" variant="ghost" :disabled="hasActiveMutation" @click="clearSelectedFiles">清空</UButton>
-                      <UButton size="sm" icon="tabler:upload" :loading="isUploading" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || albumMetadataDirty" @click="uploadPhotos">开始上传</UButton>
-                    </div>
-                  </div>
-                </section>
-
-                <UAlert v-if="photoError" color="error" variant="subtle" icon="tabler:alert-circle" title="相簿内容加载失败" :description="photoError" />
-
-                <section>
-                  <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-                    <div><h3 class="font-semibold text-highlighted">相簿内容</h3><p class="mt-1 text-sm text-muted">{{ isSelectingPhotos ? '选择一张或多张图片后统一删除' : '点击图片可在新窗口查看原文件' }}</p></div>
-                    <div class="flex items-center gap-2">
-                      <UBadge color="neutral" variant="soft">{{ photos.length }} 张</UBadge>
-                      <UButton v-if="photos.length && !isSelectingPhotos" size="sm" color="neutral" variant="soft" icon="tabler:select" :disabled="isAlbumInteractionLocked" @click="isSelectingPhotos = true">管理图片</UButton>
-                      <UButton v-else-if="isSelectingPhotos" size="sm" color="neutral" variant="ghost" :disabled="isDeletingPhotos" @click="leavePhotoSelection">退出管理</UButton>
-                    </div>
-                  </div>
-                  <div v-if="isSelectingPhotos" class="mb-4 flex flex-col gap-3 rounded-xl border border-primary/15 bg-primary/5 p-3 sm:flex-row sm:items-center sm:justify-between">
-                    <p class="text-sm text-highlighted">已选择 <strong>{{ selectedPhotoIds.length }}</strong> / {{ photos.length }} 张</p>
-                    <div class="flex flex-wrap gap-2">
-                      <UButton size="sm" color="neutral" variant="soft" :icon="allPhotosSelected ? 'tabler:square' : 'tabler:checkbox'" @click="toggleAllPhotos">{{ allPhotosSelected ? '取消全选' : '全选' }}</UButton>
-                      <UButton size="sm" color="error" icon="tabler:trash" :loading="isDeletingPhotos" :disabled="!selectedPhotoIds.length" @click="deleteSelectedPhotos">永久删除</UButton>
-                    </div>
-                  </div>
-                  <div v-if="isLoadingPhotos" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-                    <USkeleton v-for="index in 10" :key="index" class="aspect-square w-full rounded-xl" />
-                  </div>
-                  <div v-else-if="photos.length" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-                    <div v-for="photo in photos" :key="photo.id" class="group relative min-w-0 overflow-hidden rounded-xl border bg-elevated transition" :class="selectedPhotoIds.includes(photo.id) ? 'border-primary ring-2 ring-primary/20' : 'border-default hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md'">
-                      <a :href="`/api/photos/${photo.id}/file`" target="_blank" rel="noopener noreferrer" :class="isSelectingPhotos ? 'pointer-events-none' : ''">
-                        <div class="aspect-square overflow-hidden bg-muted"><img :src="`/api/photos/${photo.id}/thumbnail?v=grid2`" :alt="photo.originalName" loading="lazy" class="size-full object-cover transition duration-300 group-hover:scale-105" /></div>
-                        <div class="p-2.5"><p class="truncate text-sm font-medium text-highlighted" :title="photo.originalName">{{ photo.originalName }}</p><p class="mt-1 flex items-center justify-between gap-2 text-xs text-muted"><span>{{ photo.format.toUpperCase() }}</span><span>{{ formatBytes(photo.byteSize) }}</span></p></div>
-                      </a>
-                      <button v-if="isSelectingPhotos" type="button" class="absolute inset-0 cursor-pointer text-left" :aria-label="`${selectedPhotoIds.includes(photo.id) ? '取消选择' : '选择'} ${photo.originalName}`" @click="togglePhotoSelection(photo.id)">
-                        <span class="absolute right-2 top-2 flex size-7 items-center justify-center rounded-full border shadow-sm backdrop-blur" :class="selectedPhotoIds.includes(photo.id) ? 'border-primary bg-primary text-inverted' : 'border-white/60 bg-black/45 text-white'"><Icon :name="selectedPhotoIds.includes(photo.id) ? 'tabler:check' : 'tabler:circle'" class="size-4" /></span>
-                      </button>
-                    </div>
-                  </div>
-                  <div v-else class="flex min-h-64 flex-col items-center justify-center rounded-2xl border border-dashed border-default text-center">
-                    <span class="flex size-12 items-center justify-center rounded-2xl bg-elevated text-muted"><Icon name="tabler:photo-plus" class="size-6" /></span>
-                    <p class="mt-3 font-medium text-highlighted">这个相簿还是空的</p><p class="mt-1 text-sm text-muted">从上方选择图片，确认后再开始上传。</p>
-                  </div>
-                </section>
-              </div>
-
-              <div v-else-if="activeWorkspaceTab === 'details'" class="divide-y divide-default">
-                <section class="p-4 sm:p-6">
-                  <div class="grid gap-6 xl:grid-cols-[220px_minmax(0,1fr)]">
-                    <div><span class="flex size-10 items-center justify-center rounded-lg bg-primary/10 text-primary"><Icon name="tabler:edit" class="size-5" /></span><h3 class="mt-3 font-semibold text-highlighted">基本资料</h3><p class="mt-1 text-sm leading-6 text-muted">名称用于后台识别和公开展示；简介显示在相簿列表和详情页。</p></div>
-                    <form class="space-y-4" @submit.prevent="saveAlbumIdentity">
-                      <UFormField label="相簿名" description="1–100 个字符" required>
-                        <UInput v-model="albumNameDraft" maxlength="100" icon="tabler:album" placeholder="输入相簿名" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" />
-                      </UFormField>
-                      <UFormField label="公开简介" :description="`${albumDescriptionDraft.length} / 1000；留空保存即可隐藏`">
-                        <UTextarea v-model="albumDescriptionDraft" :rows="5" maxlength="1000" placeholder="介绍这个相簿的主题、地点或故事" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" />
-                      </UFormField>
-                      <div class="flex flex-wrap justify-end gap-2"><UButton v-if="albumIdentityDirty" type="button" color="neutral" variant="ghost" icon="tabler:arrow-back-up" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="resetAlbumIdentityDraft">放弃修改</UButton><UButton type="submit" icon="tabler:device-floppy" :loading="isSavingAlbumIdentity" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || !albumIdentityDirty || !albumNameDraft.trim()">保存基本资料</UButton></div>
-                    </form>
-                  </div>
-                </section>
-
-                <section class="p-4 sm:p-6">
-                  <div class="grid gap-6 xl:grid-cols-[220px_minmax(0,1fr)]">
-                    <div><span class="flex size-10 items-center justify-center rounded-xl bg-warning/10 text-warning"><Icon name="tabler:calendar-event" class="size-5" /></span><div class="mt-3 flex flex-wrap items-center gap-2"><h3 class="font-semibold text-highlighted">公开显示日期</h3><UBadge :color="albumHasCustomDates ? 'primary' : 'neutral'" variant="soft">{{ albumHasCustomDates ? '手动' : '自动' }}</UBadge></div><p class="mt-1 text-sm leading-6 text-muted">只改变公开页面的文字，不修改图片时间戳和文件。</p></div>
-                    <form class="space-y-4" @submit.prevent="saveAlbumDates">
-                      <UAlert v-if="photoError && !isAlbumDetailReady" color="error" variant="subtle" icon="tabler:alert-circle" title="相簿详情加载失败" description="日期表单已锁定，请刷新后重试。" />
-                      <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
-                        <UFormField label="相簿创建日期" required><UInput v-model="albumDateDraft.displayCreatedDate" type="date" icon="tabler:clock-plus" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" /></UFormField>
-                        <UFormField label="图片范围开始" required><UInput v-model="albumDateDraft.photoDateStart" type="date" icon="tabler:calendar" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" /></UFormField>
-                        <UFormField label="图片范围结束" required><UInput v-model="albumDateDraft.photoDateEnd" type="date" icon="tabler:calendar" class="w-full" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" /></UFormField>
-                      </div>
-                      <div class="flex flex-wrap justify-end gap-2"><UButton v-if="albumDatesDirty" type="button" color="neutral" variant="ghost" icon="tabler:arrow-back-up" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked" @click="resetAlbumDateDraft">放弃</UButton><UButton type="button" color="neutral" variant="soft" icon="tabler:restore" :loading="isSavingAlbumDates && albumHasCustomDates" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || (!albumHasCustomDates && !albumDatesDirty)" @click="clearAlbumDates">恢复自动日期</UButton><UButton type="submit" icon="tabler:device-floppy" :loading="isSavingAlbumDates" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || !albumDatesDirty">保存日期</UButton></div>
-                    </form>
-                  </div>
-                </section>
-
-                <section class="p-4 sm:p-6">
-                  <div class="grid gap-6 xl:grid-cols-[220px_minmax(0,1fr)]">
-                    <div><span class="flex size-10 items-center justify-center rounded-lg bg-error/10 text-error"><Icon name="tabler:trash" class="size-5" /></span><h3 class="mt-3 font-semibold text-highlighted">删除相簿</h3><p class="mt-1 text-sm leading-6 text-muted">永久删除相簿、其中的图片记录以及当前存储中的文件。</p></div>
-                    <div class="flex flex-col gap-4 rounded-xl border border-error/25 bg-error/5 p-4 sm:flex-row sm:items-center sm:justify-between">
-                      <div><p class="font-medium text-highlighted">删除「{{ selectedAlbum.name }}」</p><p class="mt-1 text-sm leading-6 text-muted">{{ selectedAlbum.photoCount ? `同时永久删除 ${selectedAlbum.photoCount} 张图片。转换或迁移任务占用时会拒绝删除。` : '这是一个空相簿，可以直接删除。' }}</p></div>
-                      <UButton color="error" variant="soft" icon="tabler:trash" :loading="isDeletingAlbum" :disabled="!isAlbumDetailReady || isAlbumInteractionLocked || albumMetadataDirty" @click="requestDeleteCurrentAlbum">删除相簿</UButton>
-                    </div>
-                  </div>
-                </section>
-              </div>
-
-              <div v-else class="p-4 sm:p-6">
-                <div class="mx-auto max-w-4xl">
-                  <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-                    <div><h3 class="text-lg font-semibold text-highlighted">选择要打包的相簿</h3><p class="mt-1 text-sm text-muted">单选生成一个 ZIP；多选生成外层 ZIP，里面每个相簿各有一个 ZIP。</p></div>
-                    <div class="flex gap-2"><UButton size="sm" color="neutral" variant="soft" :disabled="exportAlbumIds.length === albums.length" @click="exportAlbumIds = albums.map(album => album.id)">全选</UButton><UButton size="sm" color="neutral" variant="ghost" :disabled="!exportAlbumIds.length" @click="exportAlbumIds = []">清空</UButton></div>
-                  </div>
-
-                  <div class="mt-5 grid gap-2 sm:grid-cols-2">
-                    <label v-for="album in albums" :key="`export-${album.id}`" class="flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition" :class="exportAlbumIds.includes(album.id) ? 'border-primary/30 bg-primary/10' : 'border-default hover:bg-elevated'">
-                      <input type="checkbox" class="size-4 accent-primary" :checked="exportAlbumIds.includes(album.id)" @change="handleExportAlbumToggle(album.id, $event)">
-                      <span class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-elevated text-muted"><Icon name="tabler:album" class="size-4" /></span>
-                      <span class="min-w-0 flex-1"><span class="block truncate text-sm font-medium text-highlighted">{{ album.name }}</span><span class="mt-0.5 block text-xs text-muted">{{ album.photoCount }} 张图片</span></span>
-                    </label>
-                  </div>
-
-                  <div class="mt-6 flex flex-col gap-4 rounded-2xl bg-elevated p-4 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="flex items-center gap-3"><span class="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:file-zip" class="size-5" /></span><div><p class="font-medium text-highlighted">{{ exportAlbumIds.length ? `已选择 ${exportAlbumIds.length} 个相簿` : '尚未选择相簿' }}</p><p class="mt-0.5 text-xs text-muted">{{ exportAlbumIds.length === 1 ? '图片会直接放在 ZIP 内。' : exportAlbumIds.length > 1 ? `将生成包含 ${exportAlbumIds.length} 个相簿 ZIP 的压缩包。` : '勾选一个或多个相簿后开始。' }}</p></div></div>
-                    <UButton icon="tabler:download" :loading="isStartingExport" :disabled="!exportAlbumIds.length" @click="startAlbumExport">开始打包下载</UButton>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            <section v-else class="dashboard-section flex min-h-[520px] flex-col items-center justify-center px-6 text-center">
-              <span class="flex size-16 items-center justify-center rounded-3xl bg-primary/10 text-primary"><Icon name="tabler:folder-plus" class="size-8" /></span>
-              <h2 class="mt-5 text-xl font-semibold text-highlighted">从第一个相簿开始</h2>
-              <p class="mt-2 max-w-md text-sm leading-6 text-muted">ChronoFrame 只允许向相簿空间上传图片。创建后，这里会变成该相簿的完整工作区。</p>
-              <UButton class="mt-5" size="lg" icon="tabler:plus" @click="openCreateDialog">创建相簿</UButton>
-            </section>
-          </main>
+          </ACard>
+          <ACard :title="'相册图片（' + photos.length + '）'">
+            <template #extra><AButton danger :disabled="!selectedPhotoIds.length || isUploading" :loading="isDeletingPhotos" @click="deleteSelectedPhotos">删除所选 {{ selectedPhotoIds.length || '' }}</AButton></template>
+            <ATable :columns="photoColumns" :data-source="photos" :row-selection="photoSelection" row-key="id" :loading="isLoadingPhotos" :pagination="{ pageSize: 30, showSizeChanger: true }" :scroll="{ x: 620 }">
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'preview'"><AImage :width="48" :height="48" class="admin-preview" :src="'/api/photos/' + record.id + '/thumbnail'" :preview="{ src: '/api/photos/' + record.id + '/preview' }" /></template>
+                <template v-else-if="column.dataIndex === 'format'"><ATag>{{ record.format.toUpperCase() }}</ATag></template>
+                <template v-else-if="column.key === 'dimensions'">{{ record.width }} × {{ record.height }}</template>
+                <template v-else-if="column.key === 'size'">{{ formatBytes(record.byteSize) }}</template>
+              </template>
+            </ATable>
+          </ACard>
         </div>
-      </div>
-    </template>
-  </UDashboardPanel>
-
-  <Teleport to="body">
-    <Transition enter-active-class="transition duration-200" enter-from-class="opacity-0" leave-active-class="transition duration-150" leave-to-class="opacity-0">
-      <div v-if="isCreateDialogOpen" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm" role="presentation" @click.self="closeCreateDialog">
-        <section role="dialog" aria-modal="true" aria-labelledby="create-album-title" class="w-full max-w-lg overflow-hidden rounded-xl border border-default bg-default shadow-2xl">
-          <header class="flex items-start justify-between gap-4 border-b border-default px-5 py-4">
-            <div class="flex items-center gap-3"><span class="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Icon name="tabler:folder-plus" class="size-5" /></span><div><h2 id="create-album-title" class="font-semibold text-highlighted">新建相簿空间</h2><p class="mt-0.5 text-sm text-muted">创建后会自动选中，可立即上传图片。</p></div></div>
-            <UButton icon="tabler:x" color="neutral" variant="ghost" aria-label="关闭" :disabled="isCreating" @click="closeCreateDialog" />
-          </header>
-          <form class="space-y-5 p-5" @submit.prevent="createAlbum">
-            <UFormField label="相簿名称" description="最多 100 个字符" required><UInput v-model="newAlbumName" maxlength="100" placeholder="例如：2026 夏日旅行" icon="tabler:album" class="w-full" :disabled="isCreating" autofocus /></UFormField>
-            <UFormField label="相簿简介" description="可稍后在资料页修改；留空也可以创建。"><UTextarea v-model="newAlbumDescription" :rows="4" maxlength="1000" placeholder="记录这个相簿的主题、地点或故事" class="w-full" :disabled="isCreating" /></UFormField>
-            <div class="flex justify-end gap-2"><UButton type="button" color="neutral" variant="ghost" :disabled="isCreating" @click="closeCreateDialog">取消</UButton><UButton type="submit" icon="tabler:plus" :loading="isCreating" :disabled="!newAlbumName.trim()">创建并进入</UButton></div>
-          </form>
-        </section>
-      </div>
-    </Transition>
-  </Teleport>
-
-  <Teleport to="body">
-    <Transition enter-active-class="transition duration-200" enter-from-class="opacity-0" leave-active-class="transition duration-150" leave-to-class="opacity-0">
-      <div v-if="isDeleteDialogOpen && selectedAlbum" class="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4" role="presentation" @click.self="closeDeleteAlbumDialog">
-        <section role="alertdialog" aria-modal="true" aria-labelledby="delete-album-title" class="w-full max-w-md overflow-hidden rounded-xl border border-default bg-default shadow-2xl">
-          <header class="flex items-start gap-3 border-b border-default px-5 py-4">
-            <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-error/10 text-error"><Icon name="tabler:trash" class="size-5" /></span>
-            <div class="min-w-0 flex-1"><h2 id="delete-album-title" class="font-semibold text-highlighted">删除相簿</h2><p class="mt-1 text-sm text-muted">此操作不能撤销</p></div>
-            <UButton icon="tabler:x" color="neutral" variant="ghost" aria-label="关闭" :disabled="isDeletingAlbum" @click="closeDeleteAlbumDialog" />
-          </header>
-          <div class="space-y-4 p-5">
-            <p class="text-sm leading-6 text-toned">确定永久删除相簿 <strong class="text-highlighted">「{{ selectedAlbum.name }}」</strong> 吗？</p>
-            <div class="rounded-lg border border-error/20 bg-error/5 px-4 py-3 text-sm leading-6 text-muted">
-              <p v-if="selectedAlbum.photoCount">相簿中的 <strong class="text-highlighted">{{ selectedAlbum.photoCount }} 张图片</strong>及其当前存储对象会一并删除。</p>
-              <p v-else>这是一个空相簿，不会删除图片文件。</p>
-              <p class="mt-1">若图片正被转换或存储迁移任务占用，系统会拒绝删除并保留原数据。</p>
+      </ATabPane>
+      <ATabPane key="details" tab="相册设置">
+        <div class="admin-stack" style="max-width:960px">
+          <ACard title="基本信息"><AForm layout="vertical" @finish="saveAlbumIdentity">
+            <AFormItem label="相册名称" html-for="album-name" required><AInput id="album-name" v-model:value="albumNameDraft" :maxlength="100" :disabled="!isAlbumDetailReady" /></AFormItem>
+            <AFormItem label="相册简介" html-for="album-description" extra="显示在相册首页和详情页"><ATextarea id="album-description" v-model:value="albumDescriptionDraft" :maxlength="1000" show-count :rows="4" :disabled="!isAlbumDetailReady" /></AFormItem>
+            <ASpace><AButton type="primary" html-type="submit" :loading="isSavingAlbumIdentity" :disabled="!albumIdentityDirty">保存基本信息</AButton><AButton :disabled="!albumIdentityDirty" @click="resetAlbumIdentityDraft">重置</AButton></ASpace>
+          </AForm></ACard>
+          <ACard title="展示日期"><AForm layout="vertical" @finish="saveAlbumDates">
+            <div class="admin-form-grid">
+              <AFormItem label="相册创建日期" html-for="album-created-date"><ADatePicker id="album-created-date" v-model:value="albumDateDraft.displayCreatedDate" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem><div />
+              <AFormItem label="图片开始日期" html-for="album-start-date"><ADatePicker id="album-start-date" v-model:value="albumDateDraft.photoDateStart" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem>
+              <AFormItem label="图片结束日期" html-for="album-end-date"><ADatePicker id="album-end-date" v-model:value="albumDateDraft.photoDateEnd" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem>
             </div>
-            <div class="flex justify-end gap-2"><UButton color="neutral" variant="ghost" :disabled="isDeletingAlbum" @click="closeDeleteAlbumDialog">取消</UButton><UButton color="error" icon="tabler:trash" :loading="isDeletingAlbum" @click="deleteCurrentAlbum">确认永久删除</UButton></div>
-          </div>
-        </section>
-      </div>
-    </Transition>
-  </Teleport>
+            <ASpace wrap><AButton type="primary" html-type="submit" :loading="isSavingAlbumDates" :disabled="!albumDatesDirty">保存日期</AButton><AButton :disabled="!albumDatesDirty" @click="resetAlbumDateDraft">重置</AButton><AButton @click="clearAlbumDates">恢复自动日期</AButton></ASpace>
+          </AForm></ACard>
+        </div>
+      </ATabPane>
+      <ATabPane key="export" tab="管理员导出">
+        <AAlert type="info" show-icon message="访客下载请在“下载设置”中开启。此处仅供管理员导出原始文件。" class="mb-4" />
+      </ATabPane>
+    </ATabs>
+    <ACard v-if="activeWorkspaceTab === 'export'" title="管理员批量导出" class="mt-4">
+      <p class="admin-help mb-4">单个相册为一个 ZIP；多个相册为一个包含各相册 ZIP 的总包。此导出不改变公开下载设置。</p>
+      <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 mb-5"><ACheckbox v-for="album in albums" :key="album.id" :checked="exportAlbumIds.includes(album.id)" @change="toggleExportAlbum(album.id, $event.target.checked)">{{ album.name }}（{{ album.photoCount }}）</ACheckbox></div>
+      <ASpace><AButton type="primary" :loading="isStartingExport" :disabled="!exportAlbumIds.length" @click="startAlbumExport">打包并下载所选相册</AButton><AButton @click="activeWorkspaceTab = 'photos'">收起</AButton></ASpace>
+    </ACard>
+    <AModal :open="isCreateDialogOpen" title="新建相册" ok-text="创建相册" cancel-text="取消" :confirm-loading="isCreating" :mask-closable="!isCreating" @ok="createAlbum" @cancel="closeCreateDialog">
+      <AForm layout="vertical" class="mt-5"><AFormItem label="相册名称" html-for="new-album-name" required><AInput id="new-album-name" v-model:value="newAlbumName" :maxlength="100" @press-enter="createAlbum" /></AFormItem><AFormItem label="相册简介" html-for="new-album-description"><ATextarea id="new-album-description" v-model:value="newAlbumDescription" :rows="3" :maxlength="1000" /></AFormItem></AForm>
+    </AModal>
+    <AModal :open="isDeleteDialogOpen" title="删除相册" ok-text="永久删除" cancel-text="取消" :ok-button-props="{ danger: true }" :confirm-loading="isDeletingAlbum" :mask-closable="!isDeletingAlbum" @ok="deleteCurrentAlbum" @cancel="closeDeleteAlbumDialog">
+      <AAlert type="warning" show-icon :message="'确定删除「' + (selectedAlbum?.name || '') + '」？'" :description="'该相册的 ' + (selectedAlbum?.photoCount || 0) + ' 张图片、存储原文件及本地下载包都会删除，此操作不能撤销。'" />
+    </AModal>
+  </div>
 </template>
