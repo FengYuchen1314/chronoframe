@@ -3,11 +3,20 @@ use super::*;
 use std::io::{Read, Seek};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+#[derive(Clone)]
+struct ZipPhoto {
+    name: String,
+    offset: u64,
+    size: u64,
+}
+type ZipIndexes = std::collections::VecDeque<(String, Arc<Vec<ZipPhoto>>)>;
+
 pub struct Service {
     root: PathBuf,
     tasks: DashMap<String, CancellationToken>,
     image_slots: Arc<tokio::sync::Semaphore>,
     disk_gate: Arc<std::sync::Mutex<()>>,
+    indexes: tokio::sync::Mutex<ZipIndexes>,
 }
 
 impl Service {
@@ -17,6 +26,7 @@ impl Service {
             tasks: DashMap::new(),
             image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             disk_gate: Arc::new(std::sync::Mutex::new(())),
+            indexes: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
     fn path(&self, id: &str, suffix: &str) -> Result<PathBuf> {
@@ -27,6 +37,7 @@ impl Service {
         Ok(self.root.join(format!("{id}.{suffix}")))
     }
     async fn remove_files(&self, id: &str) -> Result<()> {
+        self.indexes.lock().await.retain(|(key, _)| key != id);
         for suffix in ["zip", "part", "work"] {
             let path = self.path(id, suffix)?;
             match tokio::fs::symlink_metadata(&path).await {
@@ -44,6 +55,59 @@ impl Service {
         }
         Ok(())
     }
+
+    async fn index(&self, id: &str) -> Result<Arc<Vec<ZipPhoto>>> {
+        // Only metadata is cached, never image bytes. Serializing cache misses also
+        // prevents many clients parsing the same central directory simultaneously.
+        let mut cache = self.indexes.lock().await;
+        if let Some(position) = cache.iter().position(|(key, _)| key == id) {
+            let entry = cache.remove(position).expect("known cache position");
+            let index = entry.1.clone();
+            cache.push_back(entry);
+            return Ok(index);
+        }
+        let path = self.path(id, "zip")?;
+        let index = Arc::new(tokio::task::spawn_blocking(move || read_zip_index(&path)).await??);
+        // Keep at most eight indexes / 50k entries, or one larger album. Even a
+        // very large album must not rescan its ZIP for every sequential photo.
+        while !cache.is_empty()
+            && (cache.len() >= 8
+                || cache.iter().map(|(_, rows)| rows.len()).sum::<usize>() + index.len() > 50_000)
+        {
+            cache.pop_front();
+        }
+        cache.push_back((id.to_owned(), index.clone()));
+        Ok(index)
+    }
+}
+
+fn read_zip_index(path: &Path) -> Result<Vec<ZipPhoto>> {
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut photos = Vec::with_capacity(zip.len());
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index)?;
+        if entry.is_dir()
+            || entry.compression() != zip::CompressionMethod::Stored
+            || entry.size() == 0
+        {
+            bail!("unsupported album archive entry");
+        }
+        let offset = entry.data_start().context("missing archive entry offset")?;
+        if offset
+            .checked_add(entry.size())
+            .is_none_or(|end| end > size)
+        {
+            bail!("invalid album archive entry bounds");
+        }
+        photos.push(ZipPhoto {
+            name: entry.name().to_owned(),
+            offset,
+            size: entry.size(),
+        });
+    }
+    Ok(photos)
 }
 
 pub async fn setup(db: &SqlitePool) -> Result<()> {
@@ -146,6 +210,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/albums/{album_id}/downloads/rebuild", post(rebuild))
         .route("/api/albums/{album_id}/downloads/{format}", get(download))
+        .route(
+            "/api/albums/{album_id}/downloads/{format}/photos",
+            get(photo_list),
+        )
+        .route(
+            "/api/albums/{album_id}/downloads/{format}/photos/{index}",
+            get(download_photo),
+        )
         .route("/api/album-downloads/{job_id}/cancel", post(cancel))
         .route("/api/album-downloads/{job_id}", delete(remove))
 }
@@ -163,7 +235,8 @@ async fn public_list(State(state): State<AppState>) -> ApiResult<Json<serde_json
             let job = jobs.iter().find(|j| j.get::<String,_>("album_id")==album_id && j.get::<String,_>("format")==*format);
             let status: String = job.map(|j| j.get("status")).unwrap_or("queued".into());
             let size: i64 = job.map(|j| j.get("byte_size")).unwrap_or(0);
-            serde_json::json!({"format":format,"status":status,"byteSize":size,"url": if status=="ready" {job.map(|j| format!("/api/albums/{album_id}/downloads/{format}?version={}", j.get::<String,_>("id")))} else {None}})
+            let base = job.filter(|_| status=="ready").map(|j| (format!("/api/albums/{album_id}/downloads/{format}"), j.get::<String,_>("id")));
+            serde_json::json!({"format":format,"status":status,"byteSize":size,"url":base.as_ref().map(|(path,id)|format!("{path}?version={id}")),"photosUrl":base.as_ref().map(|(path,id)|format!("{path}/photos?version={id}"))})
         }).collect::<Vec<_>>();
         serde_json::json!({"albumId":album_id,"formats":entries})
     }).collect::<Vec<_>>();
@@ -330,14 +403,14 @@ struct DownloadQuery {
     version: Option<String>,
 }
 
-async fn download(
-    State(state): State<AppState>,
-    AxumPath((album_id, format)): AxumPath<(String, String)>,
-    Query(query): Query<DownloadQuery>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
+async fn ready_archive(
+    state: &AppState,
+    album_id: &str,
+    format: &str,
+    query: &DownloadQuery,
+) -> ApiResult<(String, String)> {
     let row = sqlx::query("SELECT j.id,a.name FROM album_download_jobs j JOIN album_download_settings s ON s.album_id=j.album_id AND s.revision=j.revision JOIN albums a ON a.id=j.album_id WHERE j.album_id=? AND j.format=? AND j.status='ready' AND s.enabled=1")
-        .bind(album_id).bind(&format).fetch_optional(&state.db).await.map_err(AppError::internal)?
+        .bind(album_id).bind(format).fetch_optional(&state.db).await.map_err(AppError::internal)?
         .ok_or_else(|| AppError {status:StatusCode::NOT_FOUND,message:"此相簿压缩包尚不可下载或已被管理员撤下".into(),clear_auth_cookies:None})?;
     let job_id: String = row.get("id");
     if query
@@ -351,17 +424,112 @@ async fn download(
             clear_auth_cookies: None,
         });
     }
+    Ok((job_id, row.get("name")))
+}
+
+fn missing_archive() -> AppError {
+    AppError {
+        status: StatusCode::NOT_FOUND,
+        message: "相册下载文件暂不可用，请刷新或联系管理员重新生成".into(),
+        clear_auth_cookies: None,
+    }
+}
+
+async fn photo_list(
+    State(state): State<AppState>,
+    AxumPath((album_id, format)): AxumPath<(String, String)>,
+    Query(query): Query<DownloadQuery>,
+) -> ApiResult<Response> {
+    let (id, name) = ready_archive(&state, &album_id, &format, &query).await?;
+    let photos = state
+        .downloads
+        .index(&id)
+        .await
+        .map_err(|_| missing_archive())?;
+    let entries = photos.iter().enumerate().map(|(index, photo)| serde_json::json!({
+        "name":photo.name,"byteSize":photo.size,"url":format!("/api/albums/{album_id}/downloads/{format}/photos/{index}?version={id}")
+    })).collect::<Vec<_>>();
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({"version":id,"albumName":name,"photos":entries})),
+    )
+        .into_response())
+}
+
+async fn download_photo(
+    State(state): State<AppState>,
+    AxumPath((album_id, format, index)): AxumPath<(String, String, usize)>,
+    Query(query): Query<DownloadQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (id, _) = ready_archive(&state, &album_id, &format, &query).await?;
+    let photos = state
+        .downloads
+        .index(&id)
+        .await
+        .map_err(|_| missing_archive())?;
+    let photo = photos.get(index).ok_or_else(missing_archive)?;
+    let file = tokio::fs::File::open(
+        state
+            .downloads
+            .path(&id, "zip")
+            .map_err(AppError::internal)?,
+    )
+    .await
+    .map_err(|_| missing_archive())?;
+    let mime = match format.as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    serve_segment(
+        file,
+        (photo.offset, photo.size),
+        photo.name.clone(),
+        mime,
+        format!("\"{id}-{index}-{}\"", photo.size),
+        headers,
+    )
+    .await
+}
+
+async fn download(
+    State(state): State<AppState>,
+    AxumPath((album_id, format)): AxumPath<(String, String)>,
+    Query(query): Query<DownloadQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (job_id, album_name) = ready_archive(&state, &album_id, &format, &query).await?;
     let path = state
         .downloads
-        .path(&row.get::<String, _>("id"), "zip")
+        .path(&job_id, "zip")
         .map_err(AppError::internal)?;
-    let mut file = tokio::fs::File::open(path).await.map_err(|_| AppError {
+    let file = tokio::fs::File::open(path).await.map_err(|_| AppError {
         status: StatusCode::NOT_FOUND,
         message: "压缩包已删除，请管理员重新生成".into(),
         clear_auth_cookies: None,
     })?;
     let size = file.metadata().await.map_err(AppError::internal)?.len();
     let etag = format!("\"{job_id}-{size}\"");
+    let filename = format!(
+        "{}-{format}.zip",
+        sanitize_export_name(&album_name, "album")
+    );
+    serve_segment(file, (0, size), filename, "application/zip", etag, headers).await
+}
+
+async fn serve_segment(
+    mut file: tokio::fs::File,
+    (offset, size): (u64, u64),
+    filename: String,
+    mime: &'static str,
+    etag: String,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let file_size = file.metadata().await.map_err(AppError::internal)?.len();
+    if offset.checked_add(size).is_none_or(|end| end > file_size) {
+        return Err(missing_archive());
+    }
     let range = if headers
         .get(header::IF_RANGE)
         .is_some_and(|value| value.to_str().ok() != Some(etag.as_str()))
@@ -381,7 +549,7 @@ async fn download(
             return Ok(response);
         }
     };
-    file.seek(std::io::SeekFrom::Start(start))
+    file.seek(std::io::SeekFrom::Start(offset + start))
         .await
         .map_err(AppError::internal)?;
     let length = end - start + 1;
@@ -391,19 +559,12 @@ async fn download(
     } else {
         StatusCode::OK
     };
-    let filename = format!(
-        "{}-{format}.zip",
-        sanitize_export_name(&row.get::<String, _>("name"), "album")
-    );
     let out = response.headers_mut();
     out.insert(
         header::ETAG,
         HeaderValue::from_str(&etag).map_err(AppError::internal)?,
     );
-    out.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/zip"),
-    );
+    out.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     out.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
@@ -413,10 +574,20 @@ async fn download(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&length.to_string()).map_err(AppError::internal)?,
     );
+    let fallback: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     out.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
-            "attachment; filename=\"album-{format}.zip\"; filename*=UTF-8''{}",
+            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
             urlencoding::encode(&filename)
         ))
         .map_err(AppError::internal)?,
@@ -817,6 +988,140 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mobile_downloads_stream_zip_entries_and_recheck_publication() {
+        let state = super::super::tests::test_state().await;
+        tokio::fs::create_dir_all(&state.downloads.root)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO albums(id,name,created_at) VALUES('mobile','Mobile',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        apply_settings(&state.db, SettingsTarget::All {}, batch_settings(true))
+            .await
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO album_download_jobs(id,album_id,format,revision,status,created_at,updated_at) VALUES(?,'mobile','png',1,'ready',1,1)").bind(&id).execute(&state.db).await.unwrap();
+        let path = state.downloads.path(&id, "zip").unwrap();
+        let mut writer = ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (name, bytes) in [
+            ("first.png", b"first-photo".as_slice()),
+            ("second.png", b"second-photo".as_slice()),
+        ] {
+            writer
+                .start_file(
+                    name,
+                    SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Stored)
+                        .large_file(true),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let index = state.downloads.index(&id).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &index,
+            &state.downloads.index(&id).await.unwrap()
+        ));
+        assert_eq!(index.len(), 2);
+        let response = photo_list(
+            State(state.clone()),
+            AxumPath(("mobile".into(), "png".into())),
+            Query(DownloadQuery {
+                version: Some(id.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        let list: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 10_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list["photos"][1]["name"], "second.png");
+        assert_eq!(list["photos"][1]["byteSize"], 12);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=1-4"));
+        let response = download_photo(
+            State(state.clone()),
+            AxumPath(("mobile".into(), "png".into(), 1)),
+            Query(DownloadQuery {
+                version: Some(id.clone()),
+            }),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 1-4/12");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"econ"
+        );
+        assert!(
+            download_photo(
+                State(state.clone()),
+                AxumPath(("mobile".into(), "png".into(), 2)),
+                Query(DownloadQuery { version: None }),
+                HeaderMap::new()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            ready_archive(
+                &state,
+                "mobile",
+                "png",
+                &DownloadQuery {
+                    version: Some("old".into())
+                }
+            )
+            .await
+            .is_err()
+        );
+        apply_settings(&state.db, SettingsTarget::All {}, batch_settings(false))
+            .await
+            .unwrap();
+        assert!(
+            photo_list(
+                State(state.clone()),
+                AxumPath(("mobile".into(), "png".into())),
+                Query(DownloadQuery {
+                    version: Some(id.clone())
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            download_photo(
+                State(state.clone()),
+                AxumPath(("mobile".into(), "png".into(), 0)),
+                Query(DownloadQuery {
+                    version: Some(id.clone())
+                }),
+                HeaderMap::new()
+            )
+            .await
+            .is_err()
+        );
+        state.downloads.remove_files(&id).await.unwrap();
+        assert!(state.downloads.indexes.lock().await.is_empty());
+        assert!(!path.exists());
+    }
 
     fn batch_settings(enabled: bool) -> SettingsInput {
         SettingsInput {
