@@ -110,6 +110,8 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 进入后台 **下载管理**，选择相册，开启「可供下载」，选择 PNG、JPG、JPEG、WebP 中的一种或多种，并设置**单张图片大小上限（MB）**，保存即可。默认每张最多 5 MB，填写 `0` 表示不限；MB 按 1,000,000 字节计算。此限制不是整个 ZIP 的大小，也不会因为超限而漏掉某张图片：JPEG/WebP 会调整编码质量，仍超限时缩小分辨率；PNG 保持无损编码、通过缩小分辨率满足限制。透明图片转 JPEG 使用白色背景。
 
+需要统一设置时，点击 **批量设置**，选择多个相册或「全部相册」，调整下载开关、格式及单张大小上限，再点击「覆盖并应用」并确认。整批设置一次性保存，会覆盖各相册原来的单独设置，而不是合并；未选中的相册和之后新建的相册不受影响。旧 ZIP 自动清理，启用下载的相册在后台重新生成，原始图片和远端存储对象不会删除。
+
 - 每种格式生成独立 ZIP，内容从存储母本生成，不使用低清缩略图。JPG 与 JPEG 编码相同，扩展名不同。
 - 相册首页每张卡片右上角、相册详情标题旁都会显示下载按钮。单格式直接下载，多格式展开下拉菜单；未生成完的格式显示「正在打包」。未开启的相册不显示按钮。
 - ZIP 始终保存在服务器本地的 **`./data/album-downloads`**，不上传 S3/R2 或 WebDAV。使用上面的 Compose 时，该目录随 `./data` 持久化、备份和迁移，不需要新增环境变量或挂载。
@@ -166,6 +168,7 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `PUT /api/albums/:album_id/download-settings` — 设置 `{ "enabled": true, "formats": ["png", "webp"], "maxImageBytes": 5000000 }`
 - `POST /api/albums/:album_id/downloads/rebuild` — 后台重新生成相册的所有已选格式
 - `GET /api/albums/:album_id/downloads/:format` — 公开流式下载当前 ZIP，支持 Range 断点续传
+- `PUT /api/album-downloads/settings/bulk` — 管理员批量覆盖下载设置；请求为 `{ "target": { "scope": "selected", "albumIds": ["id1", "id2"] }, "settings": { "enabled": true, "formats": ["png", "webp"], "maxImageBytes": 5000000 } }`，全部现有相册使用 `"target": { "scope": "all" }`；未知相册或无效设置会使整批操作失败，不会部分保存
 - `POST /api/album-downloads/:job_id/cancel`、`DELETE /api/album-downloads/:job_id` — 管理员取消任务或删除本地包，不删除原图
 - `GET/PATCH /api/albums/:album_id` — 相簿详情及其中的图片，或修改简介和显示日期
 - `GET/POST /api/albums/:album_id/photos`
