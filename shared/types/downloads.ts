@@ -1,7 +1,12 @@
 export type DownloadFormat = 'png' | 'jpg' | 'jpeg' | 'webp'
 export interface PublicAlbumDownload {
   albumId: string
-  formats: Array<{ format: DownloadFormat; status: string; byteSize: number; url: string | null }>
+  formats: Array<{ format: DownloadFormat; status: string; byteSize: number; url: string | null; photosUrl: string | null }>
+}
+export interface AlbumPhotoDownloadList {
+  version: string
+  albumName: string
+  photos: Array<{ name: string; byteSize: number; url: string }>
 }
 export interface AlbumDownloadSettings {
   albumId: string
