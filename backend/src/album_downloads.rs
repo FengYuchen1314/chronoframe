@@ -86,6 +86,23 @@ struct SettingsInput {
     max_zip_bytes: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+enum SettingsTarget {
+    Selected {
+        #[serde(rename = "albumIds")]
+        album_ids: Vec<String>,
+    },
+    All {},
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkSettingsInput {
+    target: SettingsTarget,
+    settings: SettingsInput,
+}
+
 fn validate(mut input: SettingsInput) -> ApiResult<SettingsInput> {
     if input.formats.is_empty() || input.formats.len() > 4 {
         return Err(AppError::bad("请选择至少一种格式"));
@@ -119,6 +136,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/album-downloads/public", get(public_list))
         .route("/api/album-downloads", get(admin_list))
+        .route(
+            "/api/album-downloads/settings/bulk",
+            axum::routing::put(save_bulk_settings),
+        )
         .route(
             "/api/albums/{album_id}/download-settings",
             axum::routing::put(save_settings),
@@ -188,18 +209,72 @@ async fn save_settings(
     Json(input): Json<SettingsInput>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&headers, &state, true).await?;
+    let enabled = input.enabled;
+    apply_settings(
+        &state.db,
+        SettingsTarget::Selected {
+            album_ids: vec![album_id],
+        },
+        input,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({"queued":enabled})))
+}
+
+async fn save_bulk_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BulkSettingsInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&headers, &state, true).await?;
+    let enabled = input.settings.enabled;
+    let updated = apply_settings(&state.db, input.target, input.settings).await?;
+    Ok(Json(
+        serde_json::json!({"updated":updated,"queued":enabled}),
+    ))
+}
+
+async fn apply_settings(
+    db: &SqlitePool,
+    target: SettingsTarget,
+    input: SettingsInput,
+) -> ApiResult<usize> {
     let input = validate(input)?;
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM albums WHERE id=?)")
-        .bind(&album_id)
-        .fetch_one(&state.db)
+    // Acquire the write lock before resolving targets. The worker and other admins
+    // must never observe a partially applied batch or race a read-to-write upgrade.
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(AppError::internal)?;
-    if !exists {
-        return Err(AppError::bad("相簿不存在"));
+    let albums: Vec<String> = sqlx::query_scalar("SELECT id FROM albums")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    let album_ids = match target {
+        SettingsTarget::All {} => albums,
+        SettingsTarget::Selected { mut album_ids } => {
+            album_ids.sort();
+            album_ids.dedup();
+            let existing: HashSet<_> = albums.into_iter().collect();
+            if album_ids.iter().any(|id| !existing.contains(id)) {
+                return Err(AppError::bad(
+                    "选中的相册已不存在，请刷新列表后重试；本次未修改任何设置",
+                ));
+            }
+            album_ids
+        }
+    };
+    if album_ids.is_empty() {
+        return Err(AppError::bad("请至少选择一个现有相册"));
     }
-    sqlx::query("INSERT INTO album_download_settings(album_id,enabled,formats,max_image_bytes,max_zip_bytes,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(album_id) DO UPDATE SET enabled=excluded.enabled,formats=excluded.formats,max_image_bytes=excluded.max_image_bytes,max_zip_bytes=excluded.max_zip_bytes,revision=revision+1,updated_at=excluded.updated_at")
-        .bind(&album_id).bind(input.enabled).bind(serde_json::to_string(&input.formats).map_err(AppError::internal)?).bind(input.max_image_bytes).bind(input.max_zip_bytes).bind(now()-4).execute(&state.db).await.map_err(AppError::internal)?;
-    Ok(Json(serde_json::json!({"queued":input.enabled})))
+    let formats = serde_json::to_string(&input.formats).map_err(AppError::internal)?;
+    let updated_at = now() - 4;
+    for album_id in &album_ids {
+        sqlx::query("INSERT INTO album_download_settings(album_id,enabled,formats,max_image_bytes,max_zip_bytes,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(album_id) DO UPDATE SET enabled=excluded.enabled,formats=excluded.formats,max_image_bytes=excluded.max_image_bytes,max_zip_bytes=excluded.max_zip_bytes,revision=revision+1,updated_at=excluded.updated_at")
+            .bind(album_id).bind(input.enabled).bind(&formats).bind(input.max_image_bytes).bind(input.max_zip_bytes).bind(updated_at).execute(&mut *tx).await.map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(album_ids.len())
 }
 
 async fn rebuild(
@@ -742,6 +817,164 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn batch_settings(enabled: bool) -> SettingsInput {
+        SettingsInput {
+            enabled,
+            formats: vec!["WEBP".into(), "png".into()],
+            max_image_bytes: 1_000_000,
+            max_zip_bytes: 0,
+        }
+    }
+
+    async fn settings_snapshot(db: &SqlitePool) -> Vec<(String, bool, String, i64, i64, i64, i64)> {
+        sqlx::query_as("SELECT album_id,enabled,formats,max_image_bytes,max_zip_bytes,revision,updated_at FROM album_download_settings ORDER BY album_id")
+            .fetch_all(db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_overwrite_only_selected_and_all_existing_albums() {
+        let state = super::super::tests::test_state().await;
+        for id in ["a", "b", "c"] {
+            sqlx::query("INSERT INTO albums(id,name,created_at) VALUES(?,?,1)")
+                .bind(id)
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            apply_settings(&state.db, SettingsTarget::All {}, batch_settings(false))
+                .await
+                .unwrap(),
+            3
+        );
+        let original = settings_snapshot(&state.db).await;
+        let selected = SettingsTarget::Selected {
+            album_ids: vec!["b".into(), "a".into(), "a".into()],
+        };
+        assert_eq!(
+            apply_settings(
+                &state.db,
+                selected,
+                SettingsInput {
+                    enabled: true,
+                    formats: vec!["jpg".into()],
+                    max_image_bytes: 0,
+                    max_zip_bytes: 5_000_000
+                }
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        let changed = settings_snapshot(&state.db).await;
+        assert_eq!(changed[2], original[2]);
+        for row in &changed[..2] {
+            assert!(row.1);
+            assert_eq!(row.2, "[\"jpg\"]");
+            assert_eq!((row.3, row.4, row.5), (0, 5_000_000, 2));
+        }
+        // All resolves its targets in the transaction, including albums with no settings yet.
+        sqlx::query("INSERT INTO albums(id,name,created_at) VALUES('d','d',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            apply_settings(&state.db, SettingsTarget::All {}, batch_settings(false))
+                .await
+                .unwrap(),
+            4
+        );
+        let final_rows = settings_snapshot(&state.db).await;
+        for row in &final_rows {
+            assert!(!row.1);
+            assert_eq!(row.2, "[\"png\",\"webp\"]");
+            assert_eq!((row.3, row.4), (1_000_000, 0));
+        }
+        assert_eq!(
+            final_rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+            vec![3, 3, 2, 1]
+        );
+        sqlx::query("INSERT INTO albums(id,name,created_at) VALUES('future','future',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(settings_snapshot(&state.db).await, final_rows);
+    }
+
+    #[tokio::test]
+    async fn invalid_or_failed_batches_never_partially_save() {
+        let state = super::super::tests::test_state().await;
+        assert!(
+            apply_settings(&state.db, SettingsTarget::All {}, batch_settings(true))
+                .await
+                .is_err()
+        );
+        for id in ["a", "b"] {
+            sqlx::query("INSERT INTO albums(id,name,created_at) VALUES(?,?,1)")
+                .bind(id)
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        apply_settings(&state.db, SettingsTarget::All {}, batch_settings(false))
+            .await
+            .unwrap();
+        let original = settings_snapshot(&state.db).await;
+        for album_ids in [vec![], vec!["a".into(), "missing".into()]] {
+            assert!(
+                apply_settings(
+                    &state.db,
+                    SettingsTarget::Selected { album_ids },
+                    batch_settings(true)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(settings_snapshot(&state.db).await, original);
+        }
+        assert!(
+            apply_settings(
+                &state.db,
+                SettingsTarget::All {},
+                SettingsInput {
+                    max_image_bytes: 1,
+                    ..batch_settings(true)
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(settings_snapshot(&state.db).await, original);
+        // Simulate a storage error after the first update; dropping the transaction rolls it back.
+        sqlx::raw_sql("CREATE TRIGGER fail_batch BEFORE UPDATE ON album_download_settings WHEN NEW.album_id='b' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").execute(&state.db).await.unwrap();
+        assert!(
+            apply_settings(
+                &state.db,
+                SettingsTarget::Selected {
+                    album_ids: vec!["a".into(), "b".into()]
+                },
+                batch_settings(true)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(settings_snapshot(&state.db).await, original);
+    }
+
+    #[test]
+    fn bulk_targets_reject_ambiguous_scopes() {
+        for target in [
+            r#"{"scope":"all","albumIds":["a"]}"#,
+            r#"{"scope":"selected"}"#,
+            r#"{"scope":"unknown"}"#,
+        ] {
+            assert!(serde_json::from_str::<SettingsTarget>(target).is_err());
+        }
+    }
+
     #[test]
     fn long_archive_names_keep_the_requested_extension_and_remain_unique() {
         let mut used = HashSet::new();
