@@ -2,7 +2,13 @@ export type StorageBackend = 'local' | 'webdav' | 's3'
 
 export type ImageTargetFormat = 'png' | 'jpg' | 'jpeg' | 'webp'
 
-export interface Album {
+export interface AlbumCover {
+  coverSource: 'auto' | 'photo' | 'upload'
+  coverPhotoId: string | null
+  coverUrl: string | null
+}
+
+export interface Album extends AlbumCover {
   id: string
   name: string
   description: string
