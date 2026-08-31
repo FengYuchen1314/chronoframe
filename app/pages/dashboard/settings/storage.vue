@@ -501,7 +501,12 @@ onBeforeUnmount(() => {
   clearSensitiveInputs()
   if (maintenancePoll !== null) window.clearTimeout(maintenancePoll)
 })
-const storageTab = ref('connection')
+const storageRoute = useRoute()
+const storageRouter = useRouter()
+const storageTab = computed({
+  get: () => ['migration', 'cache', 'cleanup'].includes(String(storageRoute.query.tab)) ? String(storageRoute.query.tab) : 'connection',
+  set: (tab: string) => { void storageRouter.replace({ query: tab === 'connection' ? {} : { tab } }) },
+})
 onBeforeRouteLeave(() => !isDirty.value || toast.confirm('存储设置尚未保存，确定放弃修改并离开吗？'))
 </script>
 

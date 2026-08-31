@@ -1,859 +1,310 @@
-<script lang="ts" setup>
-import { Alert as AAlert, Button as AButton, Card as ACard, DatePicker as ADatePicker, Form as AForm, FormItem as AFormItem, Input as AInput, InputSearch as AInputSearch, Textarea as ATextarea, Modal as AModal, Table as ATable, Tabs as ATabs, TabPane as ATabPane, Space as ASpace, Tag as ATag, Progress as AProgress, UploadDragger as AUploadDragger, Image as AImage, Checkbox as ACheckbox } from 'ant-design-vue'
+<script setup lang="ts">
+import { Alert as AAlert, Button as AButton, Card as ACard, Checkbox as ACheckbox, DatePicker as ADatePicker, Empty as AEmpty, Form as AForm, FormItem as AFormItem, Image as AImage, Input as AInput, InputSearch as AInputSearch, Modal as AModal, Pagination as APagination, RadioGroup as ARadioGroup, Select as ASelect, Space as ASpace, Spin as ASpin, Table as ATable, Tabs as ATabs, TabPane as ATabPane, Tag as ATag, Textarea as ATextarea, Upload as AUpload, UploadDragger as AUploadDragger } from 'ant-design-vue'
 import type { Album, AlbumCover, AlbumDeletionResult, AlbumDetail, Photo, PhotoDeletionResult } from '~/types/dashboard'
+import { albumDraftOf, toggleVisibleSelection, validateAlbumDraft, type AlbumDraft } from '~~/shared/utils/admin-albums'
 
-definePageMeta({
-  layout: 'dashboard',
-})
-
-useHead({ title: '相簿' })
-
-const toast = useAdminNotice()
+definePageMeta({ layout: 'dashboard' })
+useHead({ title: '相册管理' })
+const route = useRoute()
+const router = useRouter()
+const notice = useAdminNotice()
 const { adminFetch } = useAdminApi()
-
-const UPLOAD_CONCURRENCY = 7
-
+const uploads = useAdminUploads()
 const albums = ref<Album[]>([])
-const selectedAlbumId = ref('')
 const photos = ref<Photo[]>([])
-const activeWorkspaceTab = ref<'photos' | 'details' | 'export'>('photos')
-const albumQuery = ref('')
-const isCreateDialogOpen = ref(false)
-const isDeleteDialogOpen = ref(false)
-const isOrderMode = ref(false)
-const newAlbumName = ref('')
-const newAlbumDescription = ref('')
-const selectedFiles = ref<File[]>([])
-const selectedPhotoIds = ref<string[]>([])
-const isSelectingPhotos = ref(false)
-const exportAlbumIds = ref<string[]>([])
-const isStartingExport = ref(false)
-const uploadInput = ref<HTMLInputElement | null>(null)
-const albumDateDraft = reactive({
-  displayCreatedDate: '',
-  photoDateStart: '',
-  photoDateEnd: '',
+const selectedId = computed(() => typeof route.query.album === 'string' ? route.query.album : '')
+const selectedAlbum = computed(() => albums.value.find(item => item.id === selectedId.value))
+const tab = computed(() => ['details', 'downloads'].includes(String(route.query.tab)) ? String(route.query.tab) : 'photos')
+const listState = useState('admin-album-list-view', () => ({ query: '', page: 1, selected: [] as string[] }))
+const loading = ref(false)
+const detailLoading = ref(false)
+const ready = ref(false)
+const error = ref('')
+const detailError = ref('')
+const mutation = ref('')
+const coverBusy = ref(false)
+const downloadBusy = ref(false)
+const downloadDirty = ref(false)
+const locked = computed(() => !!mutation.value || coverBusy.value || downloadBusy.value)
+const draft = reactive<AlbumDraft>({ name: '', description: '', displayCreatedDate: null, photoDateStart: null, photoDateEnd: null })
+const baseline = ref('')
+const dirty = computed(() => !!baseline.value && JSON.stringify(draft) !== baseline.value)
+const formError = ref('')
+const createOpen = ref(false)
+const newAlbum = reactive({ name: '', description: '' })
+const createError = ref('')
+const exportOpen = ref(false)
+const orderMode = ref(false)
+const orderIds = ref<string[]>([])
+const orderDirty = computed(() => orderMode.value && orderIds.value.join() !== albums.value.map(item => item.id).join())
+const photoQuery = ref('')
+const photoFormat = ref('all')
+const photoSort = ref('newest')
+const photoView = useState<'grid' | 'table'>('admin-photo-view', () => 'grid')
+const photoPage = ref(1)
+const photoPageSize = 48
+const selectedPhotos = ref<string[]>([])
+const accept = '.png,.jpg,.jpeg,.jepg,.webp'
+const filteredAlbums = computed(() => {
+  const ordered = orderMode.value ? orderIds.value.map(id => albums.value.find(item => item.id === id)).filter((item): item is Album => !!item) : albums.value
+  const query = listState.value.query.trim().toLocaleLowerCase()
+  return orderMode.value ? ordered : ordered.filter(item => `${item.name} ${item.description}`.toLocaleLowerCase().includes(query))
 })
-const savedAlbumDateDraft = reactive({
-  displayCreatedDate: '',
-  photoDateStart: '',
-  photoDateEnd: '',
+const filteredPhotos = computed(() => {
+  const query = photoQuery.value.trim().toLocaleLowerCase()
+  const matches = photos.value.filter(item => item.originalName.toLocaleLowerCase().includes(query) && (photoFormat.value === 'all' || item.format === photoFormat.value))
+  return matches.sort((a, b) => photoSort.value === 'name' ? a.originalName.localeCompare(b.originalName) : photoSort.value === 'size' ? b.byteSize - a.byteSize : b.createdAt - a.createdAt || b.id.localeCompare(a.id))
 })
-const dateDraftAlbumId = ref('')
-const albumNameDraft = ref('')
-const savedAlbumNameDraft = ref('')
-const albumDescriptionDraft = ref('')
-const savedAlbumDescriptionDraft = ref('')
-const descriptionDraftAlbumId = ref('')
-
-const isLoadingAlbums = ref(false)
-const isLoadingPhotos = ref(false)
-const isCreating = ref(false)
-const isUploading = ref(false)
-const isDeletingPhotos = ref(false)
-const isDeletingAlbum = ref(false)
-const isSavingAlbumDates = ref(false)
-const isSavingAlbumIdentity = ref(false)
-const isReorderingAlbums = ref(false)
-const isSavingCover = ref(false)
-const applyAlbumCover = (id: string, cover: AlbumCover) => {
+const pagePhotos = computed(() => filteredPhotos.value.slice((photoPage.value - 1) * photoPageSize, photoPage.value * photoPageSize))
+const pageChecked = computed(() => pagePhotos.value.length > 0 && pagePhotos.value.every(photo => selectedPhotos.value.includes(photo.id)))
+const pagePartial = computed(() => !pageChecked.value && pagePhotos.value.some(photo => selectedPhotos.value.includes(photo.id)))
+const albumUploads = computed(() => uploads.state.value.items.filter(item => item.albumId === selectedId.value && ['queued', 'uploading'].includes(item.status)).length)
+const albumColumns = computed(() => [
+  ...(orderMode.value ? [{ title: '顺序', key: 'order', width: 180 }] : []),
+  { title: '相册', key: 'album' }, { title: '图片', dataIndex: 'photoCount', width: 90 },
+  ...(!orderMode.value ? [{ title: '操作', key: 'actions', width: 245 }] : []),
+])
+const photoColumns = [{ title: '图片', key: 'photo', width: 90 }, { title: '文件名', dataIndex: 'originalName' }, { title: '格式', dataIndex: 'format', width: 90 }, { title: '尺寸', key: 'dimensions', width: 140 }, { title: '大小', key: 'size', width: 110 }]
+let detailSerial = 0
+let disposed = false
+let uploadRefresh: ReturnType<typeof setTimeout> | undefined
+const applyDraft = (album: Album) => { Object.assign(draft, albumDraftOf(album)); baseline.value = JSON.stringify(draft); formError.value = '' }
+const updateDate = (field: 'displayCreatedDate' | 'photoDateStart' | 'photoDateEnd', value: unknown) => { draft[field] = typeof value === 'string' && value ? value : null }
+const applyAlbum = (album: Album) => {
+  const index = albums.value.findIndex(item => item.id === album.id)
+  if (index < 0) albums.value.push(album)
+  else albums.value[index] = album
+}
+const applyCover = (id: string, cover: AlbumCover) => {
   const album = albums.value.find(item => item.id === id)
   if (album) Object.assign(album, cover)
 }
-const isAlbumDetailReady = ref(false)
-const uploadCompleted = ref(0)
-const uploadTotal = ref(0)
-const uploadActiveCount = ref(0)
-const albumError = ref('')
-const photoError = ref('')
-let detailRequestSerial = 0
-
-const selectedAlbum = computed(() =>
-  albums.value.find(album => album.id === selectedAlbumId.value) || null,
-)
-const filteredAlbums = computed(() => {
-  const query = albumQuery.value.trim().toLocaleLowerCase()
-  if (!query) return albums.value
-  return albums.value.filter(album =>
-    album.name.toLocaleLowerCase().includes(query)
-    || album.description.toLocaleLowerCase().includes(query),
-  )
+const loadDetail = async (id = selectedId.value) => {
+  const serial = ++detailSerial
+  if (!id) { detailLoading.value = false; return }
+  detailLoading.value = true
+  try {
+    const detail = await adminFetch<AlbumDetail>(`/api/albums/${encodeURIComponent(id)}`)
+    if (disposed || serial !== detailSerial || selectedId.value !== id) return
+    const { photos: loadedPhotos, ...album } = detail
+    photos.value = loadedPhotos
+    applyAlbum(album)
+    if (!dirty.value) applyDraft(album)
+    selectedPhotos.value = selectedPhotos.value.filter(photoId => loadedPhotos.some(photo => photo.id === photoId))
+    detailError.value = ''
+    ready.value = true
+  } catch (cause) { if (serial === detailSerial) detailError.value = getAdminApiErrorMessage(cause) }
+  finally { if (serial === detailSerial) detailLoading.value = false }
+}
+const loadAlbums = async () => {
+  if (loading.value) return
+  loading.value = true
+  try {
+    albums.value = await adminFetch<Album[]>('/api/albums')
+    listState.value.selected = listState.value.selected.filter(id => albums.value.some(album => album.id === id))
+    error.value = ''
+  } catch (cause) { error.value = getAdminApiErrorMessage(cause) }
+  finally { loading.value = false }
+}
+const navigateAlbum = (id = '', nextTab = 'photos') => router.push({ path: '/dashboard/albums', query: id ? { album: id, ...(nextTab === 'photos' ? {} : { tab: nextTab }) } : {} })
+const leave = async () => {
+  if (locked.value) { notice.add({ title: '正在提交操作，请稍候', color: 'warning' }); return false }
+  return (!dirty.value && !downloadDirty.value && !orderDirty.value) || await notice.confirm('有未保存的修改，确定放弃修改并离开吗？')
+}
+onBeforeRouteLeave(leave)
+onBeforeRouteUpdate((to, from) => to.query.album === from.query.album ? true : leave())
+useEventListener('beforeunload', (event: BeforeUnloadEvent) => {
+  if (dirty.value || downloadDirty.value || orderDirty.value || locked.value) { event.preventDefault(); event.returnValue = '' }
 })
-const albumDatesDirty = computed(() =>
-  dateDraftAlbumId.value === selectedAlbumId.value
-  && (
-    albumDateDraft.displayCreatedDate !== savedAlbumDateDraft.displayCreatedDate
-    || albumDateDraft.photoDateStart !== savedAlbumDateDraft.photoDateStart
-    || albumDateDraft.photoDateEnd !== savedAlbumDateDraft.photoDateEnd
-  ),
-)
-const albumDescriptionDirty = computed(() =>
-  descriptionDraftAlbumId.value === selectedAlbumId.value
-  && albumDescriptionDraft.value !== savedAlbumDescriptionDraft.value,
-)
-const albumNameDirty = computed(() =>
-  descriptionDraftAlbumId.value === selectedAlbumId.value
-  && albumNameDraft.value !== savedAlbumNameDraft.value,
-)
-const albumIdentityDirty = computed(() => albumNameDirty.value || albumDescriptionDirty.value)
-const albumMetadataDirty = computed(() => albumDatesDirty.value || albumIdentityDirty.value)
-const albumHasCustomDates = computed(() => Boolean(
-  selectedAlbum.value?.displayCreatedDate
-  || selectedAlbum.value?.photoDateStart
-  || selectedAlbum.value?.photoDateEnd,
-))
-const hasActiveMutation = computed(() =>
-  isCreating.value
-  || isUploading.value
-  || isDeletingPhotos.value
-  || isDeletingAlbum.value
-  || isSavingAlbumDates.value
-  || isSavingAlbumIdentity.value
-  || isSavingCover.value
-  || isReorderingAlbums.value,
-)
-const isAlbumInteractionLocked = computed(() =>
-  isLoadingAlbums.value || isLoadingPhotos.value || hasActiveMutation.value,
-)
+watch(selectedId, id => {
+  clearTimeout(uploadRefresh)
+  uploadRefresh = undefined
+  baseline.value = ''; ready.value = false; photos.value = []; selectedPhotos.value = []; detailError.value = ''
+  orderMode.value = false; orderIds.value = []
+  downloadDirty.value = false; downloadBusy.value = false; coverBusy.value = false
+  photoQuery.value = ''; photoFormat.value = 'all'; photoPage.value = 1
+  void loadDetail(id)
+})
+watch([photoQuery, photoFormat, photoSort], () => { photoPage.value = 1 })
+watch(() => filteredPhotos.value.length, count => { photoPage.value = Math.min(photoPage.value, Math.max(1, Math.ceil(count / photoPageSize))) })
+watch(() => listState.value.query, () => { listState.value.page = 1 })
+watch(() => filteredAlbums.value.length, count => { listState.value.page = Math.min(listState.value.page, Math.max(1, Math.ceil(count / 20))) })
+watch(() => uploads.state.value.albumVersions[selectedId.value], () => {
+  // A continuous upload must not postpone visible results until the queue ends.
+  if (uploadRefresh) return
+  uploadRefresh = setTimeout(() => { uploadRefresh = undefined; if (selectedId.value) void loadDetail() }, 1000)
+})
+onMounted(() => { void loadAlbums(); void loadDetail() })
+onBeforeUnmount(() => { disposed = true; detailSerial++; clearTimeout(uploadRefresh) })
 
-const selectedBytes = computed(() =>
-  selectedFiles.value.reduce((total, file) => total + file.size, 0),
-)
-const allPhotosSelected = computed(() =>
-  photos.value.length > 0 && selectedPhotoIds.value.length === photos.value.length,
-)
-const selectedExportAlbums = computed(() =>
-  albums.value.filter(album => exportAlbumIds.value.includes(album.id)),
-)
-
-const workspaceTabs = [
-  { value: 'photos' as const, label: '图片与上传', icon: 'tabler:photo' },
-  { value: 'details' as const, label: '相簿设置', icon: 'tabler:settings' },
-  { value: 'export' as const, label: '打包下载', icon: 'tabler:file-zip' },
-]
-
-const openCreateDialog = () => {
-  if (albumMetadataDirty.value) {
-    toast.add({ title: '请先保存或放弃当前相簿的资料修改', color: 'warning' })
-    return
-  }
-  isCreateDialogOpen.value = true
-}
-
-const closeCreateDialog = () => {
-  if (isCreating.value) return
-  isCreateDialogOpen.value = false
-  newAlbumName.value = ''
-  newAlbumDescription.value = ''
-}
-
-const openExportWorkspace = (includeCurrent = false) => {
-  activeWorkspaceTab.value = 'export'
-  if (includeCurrent && selectedAlbumId.value && !exportAlbumIds.value.includes(selectedAlbumId.value)) {
-    exportAlbumIds.value = [...exportAlbumIds.value, selectedAlbumId.value]
-  }
-}
-
-const toggleExportAlbum = (albumId: string, checked: boolean) => {
-  exportAlbumIds.value = checked
-    ? [...new Set([...exportAlbumIds.value, albumId])]
-    : exportAlbumIds.value.filter(id => id !== albumId)
-}
-
-const handleExportAlbumToggle = (albumId: string, event: Event) => {
-  toggleExportAlbum(albumId, (event.target as HTMLInputElement | null)?.checked === true)
-}
-
-const startAlbumExport = () => {
-  if (!exportAlbumIds.value.length || isStartingExport.value) return
-  isStartingExport.value = true
-  const query = new URLSearchParams({ albumIds: exportAlbumIds.value.join(',') })
-  const link = document.createElement('a')
-  link.href = `/api/albums/export?${query.toString()}`
-  link.rel = 'noopener'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  toast.add({
-    title: '已开始准备相簿压缩包',
-    description: exportAlbumIds.value.length === 1
-      ? `将下载「${selectedExportAlbums.value[0]?.name || '相簿'}」的 ZIP。`
-      : `将下载一个外层 ZIP，其中包含 ${exportAlbumIds.value.length} 个相簿 ZIP。`,
-    color: 'success',
-  })
-  window.setTimeout(() => {
-    isStartingExport.value = false
-  }, 3000)
-}
-
-const formatBytes = (bytes: number) => {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
-}
-
-const timestampToDateInput = (timestamp: number) => {
-  const date = new Date(timestamp * 1000)
-  if (Number.isNaN(date.getTime())) return ''
-  const year = String(date.getFullYear()).padStart(4, '0')
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
-}
-
-const applyAlbumDateDraft = (detail: AlbumDetail, force = false) => {
-  if (!force && dateDraftAlbumId.value === detail.id && albumDatesDirty.value) return
-
-  const fallbackCreatedDate = timestampToDateInput(detail.createdAt)
-  const photoDates = detail.photos
-    .map(photo => timestampToDateInput(photo.createdAt))
-    .filter(Boolean)
-    .sort()
-
-  const displayCreatedDate = detail.displayCreatedDate || fallbackCreatedDate
-  const photoDateStart = detail.photoDateStart || photoDates[0] || ''
-  const photoDateEnd = detail.photoDateEnd || photoDates.at(-1) || ''
-
-  dateDraftAlbumId.value = detail.id
-  albumDateDraft.displayCreatedDate = displayCreatedDate
-  albumDateDraft.photoDateStart = photoDateStart
-  albumDateDraft.photoDateEnd = photoDateEnd
-  savedAlbumDateDraft.displayCreatedDate = displayCreatedDate
-  savedAlbumDateDraft.photoDateStart = photoDateStart
-  savedAlbumDateDraft.photoDateEnd = photoDateEnd
-}
-
-const applyAlbumIdentityDraft = (detail: AlbumDetail, force = false) => {
-  if (!force && descriptionDraftAlbumId.value === detail.id && albumIdentityDirty.value) return
-  descriptionDraftAlbumId.value = detail.id
-  albumNameDraft.value = detail.name
-  savedAlbumNameDraft.value = detail.name
-  albumDescriptionDraft.value = detail.description || ''
-  savedAlbumDescriptionDraft.value = detail.description || ''
-}
-
-const resetAlbumDateDraft = () => {
-  albumDateDraft.displayCreatedDate = savedAlbumDateDraft.displayCreatedDate
-  albumDateDraft.photoDateStart = savedAlbumDateDraft.photoDateStart
-  albumDateDraft.photoDateEnd = savedAlbumDateDraft.photoDateEnd
-}
-
-const resetAlbumIdentityDraft = () => {
-  albumNameDraft.value = savedAlbumNameDraft.value
-  albumDescriptionDraft.value = savedAlbumDescriptionDraft.value
-}
-
-const selectAlbum = (albumId: string) => {
-  if (albumId === selectedAlbumId.value) return
-  if (isAlbumInteractionLocked.value) return
-  if (albumMetadataDirty.value) {
-    toast.add({
-      title: '相簿资料尚未保存',
-      description: '请先保存简介或日期，或者放弃修改后再切换相簿。',
-      color: 'warning',
-    })
-    return
-  }
-  selectedAlbumId.value = albumId
-}
-
-const loadAlbumDetail = async (albumId: string): Promise<boolean> => {
-  const requestSerial = ++detailRequestSerial
-  photos.value = []
-  selectedPhotoIds.value = []
-  photoError.value = ''
-  isAlbumDetailReady.value = false
-
-  if (!albumId) return true
-  isLoadingPhotos.value = true
-
+const create = async () => {
+  if (locked.value) return
+  const validation = validateAlbumDraft({ ...draft, ...newAlbum, displayCreatedDate: null, photoDateStart: null, photoDateEnd: null })
+  if (validation) { createError.value = validation; return }
+  mutation.value = 'create'
+  let created: Album | undefined
   try {
-    const detail = await adminFetch<AlbumDetail>(`/api/albums/${albumId}`)
-    if (requestSerial !== detailRequestSerial || selectedAlbumId.value !== albumId) return false
-
-    photos.value = detail.photos
-    applyAlbumDateDraft(detail)
-    applyAlbumIdentityDraft(detail)
-    const albumIndex = albums.value.findIndex(album => album.id === albumId)
-    if (albumIndex >= 0) {
-      albums.value[albumIndex] = {
-        id: detail.id,
-        name: detail.name,
-        description: detail.description,
-        createdAt: detail.createdAt,
-        displayCreatedDate: detail.displayCreatedDate,
-        photoDateStart: detail.photoDateStart,
-        photoDateEnd: detail.photoDateEnd,
-        position: detail.position,
-        photoCount: detail.photoCount,
-        coverSource: detail.coverSource,
-        coverPhotoId: detail.coverPhotoId,
-        coverUrl: detail.coverUrl,
-      }
-    }
-    isAlbumDetailReady.value = true
-    return true
-  } catch (error) {
-    if (requestSerial === detailRequestSerial) {
-      photoError.value = getAdminApiErrorMessage(error)
-    }
-    return false
-  } finally {
-    if (requestSerial === detailRequestSerial) {
-      isLoadingPhotos.value = false
-    }
-  }
+    created = await adminFetch<Album>('/api/albums', { method: 'POST', body: { name: newAlbum.name.trim(), description: newAlbum.description.trim() } })
+    applyAlbum(created); createOpen.value = false; newAlbum.name = ''; newAlbum.description = ''; createError.value = ''
+    notice.add({ title: '相册已创建，可以上传图片了', color: 'success' })
+  } catch (cause) { createError.value = getAdminApiErrorMessage(cause) }
+  finally { mutation.value = '' }
+  if (created) await navigateAlbum(created.id)
 }
-
-const refreshAlbums = async (preferredAlbumId?: string): Promise<boolean> => {
-  if (isLoadingAlbums.value) return false
-  isLoadingAlbums.value = true
-  albumError.value = ''
-
+const save = async () => {
+  if (locked.value || !ready.value || !dirty.value) return
+  formError.value = validateAlbumDraft(draft) || ''
+  if (formError.value) return
+  mutation.value = 'save'
   try {
-    const nextAlbums = await adminFetch<Album[]>('/api/albums')
-    albums.value = nextAlbums
-    const existingAlbumIds = new Set(nextAlbums.map(album => album.id))
-    exportAlbumIds.value = exportAlbumIds.value.filter(albumId => existingAlbumIds.has(albumId))
-
-    const candidateId = preferredAlbumId || selectedAlbumId.value
-    const nextSelectedId = nextAlbums.some(album => album.id === candidateId)
-      ? candidateId
-      : ''
-
-    if (nextSelectedId === selectedAlbumId.value) {
-      return await loadAlbumDetail(nextSelectedId)
-    } else {
-      selectedAlbumId.value = nextSelectedId
-      return true
-    }
-  } catch (error) {
-    albumError.value = getAdminApiErrorMessage(error)
-    return false
-  } finally {
-    isLoadingAlbums.value = false
-  }
+    const updated = await adminFetch<Album>(`/api/albums/${selectedId.value}`, { method: 'PATCH', body: { ...draft, name: draft.name.trim(), description: draft.description.trim() } })
+    applyAlbum(updated); applyDraft(updated)
+    notice.add({ title: '相册资料已保存', color: 'success' })
+  } catch (cause) { formError.value = getAdminApiErrorMessage(cause) }
+  finally { mutation.value = '' }
 }
-
-const createAlbum = async () => {
-  if (isAlbumInteractionLocked.value) return
-  if (albumMetadataDirty.value) {
-    toast.add({ title: '请先保存或放弃当前相簿的资料修改', color: 'warning' })
-    return
-  }
-  const name = newAlbumName.value.trim()
-  if (!name) {
-    toast.add({ title: '请输入相簿名称', color: 'warning' })
-    return
-  }
-
-  isCreating.value = true
+const queueFile = (file: File) => {
+  if (!selectedAlbum.value || locked.value || !ready.value) return false
+  if (!/\.(png|jpe?g|jepg|webp)$/i.test(file.name)) { notice.add({ title: `不支持此文件：${file.name}`, color: 'warning' }); return false }
+  uploads.enqueue([file], { id: selectedAlbum.value.id, name: selectedAlbum.value.name })
+  return false
+}
+const togglePhoto = (id: string) => { selectedPhotos.value = toggleVisibleSelection(selectedPhotos.value, [id], !selectedPhotos.value.includes(id)) }
+const deletePhotos = async () => {
+  if (locked.value || !selectedPhotos.value.length) return
+  const ids = [...selectedPhotos.value]
+  mutation.value = 'confirm-delete-photos'
+  if (!await notice.confirm(`永久删除选中的 ${ids.length} 张图片？本地、S3 或 WebDAV 中的对应图片和缓存也会删除，无法撤销。`, true)) { mutation.value = ''; return }
+  mutation.value = 'delete-photos'
   try {
-    const created = await adminFetch<Album>('/api/albums', {
-      method: 'POST',
-      body: { name, description: newAlbumDescription.value },
-    })
-    newAlbumName.value = ''
-    newAlbumDescription.value = ''
-    isCreateDialogOpen.value = false
-    albums.value.unshift(created)
-    selectedAlbumId.value = created.id
-    toast.add({ title: '相簿已创建', description: created.name, color: 'success' })
-  } catch (error) {
-    toast.add({
-      title: '创建相簿失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isCreating.value = false
-  }
+    const result = await adminFetch<PhotoDeletionResult>('/api/photos/delete', { method: 'POST', body: { photoIds: ids } })
+    await loadDetail()
+    notice.add({ title: `已删除 ${result.deleted} 张图片`, description: result.cleanupPending ? `${result.cleanupPending} 个存储对象将在后台继续清理` : undefined, color: result.failures.length || result.cleanupPending ? 'warning' : 'success' })
+  } catch (cause) { notice.add({ title: '删除失败，请刷新确认', description: getAdminApiErrorMessage(cause), color: 'error' }) }
+  finally { mutation.value = '' }
 }
-
-const saveAlbumIdentity = async () => {
-  if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
-  if (!albumIdentityDirty.value || !selectedAlbumId.value) return
-  const name = albumNameDraft.value.trim()
-  const description = albumDescriptionDraft.value.trim()
-  if (!name || Array.from(name).length > 100) {
-    toast.add({ title: '相簿名不能为空且不能超过 100 个字符', color: 'warning' })
-    return
-  }
-  if (description.length > 1000) {
-    toast.add({ title: '相簿简介不能超过 1000 个字符', color: 'warning' })
-    return
-  }
-
-  isSavingAlbumIdentity.value = true
+const setCover = async () => {
+  if (locked.value || selectedPhotos.value.length !== 1) return
+  mutation.value = 'cover'
   try {
-    const updated = await adminFetch<Album>(`/api/albums/${selectedAlbumId.value}`, {
-      method: 'PATCH',
-      body: { name, description },
-    })
-    const albumIndex = albums.value.findIndex(album => album.id === updated.id)
-    if (albumIndex >= 0) albums.value[albumIndex] = updated
-    if (selectedAlbumId.value === updated.id) {
-      applyAlbumIdentityDraft({ ...updated, photos: photos.value }, true)
-    }
-    toast.add({
-      title: '相簿资料已保存',
-      description: '名称和简介已同步到公开相簿。',
-      color: 'success',
-    })
-  } catch (error) {
-    toast.add({
-      title: '保存相簿资料失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isSavingAlbumIdentity.value = false
-  }
+    const cover = await adminFetch<AlbumCover>(`/api/albums/${selectedId.value}/cover`, { method: 'PUT', body: { photoId: selectedPhotos.value[0] } })
+    applyCover(selectedId.value, cover)
+    notice.add({ title: '已设为相册封面', color: 'success' })
+  } catch (cause) { notice.add({ title: '封面设置失败', description: getAdminApiErrorMessage(cause), color: 'error' }) }
+  finally { mutation.value = '' }
 }
-
-const requestDeleteCurrentAlbum = () => {
+const deleteAlbum = async () => {
+  if (!selectedAlbum.value || locked.value) return
+  if (albumUploads.value) { uploads.open.value = true; notice.add({ title: '请先完成或取消此相册的上传队列', color: 'warning' }); return }
   const album = selectedAlbum.value
-  if (!album || isAlbumInteractionLocked.value) return
-  if (albumMetadataDirty.value) {
-    toast.add({ title: '请先保存或放弃相簿资料修改', color: 'warning' })
-    return
-  }
-  isDeleteDialogOpen.value = true
-}
-
-const closeDeleteAlbumDialog = () => {
-  if (isDeletingAlbum.value) return
-  isDeleteDialogOpen.value = false
-}
-
-const deleteCurrentAlbum = async () => {
-  const album = selectedAlbum.value
-  if (!album || isDeletingAlbum.value) return
-
-  isDeletingAlbum.value = true
-  isAlbumDetailReady.value = false
+  mutation.value = 'confirm-delete-album'
+  if (!await notice.confirm(`永久删除相册「${album.name}」及其中全部 ${album.photoCount} 张图片？对应存储文件、封面和本地 ZIP 也会清理，无法撤销。`, true)) { mutation.value = ''; return }
+  mutation.value = 'delete-album'
+  let deleted = false
   try {
-    const result = await adminFetch<AlbumDeletionResult>(`/api/albums/${album.id}`, {
-      method: 'DELETE',
-    })
-    isDeleteDialogOpen.value = false
-    selectedAlbumId.value = ''
-    await refreshAlbums()
-    toast.add({
-      title: `已删除相簿「${album.name}」`,
-      description: result.cleanupPending
-        ? `${result.photosDeleted} 张图片已移出相簿；${result.cleanupPending} 个存储对象将在后台继续清理。`
-        : `${result.photosDeleted} 张图片及其存储对象已清理。`,
-      color: result.cleanupPending ? 'warning' : 'success',
-    })
-  } catch (error) {
-    await refreshAlbums(album.id)
-    toast.add({
-      title: '删除相簿失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isDeletingAlbum.value = false
-  }
-}
-
-const moveAlbum = async (albumId: string, delta: -1 | 1) => {
-  if (isAlbumInteractionLocked.value) return
-  if (albumMetadataDirty.value) {
-    toast.add({ title: '请先保存或放弃当前相簿的资料修改', color: 'warning' })
-    return
-  }
-  const currentIndex = albums.value.findIndex(album => album.id === albumId)
-  const nextIndex = currentIndex + delta
-  if (currentIndex < 0 || nextIndex < 0 || nextIndex >= albums.value.length) return
-  const ordered = [...albums.value]
-  const [moved] = ordered.splice(currentIndex, 1)
-  if (!moved) return
-  ordered.splice(nextIndex, 0, moved)
-
-  isReorderingAlbums.value = true
-  try {
-    albums.value = await adminFetch<Album[]>('/api/albums/order', {
-      method: 'POST',
-      body: { albumIds: ordered.map(album => album.id) },
-    })
-    toast.add({ title: '相簿顺序已更新', color: 'success' })
-  } catch (error) {
-    toast.add({
-      title: '调整相簿顺序失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isReorderingAlbums.value = false
-  }
-}
-
-const saveAlbumDates = async () => {
-  if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
-  if (!albumDatesDirty.value) return
-  const displayCreatedDate = albumDateDraft.displayCreatedDate.trim()
-  const photoDateStart = albumDateDraft.photoDateStart.trim()
-  const photoDateEnd = albumDateDraft.photoDateEnd.trim()
-
-  if (!displayCreatedDate || !photoDateStart || !photoDateEnd) {
-    toast.add({ title: '请完整填写三个日期', color: 'warning' })
-    return
-  }
-  if (photoDateStart > photoDateEnd) {
-    toast.add({ title: '图片日期范围无效', description: '开始日期不能晚于结束日期。', color: 'warning' })
-    return
-  }
-  if (!selectedAlbumId.value) return
-
-  isSavingAlbumDates.value = true
-  try {
-    const updated = await adminFetch<Album>(`/api/albums/${selectedAlbumId.value}`, {
-      method: 'PATCH',
-      body: { displayCreatedDate, photoDateStart, photoDateEnd },
-    })
-    const albumIndex = albums.value.findIndex(album => album.id === updated.id)
-    if (albumIndex >= 0) albums.value[albumIndex] = updated
-    if (selectedAlbumId.value === updated.id) {
-      applyAlbumDateDraft({ ...updated, photos: photos.value }, true)
+    const result = await adminFetch<AlbumDeletionResult>(`/api/albums/${album.id}`, { method: 'DELETE' })
+    deleted = result.deleted
+    if (deleted) {
+      baseline.value = ''; downloadDirty.value = false
+      albums.value = albums.value.filter(item => item.id !== album.id)
+      listState.value.selected = listState.value.selected.filter(id => id !== album.id)
+      notice.add({ title: `已删除「${album.name}」`, description: result.cleanupPending ? '剩余存储文件将在后台继续清理' : undefined, color: result.cleanupPending ? 'warning' : 'success' })
     }
-    toast.add({
-      title: '相簿日期已保存',
-      description: '公开相簿页会使用管理员指定的日期。',
-      color: 'success',
-    })
-  } catch (error) {
-    toast.add({
-      title: '保存相簿日期失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isSavingAlbumDates.value = false
-  }
+  } catch (cause) { notice.add({ title: '删除失败，请刷新确认', description: getAdminApiErrorMessage(cause), color: 'error' }) }
+  finally { mutation.value = '' }
+  if (deleted) await navigateAlbum()
 }
-
-const clearAlbumDates = async () => {
-  if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
-  if (!selectedAlbumId.value) return
-  if (!albumHasCustomDates.value) {
-    resetAlbumDateDraft()
-    toast.add({ title: '已恢复当前自动日期', color: 'success' })
-    return
-  }
-
-  isSavingAlbumDates.value = true
-  try {
-    const updated = await adminFetch<Album>(`/api/albums/${selectedAlbumId.value}`, {
-      method: 'PATCH',
-      body: { displayCreatedDate: null, photoDateStart: null, photoDateEnd: null },
-    })
-    const albumIndex = albums.value.findIndex(album => album.id === updated.id)
-    if (albumIndex >= 0) albums.value[albumIndex] = updated
-    if (selectedAlbumId.value === updated.id) {
-      applyAlbumDateDraft({ ...updated, photos: photos.value }, true)
-    }
-    toast.add({
-      title: '已恢复自动日期',
-      description: '公开页面重新根据相簿创建记录和当前图片记录显示日期。',
-      color: 'success',
-    })
-  } catch (error) {
-    toast.add({
-      title: '恢复自动日期失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-  } finally {
-    isSavingAlbumDates.value = false
-  }
+const startOrder = () => { orderIds.value = albums.value.map(item => item.id); orderMode.value = true }
+const move = (id: string, delta: number) => {
+  const index = orderIds.value.indexOf(id)
+  const target = Math.max(0, Math.min(orderIds.value.length - 1, index + delta))
+  if (index < 0 || index === target) return
+  orderIds.value.splice(index, 1); orderIds.value.splice(target, 0, id)
 }
-
-const handleFileSelection = (event: Event) => {
-  const input = event.target as HTMLInputElement
-  selectedFiles.value = Array.from(input.files || [])
+const saveOrder = async () => {
+  if (locked.value) return
+  mutation.value = 'order'
+  try { albums.value = await adminFetch<Album[]>('/api/albums/order', { method: 'POST', body: { albumIds: orderIds.value } }); orderMode.value = false; notice.add({ title: '相册顺序已保存', color: 'success' }) }
+  catch (cause) { notice.add({ title: '顺序保存失败，请刷新后重试', description: getAdminApiErrorMessage(cause), color: 'error' }) }
+  finally { mutation.value = '' }
 }
-
-const clearSelectedFiles = () => {
-  selectedFiles.value = []
-  if (uploadInput.value) uploadInput.value.value = ''
-}
-
-const togglePhotoSelection = (photoId: string) => {
-  selectedPhotoIds.value = selectedPhotoIds.value.includes(photoId)
-    ? selectedPhotoIds.value.filter(id => id !== photoId)
-    : [...selectedPhotoIds.value, photoId]
-}
-
-const toggleAllPhotos = () => {
-  selectedPhotoIds.value = allPhotosSelected.value ? [] : photos.value.map(photo => photo.id)
-}
-
-const leavePhotoSelection = () => {
-  if (isDeletingPhotos.value) return
-  isSelectingPhotos.value = false
-  selectedPhotoIds.value = []
-}
-
-const deleteSelectedPhotos = async () => {
-  if (isDeletingPhotos.value || !selectedPhotoIds.value.length) return
-  const count = selectedPhotoIds.value.length
-  if (!await toast.confirm(`确定永久删除选中的 ${count} 张图片吗？\n\n图片会从当前存储（包括 S3/R2 或 WebDAV）删除，不能撤销。`)) return
-  const albumId = selectedAlbumId.value
-  isDeletingPhotos.value = true
-  isAlbumDetailReady.value = false
-  try {
-    const result = await adminFetch<PhotoDeletionResult>('/api/photos/delete', {
-      method: 'POST',
-      body: { photoIds: selectedPhotoIds.value },
-    })
-    selectedPhotoIds.value = []
-    isSelectingPhotos.value = false
-    const refreshed = await refreshAlbums(albumId)
-    toast.add({
-      title: `已删除 ${result.deleted} 张图片`,
-      description: result.cleanupPending
-        ? `${result.cleanupPending} 个存储对象暂未清理成功，后台会自动重试。`
-        : '数据库记录和存储对象均已清理。',
-      color: result.cleanupPending ? 'warning' : 'success',
-    })
-    if (!refreshed) photoError.value ||= '删除成功，但列表刷新失败，请手动刷新。'
-  } catch (error) {
-    toast.add({
-      title: '删除图片失败',
-      description: getAdminApiErrorMessage(error),
-      color: 'error',
-    })
-    await refreshAlbums(albumId)
-  } finally {
-    isDeletingPhotos.value = false
-  }
-}
-
-const uploadPhotos = async () => {
-  if (isAlbumInteractionLocked.value || !isAlbumDetailReady.value) return
-  if (albumMetadataDirty.value) {
-    toast.add({ title: '请先保存或放弃相簿资料修改，再上传图片', color: 'warning' })
-    return
-  }
-  if (!selectedAlbumId.value) {
-    toast.add({ title: '请先创建并选中相簿', color: 'warning' })
-    return
-  }
-  if (!selectedFiles.value.length) {
-    toast.add({ title: '请选择要上传的图片', color: 'warning' })
-    return
-  }
-
-  const albumId = selectedAlbumId.value
-  const files = [...selectedFiles.value]
-  const failed: Array<{ index: number, file: File, message: string }> = []
-  let uploadedCount = 0
-  let nextFileIndex = 0
-  isUploading.value = true
-  isAlbumDetailReady.value = false
-  uploadCompleted.value = 0
-  uploadTotal.value = files.length
-  uploadActiveCount.value = 0
-  try {
-    const uploadWorker = async () => {
-      while (nextFileIndex < files.length) {
-        const index = nextFileIndex++
-        const file = files[index]
-        if (!file) continue
-
-        uploadActiveCount.value += 1
-        const formData = new FormData()
-        formData.append('files', file, file.name)
-        try {
-          const uploaded = await adminFetch<Photo[]>(
-            `/api/albums/${albumId}/photos`,
-            { method: 'POST', body: formData },
-          )
-          uploadedCount += uploaded.length
-          const knownIds = new Set(photos.value.map(photo => photo.id))
-          const newPhotos = uploaded.filter(photo => !knownIds.has(photo.id))
-          if (newPhotos.length) photos.value = [...newPhotos, ...photos.value]
-        } catch (error) {
-          failed.push({ index, file, message: getAdminApiErrorMessage(error) })
-        } finally {
-          uploadActiveCount.value -= 1
-          uploadCompleted.value += 1
-        }
-      }
-    }
-
-    const workerCount = Math.min(UPLOAD_CONCURRENCY, files.length)
-    await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()))
-
-    failed.sort((left, right) => left.index - right.index)
-    selectedFiles.value = failed.map(item => item.file)
-    if (!failed.length && uploadInput.value) uploadInput.value.value = ''
-    const refreshed = await refreshAlbums(albumId)
-    if (!refreshed) {
-      toast.add({
-        title: uploadedCount ? `已上传 ${uploadedCount} 张，列表同步失败` : '图片列表同步失败',
-        description: albumError.value || photoError.value || '成功项已经保留，请点击刷新确认相簿状态。',
-        color: 'warning',
-      })
-      return
-    }
-    if (failed.length) {
-      const details = failed.slice(0, 3).map(item => `${item.file.name}：${item.message}`).join('；')
-      toast.add({
-        title: `已上传 ${uploadedCount} 张，${failed.length} 张失败`,
-        description: `${details}${failed.length > 3 ? `；另有 ${failed.length - 3} 张失败` : ''}。失败文件已保留，可直接重试。`,
-        color: uploadedCount ? 'warning' : 'error',
-      })
-    } else {
-      toast.add({
-        title: '上传完成',
-        description: `已将 ${uploadedCount} 张图片写入「${selectedAlbum.value?.name || '相簿'}」`,
-        color: 'success',
-      })
-    }
-  } finally {
-    isUploading.value = false
-    uploadActiveCount.value = 0
-    uploadCompleted.value = 0
-    uploadTotal.value = 0
-  }
-}
-
-watch(selectedAlbumId, (albumId) => {
-  isDeleteDialogOpen.value = false
-  clearSelectedFiles()
-  selectedPhotoIds.value = []
-  isSelectingPhotos.value = false
-  isAlbumDetailReady.value = false
-  dateDraftAlbumId.value = albumId
-  albumDateDraft.displayCreatedDate = ''
-  albumDateDraft.photoDateStart = ''
-  albumDateDraft.photoDateEnd = ''
-  savedAlbumDateDraft.displayCreatedDate = ''
-  savedAlbumDateDraft.photoDateStart = ''
-  savedAlbumDateDraft.photoDateEnd = ''
-  descriptionDraftAlbumId.value = albumId
-  albumNameDraft.value = ''
-  savedAlbumNameDraft.value = ''
-  albumDescriptionDraft.value = ''
-  savedAlbumDescriptionDraft.value = ''
-  void loadAlbumDetail(albumId)
-})
-
-const confirmDiscardAlbumMetadata = () =>
-  !albumMetadataDirty.value || toast.confirm('相簿名称、简介或显示日期尚未保存，确定要放弃修改吗？')
-
-const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-  if (!albumMetadataDirty.value && !isUploading.value && !isSavingCover.value) return
-  event.preventDefault()
-  event.returnValue = true
-}
-
-onBeforeRouteLeave(() => {
-  if (isSavingCover.value) { toast.add({ title: '封面正在保存，请稍候', color: 'warning' }); return false }
-  if (isUploading.value) { toast.add({ title: '图片正在上传，请等待完成后离开', color: 'warning' }); return false }
-  return confirmDiscardAlbumMetadata()
-})
-onMounted(() => {
-  window.addEventListener('beforeunload', handleBeforeUnload)
-  void refreshAlbums()
-})
-onBeforeUnmount(() => window.removeEventListener('beforeunload', handleBeforeUnload))
-const albumColumns = [{ title: '排序', key: 'order', width: 105 }, { title: '相册名称', dataIndex: 'name' }, { title: '图片', dataIndex: 'photoCount', width: 90 }, { title: '简介', dataIndex: 'description', ellipsis: true }, { title: '操作', key: 'actions', width: 250 }]
-const photoColumns = [{ title: '预览', key: 'preview', width: 90 }, { title: '文件名', dataIndex: 'originalName', ellipsis: true }, { title: '格式', dataIndex: 'format', width: 90 }, { title: '尺寸', key: 'dimensions', width: 130 }, { title: '大小', key: 'size', width: 110 }]
-const photoSelection = computed(() => ({ selectedRowKeys: selectedPhotoIds.value, onChange: (keys: (string | number)[]) => { selectedPhotoIds.value = keys.map(String) }, getCheckboxProps: () => ({ disabled: isDeletingPhotos.value || isUploading.value }) }))
-const queueFile = (file: File) => { selectedFiles.value.push(file); return false }
+const exportUrl = computed(() => `/api/albums/export?${new URLSearchParams({ albumIds: listState.value.selected.join(',') })}`)
 </script>
 
 <template>
   <div>
-    <DashboardPageHeader :title="selectedAlbum ? selectedAlbum.name : '相册管理'" :description="selectedAlbum ? '管理图片、相册资料和公开下载' : '创建相册、调整展示顺序并管理图片'">
-      <AButton v-if="selectedAlbum" :disabled="isAlbumInteractionLocked" @click="selectAlbum('')">返回列表</AButton>
-      <AButton :loading="isLoadingAlbums" :disabled="hasActiveMutation" @click="refreshAlbums()">刷新</AButton>
-      <AButton v-if="!selectedAlbum" type="primary" @click="openCreateDialog">新建相册</AButton>
-      <template v-else>
-        <NuxtLink :to="'/dashboard/downloads?album=' + selectedAlbumId"><AButton>下载设置</AButton></NuxtLink>
-        <NuxtLink :to="'/albums/' + selectedAlbumId" target="_blank"><AButton>查看相册</AButton></NuxtLink>
-        <AButton danger :disabled="isAlbumInteractionLocked" @click="requestDeleteCurrentAlbum">删除相册</AButton>
-      </template>
+    <div v-if="selectedId" class="admin-workspace-back"><AButton type="link" class="admin-name-link" @click="navigateAlbum()">← 全部相册</AButton><span class="admin-help">/ {{ selectedAlbum?.name || '相册' }}</span></div>
+    <DashboardPageHeader :title="selectedId ? (selectedAlbum?.name || '加载相册') : '相册管理'" :description="selectedId ? `${selectedAlbum?.photoCount || 0} 张图片 · 在同一个工作区完成图片、资料和下载管理` : '先创建相册，再添加图片。点击相册名称进入管理。'">
+      <template v-if="!selectedId"><AButton :disabled="loading || locked || orderMode || albums.length < 2" @click="startOrder">调整顺序</AButton><AButton type="primary" :disabled="locked || orderMode" @click="createOpen = true">新建相册</AButton></template>
+      <template v-else><AButton :href="`/albums/${selectedId}`" target="_blank">查看公开页面 ↗</AButton><AButton :loading="detailLoading" :disabled="locked" @click="loadDetail()">刷新</AButton><AUpload :accept="accept" multiple :show-upload-list="false" :before-upload="queueFile" :disabled="locked || !ready"><AButton type="primary" :disabled="locked || !ready"><Icon name="tabler:upload" /> 上传图片</AButton></AUpload></template>
     </DashboardPageHeader>
-    <AAlert v-if="albumError || photoError" class="mb-5" type="error" show-icon :message="albumError || photoError" />
-    <ACard v-if="!selectedAlbum">
-      <div class="admin-toolbar"><AInputSearch v-model:value="albumQuery" placeholder="搜索相册名称或简介" allow-clear style="width:320px;max-width:100%" /><span class="admin-help">共 {{ albums.length }} 个相册 · 上下箭头调整公开展示顺序</span></div>
-      <ATable :columns="albumColumns" :data-source="filteredAlbums" row-key="id" :loading="isLoadingAlbums" :pagination="{ pageSize: 20, showSizeChanger: true }" :scroll="{ x: 900 }">
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'order'"><ASpace :size="0"><AButton type="text" :aria-label="'上移 ' + record.name" :disabled="albums[0]?.id === record.id || isAlbumInteractionLocked" @click="moveAlbum(record.id, -1)"><Icon name="tabler:arrow-up" /></AButton><AButton type="text" :aria-label="'下移 ' + record.name" :disabled="albums.at(-1)?.id === record.id || isAlbumInteractionLocked" @click="moveAlbum(record.id, 1)"><Icon name="tabler:arrow-down" /></AButton></ASpace></template>
-          <template v-else-if="column.dataIndex === 'name'"><AButton type="link" style="padding:0" @click="selectAlbum(record.id); activeWorkspaceTab = 'photos'">{{ record.name }}</AButton></template>
-          <template v-else-if="column.key === 'actions'"><ASpace><AButton type="link" size="small" @click="selectAlbum(record.id); activeWorkspaceTab = 'photos'">图片</AButton><AButton type="link" size="small" @click="selectAlbum(record.id); activeWorkspaceTab = 'details'">编辑</AButton><NuxtLink :to="'/dashboard/downloads?album=' + record.id">下载设置</NuxtLink></ASpace></template>
+    <AAlert v-if="error" type="error" show-icon :message="error" class="mb-4" />
+    <ACard v-if="!selectedId">
+      <div class="admin-toolbar">
+        <ASpace v-if="!orderMode" wrap><AInputSearch v-model:value="listState.query" placeholder="搜索名称或简介" aria-label="搜索相册" allow-clear style="width:260px;max-width:70vw" /><span class="admin-help">{{ filteredAlbums.length }} 个相册</span></ASpace>
+        <ASpace v-else wrap><strong>调整首页展示顺序</strong><span class="admin-help">上移、下移或置顶，最后统一保存。</span></ASpace>
+        <ASpace v-if="!orderMode"><AButton :loading="loading" @click="loadAlbums">刷新</AButton><AButton v-if="listState.selected.length" @click="exportOpen = true">导出原始文件（{{ listState.selected.length }}）</AButton><AButton v-if="listState.selected.length" @click="listState.selected = []">取消选择</AButton></ASpace>
+        <ASpace v-else><AButton :disabled="locked" @click="orderMode = false">取消</AButton><AButton type="primary" :disabled="!orderDirty" :loading="mutation === 'order'" @click="saveOrder">保存顺序</AButton></ASpace>
+      </div>
+      <ATable :columns="albumColumns" :data-source="filteredAlbums" row-key="id" :loading="loading" :row-selection="orderMode ? undefined : { selectedRowKeys: listState.selected, onChange: (keys: (string | number)[]) => listState.selected = keys.map(String), preserveSelectedRowKeys: true }" :pagination="orderMode ? false : { current: listState.page, onChange: (page: number) => listState.page = page, pageSize: 20, showSizeChanger: false }" :scroll="{ x: 700 }">
+        <template #bodyCell="{ column, record, index }">
+          <ASpace v-if="column.key === 'order'" :size="2"><span class="admin-help mr-2">{{ index + 1 }}</span><AButton size="small" :disabled="locked || index === 0" :aria-label="`上移${record.name}`" @click="move(record.id, -1)">↑</AButton><AButton size="small" :disabled="locked || index === albums.length - 1" :aria-label="`下移${record.name}`" @click="move(record.id, 1)">↓</AButton><AButton type="link" size="small" :disabled="locked || index === 0" @click="move(record.id, -albums.length)">置顶</AButton></ASpace>
+          <div v-if="column.key === 'album'" class="admin-album-cell"><img v-if="record.coverUrl" :src="record.coverUrl" alt="" loading="lazy" /><div v-else class="admin-album-placeholder"><Icon name="tabler:album" /></div><div><AButton type="link" class="admin-name-link" :disabled="orderMode" @click="navigateAlbum(record.id)">{{ record.name }}</AButton><div class="admin-help admin-album-description">{{ record.description || '暂无简介' }}</div></div></div>
+          <ASpace v-if="column.key === 'actions'" :size="4"><AButton type="link" @click="navigateAlbum(record.id)">管理图片</AButton><AButton type="link" @click="navigateAlbum(record.id, 'details')">资料</AButton><AButton type="link" @click="navigateAlbum(record.id, 'downloads')">下载</AButton></ASpace>
         </template>
       </ATable>
-      <div class="mt-4"><AButton @click="activeWorkspaceTab = 'export'">管理员批量导出</AButton></div>
     </ACard>
-
-    <ATabs v-if="selectedAlbum" v-model:active-key="activeWorkspaceTab" class="mt-2">
-      <ATabPane key="photos" tab="图片与上传">
-        <div class="admin-stack">
-          <ACard title="上传图片">
-            <AUploadDragger multiple accept=".png,.jpg,.jpeg,.webp" :file-list="[]" :show-upload-list="false" :before-upload="queueFile" :disabled="isUploading || !isAlbumDetailReady">
-              <p class="ant-upload-drag-icon"><Icon name="tabler:cloud-upload" style="font-size:36px;color:#1677ff" /></p>
-              <p class="ant-upload-text">点击或拖动图片到这里</p>
-              <p class="ant-upload-hint">支持 PNG、JPG / JPEG、WebP，默认 7 并发上传</p>
-            </AUploadDragger>
-            <div v-if="selectedFiles.length || isUploading" class="mt-4">
-              <div class="admin-toolbar"><span>已选择 {{ selectedFiles.length }} 张 · {{ formatBytes(selectedBytes) }}</span><ASpace><AButton :disabled="isUploading" @click="clearSelectedFiles">清空</AButton><AButton type="primary" :loading="isUploading" :disabled="!selectedFiles.length" @click="uploadPhotos">开始上传</AButton></ASpace></div>
-              <AProgress v-if="isUploading" :percent="uploadTotal ? Math.round(uploadCompleted / uploadTotal * 100) : 0" />
-              <p v-if="isUploading" class="admin-help">{{ uploadCompleted }} / {{ uploadTotal }} · {{ uploadActiveCount }} 个文件正在上传，请保持当前页面打开</p>
-              <p v-else class="admin-help" style="overflow-wrap:anywhere">{{ selectedFiles.slice(0, 5).map(file => file.name).join('、') }}{{ selectedFiles.length > 5 ? ' 等' : '' }}</p>
-            </div>
+    <template v-else>
+      <AAlert v-if="detailError" type="error" show-icon :message="detailError" class="mb-4" />
+      <ASpin v-if="!ready && detailLoading" class="my-8" tip="加载相册…" />
+      <AAlert v-if="!selectedAlbum && !loading && !detailLoading && !detailError" type="warning" message="相册不存在，请返回列表重新选择。" />
+      <ATabs v-if="selectedAlbum && ready" :active-key="tab" @change="(key: string | number) => navigateAlbum(selectedId, String(key))">
+        <ATabPane key="photos" :tab="`图片管理（${photos.length}）`">
+          <AAlert v-if="albumUploads" type="info" show-icon class="mb-4" :message="`${albumUploads} 张图片等待上传或处理中；可切换页面，成功入库后自动显示。`"><template #action><AButton size="small" @click="uploads.open.value = true">查看队列</AButton></template></AAlert>
+          <ACard>
+            <template v-if="!photos.length && !detailError"><AUploadDragger :accept="accept" multiple :show-upload-list="false" :before-upload="queueFile" :disabled="locked"><p class="ant-upload-drag-icon"><Icon name="tabler:cloud-upload" /></p><p class="ant-upload-text">拖入图片，或点击开始上传</p><p class="ant-upload-hint">选择后自动上传，7 并发；入库时自动生成三层预览。</p></AUploadDragger></template>
+            <template v-else>
+              <AUploadDragger class="admin-compact-upload" :accept="accept" multiple :show-upload-list="false" :before-upload="queueFile" :disabled="locked"><span><Icon name="tabler:cloud-upload" /> 拖入更多图片，或点击选择 · 自动加入上传队列</span></AUploadDragger>
+              <div class="admin-toolbar"><ASpace wrap><AInputSearch v-model:value="photoQuery" placeholder="搜索文件名" aria-label="搜索图片" allow-clear style="width:230px" /><ASelect v-model:value="photoFormat" aria-label="筛选图片格式" :options="[{ label: '全部格式', value: 'all' }, { label: 'PNG', value: 'png' }, { label: 'JPG / JPEG', value: 'jpg' }, { label: 'WebP', value: 'webp' }]" style="width:130px" /><ASelect v-model:value="photoSort" aria-label="图片排序" :options="[{ label: '最近上传', value: 'newest' }, { label: '文件名称', value: 'name' }, { label: '文件大小', value: 'size' }]" style="width:120px" /></ASpace><ARadioGroup v-model:value="photoView" option-type="button" aria-label="图片视图" :options="[{ label: '网格', value: 'grid' }, { label: '列表', value: 'table' }]" /></div>
+              <div class="admin-selection-bar"><ASpace wrap><ACheckbox :checked="pageChecked" :indeterminate="pagePartial" :disabled="locked || !pagePhotos.length" @change="(event: { target: { checked: boolean } }) => selectedPhotos = toggleVisibleSelection(selectedPhotos, pagePhotos.map(photo => photo.id), event.target.checked)">本页全选</ACheckbox><span>已选 {{ selectedPhotos.length }} / {{ photos.length }}</span><AButton type="link" size="small" :disabled="locked || !filteredPhotos.length" @click="selectedPhotos = toggleVisibleSelection(selectedPhotos, filteredPhotos.map(photo => photo.id), true)">选择全部筛选结果（{{ filteredPhotos.length }}）</AButton><AButton v-if="selectedPhotos.length" type="link" size="small" :disabled="locked" @click="selectedPhotos = []">取消选择</AButton></ASpace><ASpace v-if="selectedPhotos.length"><AButton :disabled="locked || selectedPhotos.length !== 1" @click="setCover">设为封面</AButton><AButton danger :loading="mutation === 'delete-photos'" :disabled="locked && mutation !== 'delete-photos'" @click="deletePhotos">删除（{{ selectedPhotos.length }}）</AButton></ASpace></div>
+              <div v-if="photoView === 'grid' && pagePhotos.length" class="admin-photo-grid">
+                <article v-for="photo in pagePhotos" :key="photo.id" class="admin-photo-tile" :class="{ selected: selectedPhotos.includes(photo.id) }">
+                  <AImage :src="`/api/photos/${photo.id}/thumbnail?v=grid2`" :alt="photo.originalName" :preview="{ src: `/api/photos/${photo.id}/preview` }" loading="lazy" />
+                  <ACheckbox class="admin-photo-check" :checked="selectedPhotos.includes(photo.id)" :aria-label="`选择图片：${photo.originalName}`" :disabled="locked" @change="togglePhoto(photo.id)" />
+                  <ATag v-if="selectedAlbum.coverPhotoId === photo.id" class="admin-cover-label" color="blue">封面</ATag>
+                  <button type="button" class="admin-photo-caption" :title="photo.originalName" :disabled="locked" @click="togglePhoto(photo.id)"><span>{{ photo.originalName }}</span><small>{{ photo.format.toUpperCase() }} · {{ adminBytes(photo.byteSize) }}</small></button>
+                </article>
+              </div>
+              <ATable v-else-if="photoView === 'table'" :columns="photoColumns" :data-source="pagePhotos" row-key="id" size="middle" :pagination="false" :row-selection="{ selectedRowKeys: selectedPhotos, onChange: (keys: (string | number)[]) => selectedPhotos = keys.map(String), preserveSelectedRowKeys: true, getCheckboxProps: () => ({ disabled: locked }) }" :scroll="{ x: 700 }">
+                <template #bodyCell="{ column, record }"><AImage v-if="column.key === 'photo'" :width="56" :height="56" style="object-fit:cover" :src="`/api/photos/${record.id}/thumbnail?v=grid2`" :preview="{ src: `/api/photos/${record.id}/preview` }" :alt="record.originalName" /><span v-if="column.key === 'size'">{{ adminBytes(record.byteSize) }}</span><span v-if="column.key === 'dimensions'">{{ record.width }} × {{ record.height }}</span></template>
+              </ATable>
+              <AEmpty v-else description="没有符合条件的图片" />
+              <div class="admin-pagination"><span class="admin-help">{{ filteredPhotos.length }} 张符合条件 · 每页 {{ photoPageSize }} 张</span><APagination v-model:current="photoPage" :page-size="photoPageSize" :total="filteredPhotos.length" :show-size-changer="false" show-quick-jumper /></div>
+            </template>
           </ACard>
-          <ACard :title="'相册图片（' + photos.length + '）'">
-            <template #extra><AButton danger :disabled="!selectedPhotoIds.length || isUploading" :loading="isDeletingPhotos" @click="deleteSelectedPhotos">删除所选 {{ selectedPhotoIds.length || '' }}</AButton></template>
-            <ATable :columns="photoColumns" :data-source="photos" :row-selection="photoSelection" row-key="id" :loading="isLoadingPhotos" :pagination="{ pageSize: 30, showSizeChanger: true }" :scroll="{ x: 620 }">
-              <template #bodyCell="{ column, record }">
-                <template v-if="column.key === 'preview'"><AImage :width="48" :height="48" class="admin-preview" :src="'/api/photos/' + record.id + '/thumbnail'" :preview="{ src: '/api/photos/' + record.id + '/preview' }" /></template>
-                <template v-else-if="column.dataIndex === 'format'"><ATag>{{ record.format.toUpperCase() }}</ATag></template>
-                <template v-else-if="column.key === 'dimensions'">{{ record.width }} × {{ record.height }}</template>
-                <template v-else-if="column.key === 'size'">{{ formatBytes(record.byteSize) }}</template>
-              </template>
-            </ATable>
-          </ACard>
-        </div>
-      </ATabPane>
-      <ATabPane key="details" tab="相册设置">
-        <div class="admin-stack" style="max-width:960px">
-          <DashboardAlbumCoverEditor :key="selectedAlbum.id" :album="selectedAlbum" :photos="photos" :disabled="isAlbumInteractionLocked || !isAlbumDetailReady" @saved="applyAlbumCover" @busy="isSavingCover = $event" />
-          <ACard title="基本信息"><AForm layout="vertical" @finish="saveAlbumIdentity">
-            <AFormItem label="相册名称" html-for="album-name" required><AInput id="album-name" v-model:value="albumNameDraft" :maxlength="100" :disabled="!isAlbumDetailReady" /></AFormItem>
-            <AFormItem label="相册简介" html-for="album-description" extra="显示在相册首页和详情页"><ATextarea id="album-description" v-model:value="albumDescriptionDraft" :maxlength="1000" show-count :rows="4" :disabled="!isAlbumDetailReady" /></AFormItem>
-            <ASpace><AButton type="primary" html-type="submit" :loading="isSavingAlbumIdentity" :disabled="!albumIdentityDirty">保存基本信息</AButton><AButton :disabled="!albumIdentityDirty" @click="resetAlbumIdentityDraft">重置</AButton></ASpace>
-          </AForm></ACard>
-          <ACard title="展示日期"><AForm layout="vertical" @finish="saveAlbumDates">
-            <div class="admin-form-grid">
-              <AFormItem label="相册创建日期" html-for="album-created-date"><ADatePicker id="album-created-date" v-model:value="albumDateDraft.displayCreatedDate" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem><div />
-              <AFormItem label="图片开始日期" html-for="album-start-date"><ADatePicker id="album-start-date" v-model:value="albumDateDraft.photoDateStart" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem>
-              <AFormItem label="图片结束日期" html-for="album-end-date"><ADatePicker id="album-end-date" v-model:value="albumDateDraft.photoDateEnd" value-format="YYYY-MM-DD" :allow-clear="false" /></AFormItem>
-            </div>
-            <ASpace wrap><AButton type="primary" html-type="submit" :loading="isSavingAlbumDates" :disabled="!albumDatesDirty">保存日期</AButton><AButton :disabled="!albumDatesDirty" @click="resetAlbumDateDraft">重置</AButton><AButton @click="clearAlbumDates">恢复自动日期</AButton></ASpace>
-          </AForm></ACard>
-        </div>
-      </ATabPane>
-      <ATabPane key="export" tab="管理员导出">
-        <AAlert type="info" show-icon message="访客下载请在“下载设置”中开启。此处仅供管理员导出原始文件。" class="mb-4" />
-      </ATabPane>
-    </ATabs>
-    <ACard v-if="activeWorkspaceTab === 'export'" title="管理员批量导出" class="mt-4">
-      <p class="admin-help mb-4">单个相册为一个 ZIP；多个相册为一个包含各相册 ZIP 的总包。此导出不改变公开下载设置。</p>
-      <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 mb-5"><ACheckbox v-for="album in albums" :key="album.id" :checked="exportAlbumIds.includes(album.id)" @change="toggleExportAlbum(album.id, $event.target.checked)">{{ album.name }}（{{ album.photoCount }}）</ACheckbox></div>
-      <ASpace><AButton type="primary" :loading="isStartingExport" :disabled="!exportAlbumIds.length" @click="startAlbumExport">打包并下载所选相册</AButton><AButton @click="activeWorkspaceTab = 'photos'">收起</AButton></ASpace>
-    </ACard>
-    <AModal :open="isCreateDialogOpen" title="新建相册" ok-text="创建相册" cancel-text="取消" :confirm-loading="isCreating" :mask-closable="!isCreating" @ok="createAlbum" @cancel="closeCreateDialog">
-      <AForm layout="vertical" class="mt-5"><AFormItem label="相册名称" html-for="new-album-name" required><AInput id="new-album-name" v-model:value="newAlbumName" :maxlength="100" @press-enter="createAlbum" /></AFormItem><AFormItem label="相册简介" html-for="new-album-description"><ATextarea id="new-album-description" v-model:value="newAlbumDescription" :rows="3" :maxlength="1000" /></AFormItem></AForm>
+        </ATabPane>
+        <ATabPane key="details" tab="相册资料">
+          <div class="admin-stack">
+            <ACard title="名称、简介与展示日期">
+              <AForm layout="vertical" :model="draft" :disabled="locked" @finish="save">
+                <div class="admin-form-grid"><AFormItem label="相册名称" required><AInput v-model:value="draft.name" :maxlength="100" show-count /></AFormItem><AFormItem label="展示创建日期" extra="留空使用真实创建日期。"><ADatePicker :value="draft.displayCreatedDate || undefined" value-format="YYYY-MM-DD" placeholder="自动日期" @update:value="(value: unknown) => updateDate('displayCreatedDate', value)" /></AFormItem></div>
+                <AFormItem label="相册简介"><ATextarea v-model:value="draft.description" :rows="3" :maxlength="1000" show-count placeholder="显示在公开相册页面的介绍" /></AFormItem>
+                <div class="admin-form-grid"><AFormItem label="图片开始日期"><ADatePicker :value="draft.photoDateStart || undefined" value-format="YYYY-MM-DD" placeholder="自动日期" @update:value="(value: unknown) => updateDate('photoDateStart', value)" /></AFormItem><AFormItem label="图片结束日期"><ADatePicker :value="draft.photoDateEnd || undefined" value-format="YYYY-MM-DD" placeholder="自动日期" @update:value="(value: unknown) => updateDate('photoDateEnd', value)" /></AFormItem></div>
+                <AButton type="link" class="admin-name-link" @click="draft.displayCreatedDate = null; draft.photoDateStart = null; draft.photoDateEnd = null">恢复自动日期（保存后生效）</AButton>
+                <AAlert v-if="formError" type="error" show-icon :message="formError" class="mt-4" />
+                <div class="admin-save-bar"><span :class="dirty ? 'admin-unsaved' : 'admin-help'">{{ dirty ? '有未保存的修改' : '所有资料已保存' }}</span><ASpace><AButton :disabled="!dirty || locked" @click="applyDraft(selectedAlbum)">放弃修改</AButton><AButton html-type="submit" type="primary" :disabled="!dirty" :loading="mutation === 'save'">保存相册资料</AButton></ASpace></div>
+              </AForm>
+            </ACard>
+            <DashboardAlbumCoverEditor :key="selectedId" :album="selectedAlbum" :photos="photos" :disabled="locked" @saved="applyCover" @busy="coverBusy = $event" />
+            <ACard size="small"><div class="admin-toolbar" style="margin:0"><div><strong>删除相册</strong><p class="admin-help" style="margin:4px 0 0">将删除相册及其中全部图片、封面和压缩包，无法撤销。</p></div><AButton danger :disabled="locked || dirty || downloadDirty" :loading="mutation === 'delete-album'" @click="deleteAlbum">删除此相册</AButton></div></ACard>
+          </div>
+        </ATabPane>
+        <ATabPane key="downloads" tab="公开下载"><DashboardDownloadManager :key="selectedId" :album-id="selectedId" embedded @dirty="downloadDirty = $event" @busy="downloadBusy = $event" /></ATabPane>
+      </ATabs>
+    </template>
+    <AModal v-model:open="createOpen" title="新建相册" :footer="null" :closable="!locked" :mask-closable="!locked" :keyboard="!locked">
+      <AForm layout="vertical" :model="newAlbum" :disabled="locked" @finish="create"><AFormItem label="相册名称" required><AInput v-model:value="newAlbum.name" :maxlength="100" placeholder="例如：2026 夏日旅行" /></AFormItem><AFormItem label="简介（选填）"><ATextarea v-model:value="newAlbum.description" :rows="3" :maxlength="1000" /></AFormItem><AAlert v-if="createError" type="error" :message="createError" class="mb-4" /><div class="admin-dialog-actions"><AButton :disabled="locked" @click="createOpen = false">取消</AButton><AButton type="primary" html-type="submit" :loading="mutation === 'create'">创建并上传图片</AButton></div></AForm>
     </AModal>
-    <AModal :open="isDeleteDialogOpen" title="删除相册" ok-text="永久删除" cancel-text="取消" :ok-button-props="{ danger: true }" :confirm-loading="isDeletingAlbum" :mask-closable="!isDeletingAlbum" @ok="deleteCurrentAlbum" @cancel="closeDeleteAlbumDialog">
-      <AAlert type="warning" show-icon :message="'确定删除「' + (selectedAlbum?.name || '') + '」？'" :description="'该相册的 ' + (selectedAlbum?.photoCount || 0) + ' 张图片、存储原文件及本地下载包都会删除，此操作不能撤销。'" />
-    </AModal>
+    <AModal v-model:open="exportOpen" title="管理员导出原始文件" :footer="null"><p>导出选中的 {{ listState.selected.length }} 个相册，保持入库文件格式，不改变公开下载设置。</p><p class="admin-help">一个相册生成一个 ZIP；多个相册生成一个外层 ZIP，其中每个相册各一个 ZIP。大相册需要等待服务器打包。</p><div class="admin-dialog-actions"><AButton @click="exportOpen = false">取消</AButton><AButton type="primary" :href="exportUrl" :disabled="!listState.selected.length" @click="exportOpen = false">下载原始文件</AButton></div></AModal>
   </div>
 </template>
