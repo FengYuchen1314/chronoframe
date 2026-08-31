@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { AnimatePresence, motion } from 'motion-v'
+import { PROJECT_LINKS } from '~~/shared/utils/projectLinks'
 
 defineProps<{ total: number; dateRangeText: string }>()
 const config = useRuntimeConfig()
@@ -90,7 +91,7 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
       <footer class="mt-1 flex w-full items-center justify-between gap-2 bg-neutral-200/50 px-3 py-2 text-xs font-medium text-neutral-500 sm:px-2 sm:py-1.5 dark:bg-neutral-900/50">
         <span class="truncate">© {{ new Date().getFullYear() }} {{ siteSettings.author || siteSettings.title }}</span>
         <a
-          href="https://github.com/HoshinoSuzumi/chronoframe"
+          :href="PROJECT_LINKS.repository"
           target="_blank"
           rel="noopener noreferrer"
           class="inline-flex items-center gap-1 hover:underline"
