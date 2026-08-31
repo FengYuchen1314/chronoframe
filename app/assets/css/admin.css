@@ -23,5 +23,40 @@
 .admin-auth-card { width: 100%; max-width: 420px; }
 .admin-auth-card h1 { font-size: 24px; font-weight: 600; margin: 16px 0 8px; }
 .admin-auth-card .ant-form { margin-top: 24px; }
+.admin-workspace-back { display: flex; gap: 10px; align-items: center; margin: -4px 0 12px; }
+.admin-name-link.ant-btn { padding-inline: 0; height: auto; white-space: normal; text-align: left; }
+.admin-album-cell { display: flex; gap: 14px; align-items: center; min-width: 180px; }
+.admin-album-cell > img, .admin-album-placeholder { width: 72px; height: 54px; flex-shrink: 0; object-fit: cover; border-radius: 6px; background: #f0f2f5; }
+.admin-album-placeholder { display: grid; place-items: center; color: #8c8c8c; font-size: 24px; }
+.admin-album-description { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-photo-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(160px,1fr)); gap: 16px; }
+.admin-compact-upload.ant-upload-wrapper { display: block; margin-bottom: 20px; }
+.admin-compact-upload.ant-upload-wrapper .ant-upload-drag .ant-upload-btn { padding: 12px; color: #8c8c8c; }
+.admin-photo-tile { position: relative; min-width: 0; border: 2px solid #f0f0f0; border-radius: 8px; overflow: hidden; background: white; transition: border-color .15s; }
+.admin-photo-tile:hover { border-color: #91caff; }
+.admin-photo-tile.selected { border-color: #1677ff; background: #e6f4ff; }
+.admin-photo-tile > .ant-image { display: block; width: 100%; aspect-ratio: 4/3; background: #f5f5f5; }
+.admin-photo-tile > .ant-image img { width: 100%; height: 100%; object-fit: cover; }
+.admin-photo-check { position: absolute; top: 8px; left: 8px; border-radius: 4px; padding: 3px; background: #fff; line-height: 1; }
+.admin-cover-label { position: absolute; top: 8px; right: 0; pointer-events: none; }
+.admin-photo-caption { display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 10px; text-align: left; cursor: pointer; background: transparent; border: 0; }
+.admin-photo-caption > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; font-size: 13px; }
+.admin-photo-caption > small { font-size: 12px; color: #8c8c8c; }
+.admin-photo-caption:focus-visible { outline: 2px solid #1677ff; outline-offset: -3px; }
+.admin-selection-bar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 12px; border: 1px solid #d6e4ff; background: #f5faff; border-radius: 6px; margin-bottom: 20px; }
+.admin-pagination { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; align-items: center; margin-top: 24px; }
+.admin-save-bar { display: flex; gap: 16px; justify-content: space-between; align-items: center; position: sticky; bottom: 12px; z-index: 5; background: #fff; border: 1px solid #f0f0f0; border-radius: 6px; padding: 12px 16px; margin-top: 24px; box-shadow: 0 4px 16px #00000008; }
+.admin-unsaved { color: #ad6800; }
+.admin-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.admin-upload-summary { display: flex; flex-wrap: wrap; gap: 16px; margin: 20px 0 8px; }
+.admin-field-error { color: #cf1322; overflow-wrap: anywhere; font-size: 13px; margin-top: 4px; }
+.admin-file-name { overflow-wrap: anywhere; }
+.admin-quick-actions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 20px; }
+.admin-quick-actions > a { display: grid; grid-template-columns: 40px 1fr; gap: 6px 12px; padding: 18px; border: 1px solid #f0f0f0; border-radius: 8px; color: #262626; }
+.admin-quick-actions > a:hover { border-color: #91caff; background: #f5faff; }
+.admin-quick-actions > a > .iconify { grid-row: span 2; font-size: 28px; color: #1677ff; align-self: center; }
+.admin-quick-actions > a > span:last-child { font-size: 13px; color: #8c8c8c; }
+@media(max-width: 1100px) { .admin-quick-actions { grid-template-columns: 1fr; gap: 12px; } }
+@media(max-width: 600px) { .admin-photo-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; } .admin-save-bar { align-items: flex-start; flex-direction: column; } .admin-album-description { max-width: 200px; } }
 @media(max-width: 1360px) { .admin-settings-grid { grid-template-columns: 1fr; } }
 @media(max-width: 768px) { .admin-app .admin-content { padding: 16px; } .admin-app .admin-topbar { padding: 0 16px; } .admin-page-header { flex-direction: column; gap: 16px; } .admin-page-actions { justify-content: flex-start; } .admin-form-grid { grid-template-columns: 1fr; } }
