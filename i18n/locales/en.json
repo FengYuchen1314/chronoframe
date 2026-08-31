@@ -1,4 +1,8 @@
 {
+  "siteFooter": {
+    "source": "Source code",
+    "upstream": "Original project"
+  },
   "plural": {
     "photo": "no photos | one photo | {count} photos"
   },

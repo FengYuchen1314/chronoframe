@@ -89,6 +89,7 @@ useHead({ titleTemplate: title => `${title ? `${title} | ` : ''}${siteSettings.v
       <NuxtLayout>
         <NuxtPage />
       </NuxtLayout>
+      <SiteFooter v-if="route.meta.layout !== 'dashboard'" />
       <ClientOnly>
         <PhotoViewer
           :photos="viewerPhotos"

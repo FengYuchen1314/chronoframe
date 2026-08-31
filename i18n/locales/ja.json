@@ -1,4 +1,8 @@
 {
+  "siteFooter": {
+    "source": "ソースコード",
+    "upstream": "元のプロジェクト"
+  },
   "plural": {
     "photo": "写真がありません | 写真 {count} 枚"
   },
