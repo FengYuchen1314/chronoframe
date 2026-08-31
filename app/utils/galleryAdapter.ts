@@ -66,7 +66,8 @@ export const adaptRustAlbum = (album: RustAlbum, allPhotos: GalleryPhoto[] = [])
     photoCount: Number(album.photoCount) || photos.length,
     photos,
     photoIds: photos.map(photo => photo.id),
-    coverPhotoId: photos[0]?.id ?? null,
+    coverPhotoId: album.coverPhotoId ?? photos[0]?.id ?? null,
+    coverUrl: album.coverUrl ?? photos.find(photo => photo.id === album.coverPhotoId)?.thumbnailUrl ?? photos[0]?.thumbnailUrl ?? null,
   }
 }
 
