@@ -36,3 +36,6 @@ url = "2.5"
 urlencoding = "2.1"
 uuid = { version = "1.12", features = ["v4"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["test-util"] }

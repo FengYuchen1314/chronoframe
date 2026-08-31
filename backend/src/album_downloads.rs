@@ -936,9 +936,18 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
         let token=token.clone();let path=work.join(format!("{index}.{format}"));let format=format.clone();
         async move {
             check_cancel(&token)?;
-            let _slot=state.downloads.image_slots.clone().acquire_owned().await?;
+            let _slot=tokio::select! {
+                biased;
+                _=token.cancelled()=>bail!("打包已取消"),
+                slot=state.downloads.image_slots.clone().acquire_owned()=>slot?,
+            };
             check_cancel(&token)?;
-            let data={let _guard=state.storage.gate.read().await;state.storage.store().await?.get(&photo.storage_key).await?};
+            let data=storage_reads::read_for_archive(&token,&photo.id,|| async {
+                // Release the storage lock between attempts so migration/settings are not
+                // held up by retry backoff. Cancellation drops the in-flight GET as well.
+                let _guard=state.storage.gate.read().await;
+                state.storage.store().await?.get_for_archive(&photo.storage_key).await
+            }).await?;
             let path_copy=path.clone();let disk_gate=state.downloads.disk_gate.clone();
             tokio::task::spawn_blocking(move ||->Result<()> {let data=encode_download(&data,&format,max_image,&token)?;check_cancel(&token)?;let _guard=disk_gate.lock().map_err(|_|anyhow::anyhow!("disk lock poisoned"))?;check_disk(path_copy.parent().context("missing work directory")?,data.len() as u64)?;std::fs::write(path_copy,data)?;Ok(())}).await??;
             sqlx::query("UPDATE album_download_jobs SET completed=completed+1,updated_at=? WHERE id=? AND status='running'").bind(now()).bind(id).execute(&state.db).await?;
@@ -988,6 +997,341 @@ async fn build(state: &AppState, id: &str, token: CancellationToken) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ReadFault {
+        Unavailable,
+        AlwaysUnavailable,
+        Throttled,
+        Truncated,
+        Forbidden,
+        Missing,
+        Slow,
+        Stalled,
+    }
+
+    struct RemoteFixture {
+        store: Arc<S3Store>,
+        calls: Arc<DashMap<String, usize>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RemoteFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn remote_fixture(fault: ReadFault) -> RemoteFixture {
+        let calls = Arc::new(DashMap::<String, usize>::new());
+        let seen = calls.clone();
+        let app = Router::new().fallback(move |method: Method, uri: axum::http::Uri| {
+            let seen = seen.clone();
+            async move {
+                assert_eq!(
+                    method,
+                    Method::GET,
+                    "archives must never mutate the source store"
+                );
+                let attempt = {
+                    let mut count = seen.entry(uri.path().to_string()).or_default();
+                    *count += 1;
+                    *count
+                };
+                if uri.path().ends_with("flaky.png") {
+                    let status = match fault {
+                        ReadFault::Unavailable if attempt == 1 => Some((503, "SlowDown")),
+                        ReadFault::AlwaysUnavailable => Some((503, "ServiceUnavailable")),
+                        ReadFault::Throttled if attempt == 1 => Some((429, "SlowDown")),
+                        ReadFault::Forbidden => Some((403, "AccessDenied")),
+                        ReadFault::Missing => Some((404, "NoSuchKey")),
+                        _ => None,
+                    };
+                    if let Some((status, code)) = status {
+                        return Response::builder()
+                            .status(status)
+                            .header(header::CONTENT_TYPE, "application/xml")
+                            .body(Body::from(format!(
+                                "<Error><Code>{code}</Code><Message>injected</Message></Error>"
+                            )))
+                            .unwrap();
+                    }
+                    if matches!(fault, ReadFault::Truncated) && attempt == 1 {
+                        let chunks = stream::once(async {
+                            Ok::<_, std::io::Error>(Bytes::from_static(b"partial"))
+                        })
+                        .chain(stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Err(std::io::Error::from(ErrorKind::ConnectionReset))
+                        }));
+                        return Response::builder()
+                            .header(header::CONTENT_LENGTH, "999")
+                            .body(Body::from_stream(chunks))
+                            .unwrap();
+                    }
+                    if matches!(fault, ReadFault::Slow) {
+                        // Exercise the real S3 adapter's archive timeout, not only the retry helper.
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                    }
+                    if matches!(fault, ReadFault::Stalled) {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                let mut png = Cursor::new(Vec::new());
+                image::DynamicImage::new_rgb8(4, 3)
+                    .write_to(&mut png, ImageFormat::Png)
+                    .unwrap();
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Body::from(png.into_inner()))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = S3ConfigBuilder::new()
+            .behavior_version_latest()
+            .region(Region::new("auto"))
+            .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            // Disable SDK retries here so only the new application retry is exercised.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .build();
+        RemoteFixture {
+            store: Arc::new(S3Store {
+                client: S3Client::from_conf(config),
+                bucket: "downloads-test".into(),
+                prefix: String::new(),
+            }),
+            calls,
+            server,
+        }
+    }
+
+    async fn remote_archive_state(remote: &RemoteFixture) -> (AppState, String) {
+        let state = super::super::tests::test_state().await;
+        tokio::fs::create_dir_all(&state.downloads.root)
+            .await
+            .unwrap();
+        let fingerprint = state
+            .storage
+            .candidate_from_values(&state.storage.values().await.unwrap())
+            .unwrap()
+            .fingerprint();
+        *state.storage.cache.write().await = Some((fingerprint, remote.store.clone()));
+        sqlx::query(
+            "INSERT INTO albums(id,name,created_at) VALUES('retry-album','Retry fixture',1)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for id in ["stable", "flaky"] {
+            sqlx::query("INSERT INTO photos(id,album_id,original_name,storage_key,format,content_type,byte_size,created_at) VALUES(?,'retry-album',?,?,'png','image/png',80,1)")
+                .bind(id).bind(format!("{id}.png")).bind(format!("{id}.png")).execute(&state.db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO album_download_settings(album_id,enabled,formats,max_image_bytes,max_zip_bytes,revision,updated_at) VALUES('retry-album',1,'[\"jpeg\"]',0,0,1,1)").execute(&state.db).await.unwrap();
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO album_download_jobs(id,album_id,format,revision,status,created_at,updated_at) VALUES(?,'retry-album','jpeg',1,'queued',1,1)").bind(&id).execute(&state.db).await.unwrap();
+        (state, id)
+    }
+
+    async fn finish_job(state: &AppState, id: &str) {
+        timeout(Duration::from_secs(10), async {
+            while state.downloads.tasks.contains_key(id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("archive job should finish promptly");
+        tick(state).await.unwrap(); // Normal scheduler cleanup, including failed .work files.
+    }
+
+    async fn cleanup_fixture(state: &AppState) {
+        state.db.close().await;
+        tokio::fs::remove_dir_all(state.storage.thumbnail_cache_dir.as_ref())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jpeg_archive_recovers_from_s3_503_and_partial_bodies_without_missing_photos() {
+        for fault in [
+            ReadFault::Unavailable,
+            ReadFault::Throttled,
+            ReadFault::Truncated,
+        ] {
+            let remote = remote_fixture(fault).await;
+            let (state, id) = remote_archive_state(&remote).await;
+            tick(&state).await.unwrap();
+            finish_job(&state, &id).await;
+            let row = sqlx::query(
+                "SELECT status,completed,total,error FROM album_download_jobs WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            assert_eq!(row.get::<String, _>("status"), "ready");
+            assert_eq!(row.get::<i64, _>("completed"), 2);
+            assert_eq!(row.get::<i64, _>("total"), 2);
+            assert!(row.get::<Option<String>, _>("error").is_none());
+            assert_eq!(*remote.calls.get("/downloads-test/flaky.png").unwrap(), 2);
+            assert_eq!(*remote.calls.get("/downloads-test/stable.png").unwrap(), 1);
+            let mut zip = zip::ZipArchive::new(
+                std::fs::File::open(state.downloads.path(&id, "zip").unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(zip.len(), 2);
+            for i in 0..zip.len() {
+                let mut entry = zip.by_index(i).unwrap();
+                assert!(entry.name().ends_with(".jpeg"));
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Jpeg);
+                assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 4);
+            }
+            drop(zip);
+            assert!(!state.downloads.path(&id, "work").unwrap().exists());
+            assert!(!state.downloads.path(&id, "part").unwrap().exists());
+            cleanup_fixture(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_permissions_and_missing_objects_fail_once_and_never_publish_partial_zip() {
+        for fault in [ReadFault::Forbidden, ReadFault::Missing] {
+            let remote = remote_fixture(fault).await;
+            let (state, id) = remote_archive_state(&remote).await;
+            tick(&state).await.unwrap();
+            finish_job(&state, &id).await;
+            let row = sqlx::query("SELECT status,error FROM album_download_jobs WHERE id=?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            assert_eq!(row.get::<String, _>("status"), "failed");
+            assert!(row.get::<String, _>("error").contains("flaky"));
+            assert_eq!(*remote.calls.get("/downloads-test/flaky.png").unwrap(), 1);
+            for suffix in ["work", "part", "zip"] {
+                assert!(!state.downloads.path(&id, suffix).unwrap().exists());
+            }
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM photos")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            cleanup_fixture(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_retries_exhaust_without_publishing_a_partial_archive() {
+        let remote = remote_fixture(ReadFault::AlwaysUnavailable).await;
+        let (state, id) = remote_archive_state(&remote).await;
+        tick(&state).await.unwrap();
+        finish_job(&state, &id).await;
+        let row = sqlx::query("SELECT status,error FROM album_download_jobs WHERE id=?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert!(row.get::<String, _>("error").contains("3 次"));
+        assert_eq!(*remote.calls.get("/downloads-test/flaky.png").unwrap(), 3);
+        assert_eq!(*remote.calls.get("/downloads-test/stable.png").unwrap(), 1);
+        for suffix in ["work", "part", "zip"] {
+            assert!(!state.downloads.path(&id, suffix).unwrap().exists());
+        }
+        cleanup_fixture(&state).await;
+    }
+
+    #[tokio::test]
+    async fn s3_archive_request_can_wait_past_old_thirty_second_limit() {
+        let remote = remote_fixture(ReadFault::Slow).await;
+        let data = storage_reads::read_for_archive(&CancellationToken::new(), "slow", || {
+            remote.store.get_for_archive("flaky.png")
+        })
+        .await
+        .unwrap();
+        assert_eq!(image::guess_format(&data).unwrap(), ImageFormat::Png);
+        assert_eq!(*remote.calls.get("/downloads-test/flaky.png").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_obsolete_archive_aborts_s3_read_and_cleans_temporary_files() {
+        for obsolete in [false, true] {
+            let remote = remote_fixture(ReadFault::Stalled).await;
+            let (state, id) = remote_archive_state(&remote).await;
+            tick(&state).await.unwrap();
+            timeout(Duration::from_secs(5), async {
+                while !remote.calls.contains_key("/downloads-test/flaky.png") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if obsolete {
+                sqlx::query("UPDATE album_download_settings SET enabled=0,revision=revision+1")
+                    .execute(&state.db)
+                    .await
+                    .unwrap();
+                tick(&state).await.unwrap();
+            } else {
+                state.downloads.tasks.get(&id).unwrap().cancel();
+            }
+            finish_job(&state, &id).await;
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM album_download_jobs WHERE id=?")
+                    .bind(&id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(status, if obsolete { "deleted" } else { "cancelled" });
+            for suffix in ["work", "part", "zip"] {
+                assert!(!state.downloads.path(&id, suffix).unwrap().exists());
+            }
+            assert_eq!(*remote.calls.get("/downloads-test/flaky.png").unwrap(), 1);
+            cleanup_fixture(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_image_workers_can_cancel_without_waiting_for_a_free_slot() {
+        let remote = remote_fixture(ReadFault::Unavailable).await;
+        let (state, id) = remote_archive_state(&remote).await;
+        let slots = state
+            .downloads
+            .image_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        tick(&state).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !state.downloads.path(&id, "work").unwrap().exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.downloads.tasks.get(&id).unwrap().cancel();
+        finish_job(&state, &id).await;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM album_download_jobs WHERE id=?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(status, "cancelled");
+        assert!(remote.calls.is_empty());
+        assert!(!state.downloads.path(&id, "work").unwrap().exists());
+        drop(slots);
+        cleanup_fixture(&state).await;
+    }
 
     #[tokio::test]
     async fn mobile_downloads_stream_zip_entries_and_recheck_publication() {
