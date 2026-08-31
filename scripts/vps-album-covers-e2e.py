@@ -63,6 +63,7 @@ def main():
     assert png.startswith(b'\x89PNG')
     route = f'/api/albums/{primary["id"]}/cover'
     request(route, 'PUT', {'photoId': photos[-1]['id']}, expected=401, anonymous=True)
+    request(route, 'PUT', {'photoId': 'x' * (3 * 1024 * 1024)}, expected=413, anonymous=True)
     upload(primary['id'], png, expected=401, anonymous=True)
     api('/api/auth/login', 'POST', {'username': 'ant-test', 'password': 'Isolated-Ant-Download-Test-2026!'})
     request(route, 'DELETE', expected=403, headers={'X-CSRF-Token': 'invalid'})
