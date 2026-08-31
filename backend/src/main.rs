@@ -6860,9 +6860,9 @@ async fn main() -> Result<()> {
         .route(
             "/api/albums/{album_id}/cover",
             post(album_covers::upload)
+                .layer(DefaultBodyLimit::disable())
                 .put(album_covers::select)
-                .delete(album_covers::reset)
-                .layer(DefaultBodyLimit::disable()),
+                .delete(album_covers::reset),
         )
         .route(
             "/api/albums/{album_id}/cover/{version}",
