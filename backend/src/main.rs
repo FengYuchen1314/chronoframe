@@ -62,6 +62,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 mod album_covers;
 mod album_downloads;
+mod storage_reads;
 
 #[derive(Clone)]
 struct AppState {
@@ -298,6 +299,10 @@ async fn load_or_create_master_key(path: &Path) -> Result<[u8; 32]> {
 trait BlobStore: Send + Sync {
     async fn put_atomic(&self, key: &str, content_type: &str, data: Vec<u8>) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
+    // Background ZIPs can allow slower remote reads without changing viewer timeouts.
+    async fn get_for_archive(&self, key: &str) -> Result<Vec<u8>> {
+        self.get(key).await
+    }
     async fn delete(&self, key: &str) -> Result<()>;
     async fn healthcheck(&self) -> Result<()> {
         // A fixed probe key bounds any artifact left by a process kill during a connection test to one object per configured target.
@@ -513,6 +518,30 @@ struct S3ManagedObject {
 }
 
 impl S3Store {
+    async fn read_object(&self, key: &str, limit: Duration) -> Result<Vec<u8>> {
+        let result = timeout(
+            limit,
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(self.key(key)?)
+                .send(),
+        )
+        .await
+        .context("S3 read timed out")?
+        .map_err(|error| {
+            let retryable = storage_reads::is_transient_s3(&error);
+            storage_reads::classify(error.into(), retryable)
+        })?;
+        Ok(timeout(limit, result.body.collect())
+            .await
+            .context("S3 response body timed out")?
+            // Headers succeeded: a failed body must be fetched again from byte zero.
+            .map_err(|error| storage_reads::classify(error.into(), true))?
+            .into_bytes()
+            .to_vec())
+    }
+
     fn key(&self, key: &str) -> Result<String> {
         if key
             .split('/')
@@ -680,21 +709,11 @@ impl BlobStore for S3Store {
         Ok(())
     }
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let result = timeout(
-            STORAGE_IO_TIMEOUT,
-            self.client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(self.key(key)?)
-                .send(),
-        )
-        .await
-        .context("S3 read timed out")??;
-        Ok(timeout(STORAGE_IO_TIMEOUT, result.body.collect())
+        self.read_object(key, STORAGE_IO_TIMEOUT).await
+    }
+    async fn get_for_archive(&self, key: &str) -> Result<Vec<u8>> {
+        self.read_object(key, storage_reads::ARCHIVE_READ_TIMEOUT)
             .await
-            .context("S3 response body timed out")??
-            .into_bytes()
-            .to_vec())
     }
     async fn delete(&self, key: &str) -> Result<()> {
         timeout(
