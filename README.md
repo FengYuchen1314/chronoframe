@@ -1,11 +1,25 @@
-# ChronoFrame
+# ChronoFrame（二次开发重构版）
 
-面向自托管的个人画廊。项目恢复原作者的 Nuxt 视觉框架，并将服务端重构为：
+本仓库是 [FengYuchen1314](https://github.com/FengYuchen1314) 基于 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) 进行二次开发与重构的自托管画廊，由本仓库独立维护。保留原项目的 Nuxt/Vue 前台风格，服务端改写为 Rust，围绕相册管理、图片加载、存储迁移和公开下载重新实现业务逻辑。
+
+- 当前仓库：[FengYuchen1314/chronoframe](https://github.com/FengYuchen1314/chronoframe)
+- 二次开发者：[FengYuchen1314 的 GitHub](https://github.com/FengYuchen1314)
+- 原项目与作者：[HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) · [HoshinoSuzumi / Timothy Yin](https://github.com/HoshinoSuzumi)
+
+## 原项目介绍
+
+[ChronoFrame 原项目](https://github.com/HoshinoSuzumi/chronoframe) 是 Timothy Yin（HoshinoSuzumi）开发的自托管个人画廊，提供在线照片管理、相册展示、EXIF 信息解析、地理位置识别与地图浏览等功能，采用 Nuxt、TypeScript、Tailwind CSS 等技术。本重构版沿用了原项目的前台视觉与交互基础，感谢原作者的开源工作。
+
+本版已调整后端、数据库结构、管理流程和部署方式，功能与原项目不完全相同；地图等功能已移除。部署本版请使用下文的 Compose 文件与 `ghcr.io/fengyuchen1314/chronoframe` 镜像，本版问题请提交到[当前仓库 Issues](https://github.com/FengYuchen1314/chronoframe/issues)。
+
+## 本版架构与功能
 
 - 根目录 `app/`、`i18n/`、`shared/`、`public/`：Nuxt 4 + Vue 3 + TypeScript 静态前端
 - `backend/`：Rust + Axum + SQLite API
 - 管理后台：Ant Design Vue 4，标准侧栏导航、表格、表单、弹窗与任务进度；公开画廊保留原版风格
 - 存储：本地磁盘、WebDAV 或 S3 兼容对象存储
+
+网站公开页面底部提供二次开发者的 GitHub 主页、本版源码及原项目链接，手机与电脑端均可访问。
 
 公共端恢复原版的相簿动效主页、照片瀑布流、标签/相机/镜头/城市/评分筛选、排序、相簿详情和沉浸式查看器；地图、Globe 和地图管理功能不再存在。默认 `/` 直接展示相簿空间，全图瀑布流位于 `/photos`。上传严格遵循相簿优先的数据规则：管理员必须先创建相簿，之后才能向其中上传图片。管理员还可以重命名或删除相簿、删除单张或多张图片、迁移图片存储位置、维护公开相簿简介和显示日期、调整相簿前后顺序，以及修改网站名称、标语、作者、头像和默认主题。删除相簿时，其中的图片记录和当前存储对象会一并清理；图片被转换或存储迁移任务占用时，后端会拒绝删除以保护数据。
 
@@ -200,4 +214,6 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 
 `scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中拉取 `CHRONOFRAME_IMAGE` 指定的 Actions 镜像，覆盖并发首次注册、Argon2id 哈希、Cookie/CSRF、会话过期与退出，以及本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-s3-cleanup-e2e.sh` 使用隔离 MinIO 验证 24 小时宽限、管理前缀隔离、删除前引用保护和孤儿对象清理；`scripts/vps-delete-interrupt.sh` 专门验证登录会话和管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
 
-本项目基于原项目的 MIT 许可继续发布，原作者为 HoshinoSuzumi / Timothy Yin。
+## 开源许可与致谢
+
+本二次开发重构版沿用 [MIT 许可证](LICENSE)，保留原作者 Timothy Yin 的版权声明。原项目为 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe)，二次开发与重构由 [FengYuchen1314](https://github.com/FengYuchen1314) 在[本仓库](https://github.com/FengYuchen1314/chronoframe)维护。

@@ -1,4 +1,8 @@
 {
+  "siteFooter": {
+    "source": "專案原始碼",
+    "upstream": "原專案"
+  },
   "map": {
     "cluster": {
       "details": "點擊圖片查看詳情",
