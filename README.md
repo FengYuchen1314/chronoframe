@@ -264,6 +264,14 @@ pnpm typecheck:admin # 管理后台类型检查
 
 本二次开发重构版沿用 [MIT 许可证](LICENSE)，保留原作者 Timothy Yin 的版权声明。原项目为 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe)，二次开发与重构由 [Uniseem](https://github.com/Uniseem) 在[本仓库](https://github.com/Uniseem/chronoframe)维护。
 
+### 迁移与归档说明
+
+本仓库原位于 `FengYuchen1314/chronoframe`，已转移至 [Uniseem](https://github.com/Uniseem)。旧地址由 GitHub 自动重定向。
+
+旧镜像命名空间 `ghcr.io/fengyuchen1314/chronoframe` **作为归档保留、不再更新**：其中的历史版本仍可拉取，但新版本只发布到 `ghcr.io/uniseem/chronoframe`。按旧地址部署的实例需要把 compose 里的 `image:` 改到新地址才能继续获得更新。
+
+迁移前的提交署名历史保留在 tag `archive/pre-uniseem-attribution`，其中包含重写署名之前的原始 SHA（含已发布镜像 label `org.opencontainers.image.revision` 所引用的提交）。
+
 ### 原项目作者与贡献者
 
 本仓库保留完整的 git 历史。686 个提交中，**540 个来自原作者 Timothy Yin（[HoshinoSuzumi](https://github.com/HoshinoSuzumi)）**，53 个来自其他第三方贡献者，33 个来自依赖更新机器人。前台的 Nuxt/Vue 视觉与交互基础、WebGL 图片管线等均来自原项目。这些提交的作者署名不作任何改动。
