@@ -216,6 +216,11 @@ export default function SettingsStorage() {
     setSavedTargetSignature(targetOf(next))
     setLoaded(true)
     clearSensitiveInputs()
+    // 表单内容刚被服务端值覆盖，之前那次「连接测试通过」指向的已经不是屏幕上
+    // 这套配置了，必须清掉。放在这里而不是 loadSettings 里：轮询在迁移结束后会
+    // 静默重载设置，那条路径同样会覆盖表单。saveSettings 在本函数之后才写入
+    // 新的 lastTest，顺序上不会被这里清掉。
+    setLastTest(null)
   }, [])
 
   const buildPayload = (): StorageSettingsInput => ({
@@ -241,7 +246,6 @@ export default function SettingsStorage() {
     settingsInFlight.current = true
     if (!silent) setIsLoading(true)
     setLoadError('')
-    if (!silent) setLastTest(null)
     try {
       const [settings, albums] = await Promise.all([
         adminApi.adminFetch<StorageSettings>('/api/settings/storage'),
@@ -375,6 +379,8 @@ export default function SettingsStorage() {
   ) => {
     if (isStorageTaskAction) return
     if (action === 'cleanup') {
+      // 标红是**有意**偏离现网（现网三处 confirm 全用默认样式）：删除旧存储副本
+      // 不可撤销。与之相对，下面的 retain 是安全选项，必须保持默认样式。
       const ok = await notice.confirm(
         `确定删除迁移前 ${job.sourceBackend.toUpperCase()} 存储中的全部旧图片吗？\n\n`
         + '系统会逐张校验当前存储中的副本后再删除，但删除动作不能撤销。',
@@ -550,6 +556,10 @@ export default function SettingsStorage() {
   }
 
   const backendLabel = BACKENDS.find((item) => item.value === savedBackend)?.label ?? savedBackend
+  // 比重写前**更严**：现网只禁用存储类型单选框，文本框始终可编辑。
+  // 这里一并锁住是因为 applySettings 会整体覆盖表单——加载中或保存中输入的内容
+  // 会被静默丢弃，锁住可以避免这种无声的数据丢失。storageBusy 期间也锁，与下方
+  // 警告条「请完成或中断任务后再修改连接」的措辞一致（后端此时 PUT 也会返回 409）。
   const fieldDisabled = isLoading || isSaving || isTesting || storageBusy
 
   /* -------------------------------- 渲染 -------------------------------- */
@@ -565,6 +575,7 @@ export default function SettingsStorage() {
             <Button
               variant="secondary"
               isDisabled={isLoading}
+              isPending={isLoading}
               onPress={() => {
                 // 四个区块各自独立加载与反馈，互不阻塞（与现网一致）。
                 void loadSettings()
@@ -809,7 +820,10 @@ export default function SettingsStorage() {
                 </Button>
                 <Button
                   variant="ghost"
-                  isDisabled={!isDirty || isSaving}
+                  // 「重置」就是重新 GET。首屏加载失败时 loaded 为 false、isDirty 恒为
+                  // false，若只看 isDirty 就会把它锁死在最需要它的时刻，因此未加载
+                  // 成功时保持可用，让用户能直接重试。
+                  isDisabled={isSaving || (loaded && !isDirty)}
                   onPress={() => void loadSettings()}
                 >
                   重置
