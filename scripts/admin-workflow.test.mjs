@@ -1,7 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createUploadQueue, createUploadQueueState } from '../shared/utils/admin-upload-queue.ts'
-import { albumDraftOf, toggleVisibleSelection, validateAlbumDraft } from '../shared/utils/admin-albums.ts'
+// 管理后台已重写为独立 React SPA，这些纯逻辑模块随之搬到 admin/src/lib 下。
+// 测试本身与框架无关，直接改指向新位置继续有效。
+import { createUploadQueue, createUploadQueueState } from '../admin/src/lib/upload-queue.ts'
+import { albumDraftOf, toggleVisibleSelection, validateAlbumDraft } from '../admin/src/lib/albums.ts'
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const files = count => Array.from({ length: count }, (_, index) => ({ name: `${index}.png`, size: 123 }))
@@ -9,8 +11,18 @@ const album = { id: 'album-a', name: 'A' }
 function fixture() {
   const state = createUploadQueueState()
   const calls = []
-  const queue = createUploadQueue(state, (file, albumId) => new Promise((resolve, reject) => calls.push({ file, albumId, resolve, reject })), String)
-  return { state, calls, queue }
+  // frames 记录每次 notify() 时 UI 能看到的状态。React 侧（admin/src/lib/store.ts）
+  // 就是靠这个回调触发重渲染，所以"最后一帧"必须等于队列的真实终态。
+  const frames = []
+  const snapshot = () => ({
+    uploading: state.items.filter(item => item.status === 'uploading').length,
+    queued: state.items.filter(item => item.status === 'queued').length,
+    done: state.items.filter(item => item.status === 'done').length,
+    failed: state.items.filter(item => item.status === 'failed').length,
+    albumVersions: { ...state.albumVersions },
+  })
+  const queue = createUploadQueue(state, (file, albumId) => new Promise((resolve, reject) => calls.push({ file, albumId, resolve, reject })), String, () => frames.push(snapshot()))
+  return { state, calls, queue, frames, snapshot }
 }
 
 test('seven global upload slots, each completion immediately starts the next item', async () => {
@@ -107,4 +119,56 @@ test('page selection preserves other pages, filtered selection does not include 
   assert.deepEqual(toggleVisibleSelection(['a', 'b'], ['b', 'c'], true), ['a', 'b', 'c'])
   assert.deepEqual(toggleVisibleSelection(['a', 'b', 'c'], ['b', 'c'], false), ['a'])
   assert.deepEqual(toggleVisibleSelection([], ['visible'], true), ['visible'])
+})
+
+// 回归：终态必须通知到调用方。
+// 曾经的写法是在 upload() 的 finally 里通知，那比 'uploading' → 'done' 的赋值早一步，
+// 于是队列跑完后 UI 永远停在"上传中"，相册详情页也收不到 albumVersions 的递增。
+test('every state transition reaches the subscriber, including the terminal one', async () => {
+  const { state, calls, queue, frames, snapshot } = fixture()
+  queue.enqueue(files(1), album)
+  await tick()
+  assert.deepEqual(frames.at(-1), snapshot())
+  calls[0].resolve()
+  await tick()
+  assert.equal(state.items[0].status, 'done')
+  assert.deepEqual(frames.at(-1), { uploading: 0, queued: 0, done: 1, failed: 0, albumVersions: { 'album-a': 1 } })
+  assert.deepEqual(frames.at(-1), snapshot())
+})
+
+test('a failed upload reaches the subscriber too, and never exceeds seven slots mid-flight', async () => {
+  const { state, calls, queue, frames, snapshot } = fixture()
+  queue.enqueue(files(10), album)
+  await tick()
+  calls[0].reject(new Error('response lost'))
+  await tick()
+  assert.equal(state.items[0].status, 'failed')
+  assert.equal(frames.at(-1).failed, 1)
+  calls.slice(1).forEach(call => call.resolve())
+  await tick()
+  calls.slice(7).forEach(call => call.resolve())
+  await tick()
+  // 通知时机的改动绝不能放松并发上限：任何一帧都不能超过 7。
+  for (const frame of frames) assert.ok(frame.uploading <= 7, `一帧内并发 ${frame.uploading} 超过 7`)
+  assert.deepEqual(frames.at(-1), snapshot())
+})
+
+test('pause, resume, retry, remove and clearDone each notify the subscriber', async () => {
+  const { calls, queue, frames, snapshot } = fixture()
+  queue.enqueue(files(2), album)
+  await tick()
+  calls[0].reject(new Error('response lost'))
+  await tick()
+  for (const [label, act] of [
+    ['pause', () => queue.pause()],
+    ['resume', () => queue.resume()],
+    ['retryFailed', () => queue.retryFailed()],
+    ['remove', () => queue.remove(2)],
+    ['clearDone', () => queue.clearDone()],
+  ]) {
+    const before = frames.length
+    act()
+    assert.ok(frames.length > before, `${label}() 没有通知调用方`)
+  }
+  assert.deepEqual(frames.at(-1), snapshot())
 })

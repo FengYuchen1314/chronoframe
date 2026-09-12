@@ -9,11 +9,15 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "nuxt generate",
+    "build": "node scripts/build-admin.mjs && nuxt generate",
+    "build:web": "nuxt generate",
+    "build:admin": "node scripts/build-admin.mjs",
     "dev": "nuxt dev --host",
+    "dev:admin": "pnpm --dir admin dev",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare",
-    "typecheck": "nuxt typecheck"
+    "typecheck": "nuxt typecheck",
+    "typecheck:admin": "pnpm --dir admin typecheck"
   },
   "dependencies": {
     "@iconify-json/lucide": "^1.2.111",
@@ -26,7 +30,6 @@
     "@vueuse/core": "^14.3.0",
     "@vueuse/nuxt": "14.3.0",
     "@yeger/vue-masonry-wall": "^6.1.1",
-    "ant-design-vue": "4.2.6",
     "dayjs": "^1.11.21",
     "dayjs-nuxt": "2.1.11",
     "motion-v": "^2.3.0",

@@ -12,3 +12,5 @@ scripts
 .agents
 .github
 .vscode
+# 本地构建残留；admin-builder 阶段会自己 pnpm build 重建。
+admin/dist

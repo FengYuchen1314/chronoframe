@@ -6665,6 +6665,21 @@ async fn apply_web_cache_policy(request: axum::extract::Request, next: Next) -> 
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
         );
+    } else if path.starts_with("/dashboard/assets/")
+        && response.status().is_success()
+        && !response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html"))
+    {
+        // 管理后台的静态资源带内容哈希，同样可以长期缓存。
+        // 额外排除 text/html：immutable 一旦打在 SPA 外壳上就会把错误响应
+        // 钉死在资源 URL 上一年。路由层已经保证这里不会是 HTML，这是第二道防线。
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
     } else if response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -6936,9 +6951,33 @@ async fn main() -> Result<()> {
         .route("/api/{*path}", any(api_not_found));
     let web_dir = PathBuf::from(&config.web_dir);
     let index = web_dir.join("index.html");
-    let app = Router::new()
+    // 管理后台是独立构建的 React SPA，有自己的 index.html。它的深链（例如
+    // /dashboard/albums?album=xxx）在 ServeDir 里找不到对应文件，必须回退到
+    // dashboard/index.html 而不是站点根 index.html（那是前台的 Nuxt 外壳，
+    // 它的路由表里已经没有 /dashboard，放行过去会落到 404）。
+    // 目录不存在时（例如没构建管理后台）不挂载，行为退回原来的 Nuxt 兜底。
+    let admin_dir = web_dir.join("dashboard");
+    let admin_index = admin_dir.join("index.html");
+    let admin_mounted = admin_index.is_file();
+    let mut app = Router::new()
         .merge(api)
-        .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")))
+        .nest_service("/_nuxt", ServeDir::new(web_dir.join("_nuxt")));
+    if admin_mounted {
+        info!("serving admin dashboard from {}", admin_dir.display());
+        app = app
+            // 带内容哈希的资源必须单独挂载，**不能**共用下面的 SPA 兜底：
+            // 否则一个不存在的 chunk（旧 index.html 引用了上一次构建的哈希名）
+            // 会返回 200 + dashboard/index.html，浏览器按 module 解析 HTML 直接报错；
+            // 而 /dashboard/assets/ 又被缓存策略标成 immutable 一年，
+            // 这份错误的 HTML 会被钉在该 URL 上，重新发布也救不回来。
+            // 单独挂载后缺失资源正常 404，与 /_nuxt 的行为一致。
+            .nest_service("/dashboard/assets", ServeDir::new(admin_dir.join("assets")))
+            .nest_service(
+                "/dashboard",
+                ServeDir::new(&admin_dir).fallback(ServeFile::new(admin_index)),
+            );
+    }
+    let app = app
         .fallback_service(ServeDir::new(&config.web_dir).fallback(ServeFile::new(index)))
         .layer(middleware::from_fn(apply_web_cache_policy))
         .layer(TraceLayer::new_for_http())

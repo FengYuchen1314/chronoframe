@@ -3,6 +3,8 @@
 /frontend/
 /.nuxt
 /.output
+# `nuxt generate` 会创建一个指向 .output/public 的 dist 符号链接，不要入库。
+/dist
 /.pnpm-store
 *.tsbuildinfo
 /data
@@ -12,3 +14,8 @@ __pycache__/
 .env
 pnpm-debug.log*
 *.zip
+# 管理后台是独立构建的 React SPA，构建产物由 scripts/build-admin.mjs 落到这里，
+# 再随 Nuxt 静态产物一起发布，因此不入库。
+/admin/dist
+/admin/node_modules
+/public/dashboard
