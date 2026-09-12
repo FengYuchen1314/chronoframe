@@ -2,7 +2,7 @@ name: chronoframe
 
 services:
   chronoframe:
-    image: ghcr.io/fengyuchen1314/chronoframe:latest
+    image: ghcr.io/uniseem/chronoframe:latest
     pull_policy: always
     restart: unless-stopped
     init: true

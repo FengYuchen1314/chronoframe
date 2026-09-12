@@ -4,7 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { PROJECT_LINKS } from '../shared/utils/projectLinks.ts'
 
 test('maintainer, fork and upstream links point to the correct GitHub targets', () => {
-  assert.equal(PROJECT_LINKS.profile, 'https://github.com/FengYuchen1314')
+  assert.equal(PROJECT_LINKS.profile, 'https://github.com/Uniseem')
   assert.equal(PROJECT_LINKS.repository, `${PROJECT_LINKS.profile}/chronoframe`)
   assert.equal(PROJECT_LINKS.upstream, 'https://github.com/HoshinoSuzumi/chronoframe')
 })
@@ -23,6 +23,6 @@ test('README identifies the redevelopment, credits upstream and keeps copyable C
   for (const url of [PROJECT_LINKS.profile, PROJECT_LINKS.repository, PROJECT_LINKS.upstream]) assert.ok(readme.includes(url))
   assert.match(readme, /^# ChronoFrame（二次开发重构版）/)
   assert.match(readme, /## 原项目介绍/)
-  assert.match(readme, /```yaml[\s\S]*image: ghcr\.io\/fengyuchen1314\/chronoframe:latest[\s\S]*- \.\/data:\/app\/data[\s\S]*```/)
+  assert.match(readme, /```yaml[\s\S]*image: ghcr\.io\/uniseem\/chronoframe:latest[\s\S]*- \.\/data:\/app\/data[\s\S]*```/)
   assert.ok(readFileSync(new URL('../LICENSE', import.meta.url), 'utf8').includes('Copyright (c) 2025 Timothy Yin'))
 })

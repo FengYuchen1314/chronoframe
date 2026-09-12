@@ -1,10 +1,13 @@
 {
   "name": "chronoframe",
   "version": "1.0.0-rc.4",
-  "author": {
-    "name": "Timothy Yin",
-    "email": "master@uniiem.com"
-  },
+  "author": "Uniseem",
+  "contributors": [
+    "Uniseem",
+    "Claude",
+    "GPT",
+    "DeepSeek"
+  ],
   "license": "MIT",
   "type": "module",
   "private": true,
