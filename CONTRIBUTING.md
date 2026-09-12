@@ -30,7 +30,7 @@ bash scripts/vps-e2e.sh
 bash scripts/vps-delete-interrupt.sh
 ```
 
-通过 `CHRONOFRAME_IMAGE=ghcr.io/fengyuchen1314/chronoframe:sha-<commit>` 指定不可变镜像。验收脚本会创建并清理自己的 Docker Compose 测试数据；必须使用独立的 `PROJECT_NAME` 和端口，不要把真实凭据、个人照片或生产数据库放进测试目录。
+通过 `CHRONOFRAME_IMAGE=ghcr.io/uniseem/chronoframe:sha-<commit>` 指定不可变镜像。验收脚本会创建并清理自己的 Docker Compose 测试数据；必须使用独立的 `PROJECT_NAME` 和端口，不要把真实凭据、个人照片或生产数据库放进测试目录。
 
 ## 产品约束
 

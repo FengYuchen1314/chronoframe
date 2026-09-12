@@ -1,16 +1,16 @@
 # ChronoFrame（二次开发重构版）
 
-本仓库是 [FengYuchen1314](https://github.com/FengYuchen1314) 基于 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) 进行二次开发与重构的自托管画廊，由本仓库独立维护。保留原项目的 Nuxt/Vue 前台风格，服务端改写为 Rust，围绕相册管理、图片加载、存储迁移和公开下载重新实现业务逻辑。
+本仓库是 [Uniseem](https://github.com/Uniseem) 基于 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) 进行二次开发与重构的自托管画廊，由本仓库独立维护。保留原项目的 Nuxt/Vue 前台风格，服务端改写为 Rust，围绕相册管理、图片加载、存储迁移和公开下载重新实现业务逻辑。
 
-- 当前仓库：[FengYuchen1314/chronoframe](https://github.com/FengYuchen1314/chronoframe)
-- 二次开发者：[FengYuchen1314 的 GitHub](https://github.com/FengYuchen1314)
+- 当前仓库：[Uniseem/chronoframe](https://github.com/Uniseem/chronoframe)
+- 二次开发者：[Uniseem 的 GitHub](https://github.com/Uniseem)
 - 原项目与作者：[HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) · [HoshinoSuzumi / Timothy Yin](https://github.com/HoshinoSuzumi)
 
 ## 原项目介绍
 
 [ChronoFrame 原项目](https://github.com/HoshinoSuzumi/chronoframe) 是 Timothy Yin（HoshinoSuzumi）开发的自托管个人画廊，提供在线照片管理、相册展示、EXIF 信息解析、地理位置识别与地图浏览等功能，采用 Nuxt、TypeScript、Tailwind CSS 等技术。本重构版沿用了原项目的前台视觉与交互基础，感谢原作者的开源工作。
 
-本版已调整后端、数据库结构、管理流程和部署方式，功能与原项目不完全相同；地图等功能已移除。部署本版请使用下文的 Compose 文件与 `ghcr.io/fengyuchen1314/chronoframe` 镜像，本版问题请提交到[当前仓库 Issues](https://github.com/FengYuchen1314/chronoframe/issues)。
+本版已调整后端、数据库结构、管理流程和部署方式，功能与原项目不完全相同；地图等功能已移除。部署本版请使用下文的 Compose 文件与 `ghcr.io/uniseem/chronoframe` 镜像，本版问题请提交到[当前仓库 Issues](https://github.com/Uniseem/chronoframe/issues)。
 
 ## 本版架构与功能
 
@@ -41,11 +41,11 @@
 
 ## 单文件部署
 
-提交到 `main` 后，GitHub Actions 会在原生 amd64 和 arm64 runner 上编译 Nuxt/Rust、构建镜像并发布多架构的 `ghcr.io/fengyuchen1314/chronoframe:latest`。部署机器不需要源码、Node.js 或 Rust，只需要 Docker Compose 和根目录的一个 `docker-compose.yml`。
+提交到 `main` 后，GitHub Actions 会在原生 amd64 和 arm64 runner 上编译 Nuxt/Rust、构建镜像并发布多架构的 `ghcr.io/uniseem/chronoframe:latest`。部署机器不需要源码、Node.js 或 Rust，只需要 Docker Compose 和根目录的一个 `docker-compose.yml`。
 
 ```bash
 mkdir chronoframe && cd chronoframe
-curl -fsSLO https://raw.githubusercontent.com/FengYuchen1314/chronoframe/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/Uniseem/chronoframe/main/docker-compose.yml
 docker compose up -d
 ```
 
@@ -56,7 +56,7 @@ name: chronoframe
 
 services:
   chronoframe:
-    image: ghcr.io/fengyuchen1314/chronoframe:latest
+    image: ghcr.io/uniseem/chronoframe:latest
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -82,7 +82,7 @@ docker compose pull
 docker compose up -d
 ```
 
-如果旧部署的 Compose 仍使用 `build: .`，`docker compose pull` 不会更新应用。请先改用上方示例中的 `image: ghcr.io/fengyuchen1314/chronoframe:latest`，并保留原来的 `volumes` 映射，再执行更新命令。新版会要求浏览器重新验证入口 HTML，避免更新后因旧页面继续引用已经移除的脚本而出现空白页。
+如果旧部署的 Compose 仍使用 `build: .`，`docker compose pull` 不会更新应用。请先改用上方示例中的 `image: ghcr.io/uniseem/chronoframe:latest`，并保留原来的 `volumes` 映射，再执行更新命令。新版会要求浏览器重新验证入口 HTML，避免更新后因旧页面继续引用已经移除的脚本而出现空白页。
 
 迁移前先停止写入，然后把 Compose 文件和整个 `data` 目录一起打包：
 
@@ -262,4 +262,19 @@ pnpm typecheck:admin # 管理后台类型检查
 
 ## 开源许可与致谢
 
-本二次开发重构版沿用 [MIT 许可证](LICENSE)，保留原作者 Timothy Yin 的版权声明。原项目为 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe)，二次开发与重构由 [FengYuchen1314](https://github.com/FengYuchen1314) 在[本仓库](https://github.com/FengYuchen1314/chronoframe)维护。
+本二次开发重构版沿用 [MIT 许可证](LICENSE)，保留原作者 Timothy Yin 的版权声明。原项目为 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe)，二次开发与重构由 [Uniseem](https://github.com/Uniseem) 在[本仓库](https://github.com/Uniseem/chronoframe)维护。
+
+### 原项目作者与贡献者
+
+本仓库保留完整的 git 历史。686 个提交中，**540 个来自原作者 Timothy Yin（[HoshinoSuzumi](https://github.com/HoshinoSuzumi)）**，53 个来自其他第三方贡献者，33 个来自依赖更新机器人。前台的 Nuxt/Vue 视觉与交互基础、WebGL 图片管线等均来自原项目。这些提交的作者署名不作任何改动。
+
+### 本重构版贡献者
+
+二次开发与重构部分共 60 个提交，由 [Uniseem](https://github.com/Uniseem) 维护并对代码负责，实现过程借助 AI 编程助手完成：
+
+| 时间 | 协作者 | 范围 |
+|---|---|---|
+| 2026-08-23 ～ 09-01 | **GPT** | 服务端改写为 Rust、相簿优先的数据模型、三层派生图与查看器性能、存储迁移与 S3 旧对象清理、公开下载与批量设置、Ant Design 后台 |
+| 2026-09-12 ～ 09-13 | **DeepSeek**、**Claude** | 管理后台重写为 `admin/` 下的独立 React SPA。DeepSeek 完成重写主体与四份实现规格，Claude 完成 review、缺陷修复与回归测试 |
+
+AI 协作者按其实际参与的时间段列出；署名范围仅限本重构版自身的 60 个提交。

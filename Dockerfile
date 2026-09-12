@@ -50,7 +50,7 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
     && mkdir -p /app/data/storage \
     && chown -R chronoframe:chronoframe /app
 ENV CF_WEB_DIR=/app/web CF_DATABASE_URL=sqlite:///app/data/chronoframe.db?mode=rwc
-LABEL org.opencontainers.image.source="https://github.com/FengYuchen1314/chronoframe" \
+LABEL org.opencontainers.image.source="https://github.com/Uniseem/chronoframe" \
       org.opencontainers.image.description="Album-first self-hosted gallery with a Rust backend" \
       org.opencontainers.image.licenses="MIT"
 EXPOSE 8080

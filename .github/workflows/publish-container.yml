@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/fengyuchen1314/chronoframe
+  IMAGE: ghcr.io/uniseem/chronoframe
 
 jobs:
   build:
