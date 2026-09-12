@@ -1,0 +1,30 @@
+{
+  "name": "chronoframe-admin",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ChronoFrame 管理后台（React + HeroUI）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@heroui/react": "^3.2.5",
+    "@iconify-json/tabler": "^1.2.38",
+    "@iconify/react": "^6.0.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.0"
+  }
+}
