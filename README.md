@@ -15,9 +15,11 @@
 ## 本版架构与功能
 
 - 根目录 `app/`、`i18n/`、`shared/`、`public/`：Nuxt 4 + Vue 3 + TypeScript 静态前端
+- `admin/`：管理后台，独立构建的 React 19 + HeroUI v3 + Tailwind v4 单页应用
 - `backend/`：Rust + Axum + SQLite API
-- 管理后台：Ant Design Vue 4，标准侧栏导航、表格、表单、弹窗与任务进度；公开画廊保留原版风格
 - 存储：本地磁盘、WebDAV 或 S3 兼容对象存储
+
+管理后台与公开画廊是**两套独立构建**。前台用 `@nuxt/ui`，后台用 HeroUI，两者都基于 Tailwind v4，放在同一个构建里会互相渗透全局样式（preflight、主题变量、工具类），因此后台拥有自己的 `package.json`、lockfile 与 Vite 配置，产物落到 `public/dashboard`，再随 Nuxt 静态产物一起发布到 `/dashboard/` 路径。删除或改造后台不会影响公开画廊的任何一个文件。
 
 网站公开页面底部提供二次开发者的 GitHub 主页、本版源码及原项目链接，手机与电脑端均可访问。
 
@@ -224,6 +226,33 @@ WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-
 - `POST /api/s3-cleanups/:job_id/delete|resume|cancel` — 确认后台清理、继续或安全中断 S3 旧空间任务
 - `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建三层派生图
 - `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断派生图重建
+
+## 管理后台的开发与构建
+
+管理后台在 `admin/` 下，是一个与公开画廊完全隔离的 React 单页应用：React 19 + HeroUI v3 + Tailwind CSS v4 + React Router 7，由 Vite 构建。
+
+```bash
+pnpm build          # 先构建后台，再跑 nuxt generate（发布用）
+pnpm build:admin    # 只构建后台
+pnpm build:web      # 只构建公开画廊
+pnpm dev            # 开发公开画廊（Nuxt dev server）
+pnpm dev:admin      # 开发管理后台（Vite dev server，:5174，/api 代理到 :8080）
+pnpm typecheck      # 公开画廊类型检查
+pnpm typecheck:admin # 管理后台类型检查
+```
+
+`pnpm build` 会先运行 `scripts/build-admin.mjs`：它会按需在 `admin/` 内安装依赖、构建 SPA，并把产物复制到 `public/dashboard`。随后 `nuxt generate` 把 `public/` 原样复制进 `.output/public`，后台就出现在 `/dashboard/` 下。`admin/dist`、`public/dashboard` 都是构建产物，不入库。
+
+> **验证后台改动时必须用完整的 `pnpm build`。** 服务端提供的是 `.output/public/dashboard`，而 `pnpm build:admin` 只更新到 `public/dashboard` 为止，不会触发 `nuxt generate`。只跑 `build:admin` 就刷新页面，浏览器拿到的仍是上一次 `nuxt generate` 的旧代码 —— 改动看起来"没生效"。开发时请直接用 `pnpm dev:admin`（Vite 热更新，不需要构建）。
+
+因此**后台代码位于 `admin/src/`**，其目录结构为 `lib/`（API 客户端、类型、格式化、上传队列、主题、跨页共享状态）、`components/`（外壳、表格、分页、上传队列抽屉、下载管理、封面编辑器）与 `pages/`（概览、相册管理、下载管理、任务中心、站点设置、存储与维护）。
+
+有两处必须在改动时留意的服务端配合：
+
+- `backend/src/main.rs` 为 `/dashboard` 挂了一段独立的静态服务，用自己的 `index.html` 做深链回退。后台的深链（如 `/dashboard/albums?album=xxx`）在 `ServeDir` 里没有对应文件，若不单独回退就会被交给站点根 `index.html`（公开画廊的 Nuxt 外壳），而它的路由表里已经不存在 `/dashboard`。该目录不存在时（例如没构建后台）不会挂载，行为自动退回原状。
+- 同一文件里的缓存策略把 `/dashboard/assets/` 视为带内容哈希的不可变资源，与 `/_nuxt/` 一样给一年 `immutable` 缓存；HTML 仍然 `no-cache`，避免发版后命中旧外壳。
+
+**快速入口（对齐现网行为，不要改动）**：`/dashboard` 的路径与 `?album=`、`?tab=` 查询参数是地址栏唯一的持久状态。相册页的 `tab` 只认 `details` 与 `downloads`（默认 `photos` 且不写进 URL），切换用 push；存储页的 `tab` 只认 `migration`、`cache`、`cleanup`（默认 `connection` 且不写进 URL），切换用 replace。其余列表状态（搜索词、页码、勾选、网格/列表视图）只存在内存里，刷新即重置。
 
 ## 验收测试
 

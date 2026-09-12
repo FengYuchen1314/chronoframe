@@ -1,0 +1,4 @@
+# 管理后台是独立工程：不并入根 pnpm 工作区，避免 React 与 Nuxt/Vue 两套工具链
+# 共享 node_modules 与 lockfile。安装与构建均在 admin/ 内完成。
+packages:
+  - .

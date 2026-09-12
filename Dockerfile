@@ -1,3 +1,14 @@
+# 管理后台是独立构建的 React SPA（admin/，自带 lockfile 与工具链）。
+# 单独一个阶段构建，产物在下一步被放进 public/dashboard，
+# 随 Nuxt 的静态产物一起发布。两个工具链互不干扰。
+FROM node:24-alpine AS admin-builder
+WORKDIR /admin
+RUN corepack enable && corepack prepare pnpm@10.34.1 --activate
+COPY admin/package.json admin/pnpm-lock.yaml admin/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY admin ./
+RUN pnpm build
+
 FROM node:24-alpine AS web-builder
 WORKDIR /src
 RUN corepack enable && corepack prepare pnpm@10.34.1 --activate
@@ -7,7 +18,13 @@ COPY app ./app
 COPY public ./public
 COPY shared ./shared
 RUN pnpm install --frozen-lockfile
-RUN pnpm build
+# nuxt generate 会把 public/ 原样复制到 .output/public，管理后台由此进入静态产物。
+COPY --from=admin-builder /admin/dist ./public/dashboard
+# 必须是 build:web（纯 nuxt generate），不能用 pnpm build：后者还会跑
+# scripts/build-admin.mjs 重新构建管理后台，而本阶段既没有 admin/ 也没有
+# scripts/（scripts 已被 .dockerignore 排除），会直接 MODULE_NOT_FOUND。
+# 后台产物已由上面的 admin-builder 阶段交付。
+RUN pnpm build:web
 
 FROM rust:1.96-bookworm AS api-builder
 WORKDIR /src
