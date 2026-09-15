@@ -1,8 +1,11 @@
+# 项目已更名为 open-gallery，但以下名称有意保持 chronoframe，改掉会弄坏已有部署：
+# - Compose 项目名与服务名：更新时会另起一套容器，与旧容器争抢同一端口和同一个 ./data；
+# - 数据库文件名 chronoframe.db：新容器会找不到旧库，创建一个空数据库。
 name: chronoframe
 
 services:
   chronoframe:
-    image: ghcr.io/uniseem/chronoframe:latest
+    image: ghcr.io/uniseem/open-gallery:latest
     pull_policy: always
     restart: unless-stopped
     init: true

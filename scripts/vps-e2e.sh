@@ -90,7 +90,7 @@ wait_app_ready() {
     if curl -fsS --connect-timeout 2 --max-time 4 "$BASE/api/albums" >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
   done
-  [[ "$ready" = 1 ]] || { "${COMPOSE[@]}" logs --tail=120 chronoframe >&2 || true; fail "ChronoFrame did not become ready"; }
+  [[ "$ready" = 1 ]] || { "${COMPOSE[@]}" logs --tail=120 chronoframe >&2 || true; fail "Open Gallery did not become ready"; }
 }
 
 wait_webdav_ready() {
@@ -533,7 +533,7 @@ auth_curl -sS -D "$RUN_TMP_DIR/preflight.headers" -o /dev/null -X OPTIONS \
 if grep -qi '^access-control-allow-origin:' "$RUN_TMP_DIR/preflight.headers"; then fail "cross-origin preflight was allowed"; fi
 
 # Original public site identity settings are database-backed and only administrators can change them.
-curl -fsS "$BASE/api/settings/site" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value == {"title":"ChronoFrame","slogan":"Frame the moments that matter.","author":"ChronoFrame","avatarUrl":"/web-app-manifest-192x192.png","theme":"system"}, value'
+curl -fsS "$BASE/api/settings/site" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value == {"title":"Open Gallery","slogan":"Frame the moments that matter.","author":"Open Gallery","avatarUrl":"/web-app-manifest-192x192.png","theme":"system"}, value'
 unauthorized_site_settings=$(curl -sS --connect-timeout 5 --max-time 30 -o "$RUN_TMP_DIR/site-settings-unauthorized.json" -w '%{http_code}' \
   -X PUT -H 'Content-Type: application/json' \
   -d '{"title":"Forbidden","slogan":"","author":"","avatarUrl":"","theme":"system"}' "$BASE/api/settings/site")

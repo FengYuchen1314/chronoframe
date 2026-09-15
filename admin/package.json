@@ -1,9 +1,9 @@
 {
-  "name": "chronoframe-admin",
+  "name": "open-gallery-admin",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "ChronoFrame 管理后台（React + HeroUI）",
+  "description": "Open Gallery 管理后台（React + HeroUI）",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

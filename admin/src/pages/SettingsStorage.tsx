@@ -471,7 +471,7 @@ export default function SettingsStorage() {
         cancel: '已请求安全中断',
       }
       const descriptions: Record<typeof action, string | undefined> = {
-        scan: '只扫描 ChronoFrame 管理前缀；24 小时内的新对象不会进入清理清单。',
+        scan: '只扫描 Open Gallery 管理前缀；24 小时内的新对象不会进入清理清单。',
         delete: '任务在后端以 8 并发运行，可以离开此页面。',
         resume: undefined,
         cancel: undefined,
@@ -1076,7 +1076,7 @@ export default function SettingsStorage() {
               <Alert.Content>
                 <Alert.Title>先扫描，再由管理员确认删除</Alert.Title>
                 <Alert.Description>
-                  仅处理 ChronoFrame 管理前缀，保护数据库引用和 24 小时内的新对象。不会删除本地 ZIP。
+                  仅处理 Open Gallery 管理前缀，保护数据库引用和 24 小时内的新对象。不会删除本地 ZIP。
                 </Alert.Description>
               </Alert.Content>
             </Alert>

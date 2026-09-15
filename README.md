@@ -1,288 +1,60 @@
-# ChronoFrame（二次开发重构版）
+# Open Gallery
 
-本仓库是 [Uniseem](https://github.com/Uniseem) 基于 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) 进行二次开发与重构的自托管画廊，由本仓库独立维护。保留原项目的 Nuxt/Vue 前台风格，服务端改写为 Rust，围绕相册管理、图片加载、存储迁移和公开下载重新实现业务逻辑。
+以相册为中心的自托管画廊。公开页面基于 Nuxt/Vue，服务端为 Rust，图片可存放在本地磁盘、WebDAV 或 S3 兼容对象存储中。
 
-- 当前仓库：[Uniseem/chronoframe](https://github.com/Uniseem/chronoframe)
-- 二次开发者：[Uniseem 的 GitHub](https://github.com/Uniseem)
-- 原项目与作者：[HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe) · [HoshinoSuzumi / Timothy Yin](https://github.com/HoshinoSuzumi)
+部署与运维见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-## 原项目介绍
+## 功能
 
-[ChronoFrame 原项目](https://github.com/HoshinoSuzumi/chronoframe) 是 Timothy Yin（HoshinoSuzumi）开发的自托管个人画廊，提供在线照片管理、相册展示、EXIF 信息解析、地理位置识别与地图浏览等功能，采用 Nuxt、TypeScript、Tailwind CSS 等技术。本重构版沿用了原项目的前台视觉与交互基础，感谢原作者的开源工作。
+### 公开画廊
 
-本版已调整后端、数据库结构、管理流程和部署方式，功能与原项目不完全相同；地图等功能已移除。部署本版请使用下文的 Compose 文件与 `ghcr.io/uniseem/chronoframe` 镜像，本版问题请提交到[当前仓库 Issues](https://github.com/Uniseem/chronoframe/issues)。
+- 相簿动效主页与照片瀑布流：`/` 为相簿空间，`/photos` 为全部照片
+- 按标签、相机、镜头、城市、评分筛选与排序
+- 沉浸式查看器：在相册页上以覆盖层打开，支持浏览器返回、单击关闭和手机下滑关闭，自动预取前后各两张
+- 三层图片按需加载：网格使用 320px PNG，查看器默认使用不超过 1.5 MB 的 WebP，点击「显示高清」才加载不超过 5 MB 的 WebP
+- 右键或长按图片可「复制为 / 下载为」WEBP、PNG、JPG/JPEG，原图不受影响
+- 多选下载：桌面端打包为一个 ZIP，移动端按顺序逐张下载并显示进度
+- 多语言界面，支持浅色、深色与跟随系统主题
 
-## 本版架构与功能
+### 相册与上传
 
-- 根目录 `app/`、`i18n/`、`shared/`、`public/`：Nuxt 4 + Vue 3 + TypeScript 静态前端
-- `admin/`：管理后台，独立构建的 React 19 + HeroUI v3 + Tailwind v4 单页应用
-- `backend/`：Rust + Axum + SQLite API
-- 存储：本地磁盘、WebDAV 或 S3 兼容对象存储
+- 相册优先：先建相册再上传；只接受 PNG、JPG/JPEG、WEBP，并校验扩展名、文件签名与完整解码
+- 上传队列 7 路并发、全后台共享；切换页面不会中断，文件始终进入最初选定的相册
+- 维护相册名称、简介、展示日期（留空自动计算）与前后顺序
+- 相册封面可从相册图片中选择，或单独上传一张；未设置时自动使用最新图片
+- 图片支持搜索、筛选、跨页多选与批量删除；远端对象删除失败时会在后台持续重试
 
-管理后台与公开画廊是**两套独立构建**。前台用 `@nuxt/ui`，后台用 HeroUI，两者都基于 Tailwind v4，放在同一个构建里会互相渗透全局样式（preflight、主题变量、工具类），因此后台拥有自己的 `package.json`、lockfile 与 Vite 配置，产物落到 `public/dashboard`，再随 Nuxt 静态产物一起发布到 `/dashboard/` 路径。删除或改造后台不会影响公开画廊的任何一个文件。
+### 公开下载
 
-网站公开页面底部提供二次开发者的 GitHub 主页、本版源码及原项目链接，手机与电脑端均可访问。
+- 按相册开启，可同时提供 PNG、JPG、JPEG、WebP，每种格式生成独立 ZIP
+- 可设置单张图片大小上限：超限时先调整编码质量，再缩小分辨率，不会漏掉图片
+- 批量设置可一次覆盖多个或全部相册
+- 电脑端下载 ZIP 并支持断点续传；手机与平板逐张下载，可停止与继续
+- 相册内容或设置变化后自动生成新版本，旧版本立即停止公开下载
 
-公共端恢复原版的相簿动效主页、照片瀑布流、标签/相机/镜头/城市/评分筛选、排序、相簿详情和沉浸式查看器；地图、Globe 和地图管理功能不再存在。默认 `/` 直接展示相簿空间，全图瀑布流位于 `/photos`。上传严格遵循相簿优先的数据规则：管理员必须先创建相簿，之后才能向其中上传图片。管理员还可以重命名或删除相簿、删除单张或多张图片、迁移图片存储位置、维护公开相簿简介和显示日期、调整相簿前后顺序，以及修改网站名称、标语、作者、头像和默认主题。删除相簿时，其中的图片记录和当前存储对象会一并清理；图片被转换或存储迁移任务占用时，后端会拒绝删除以保护数据。
+### 存储与维护
 
-## 后台常用操作
+- 支持本地磁盘、WebDAV、S3/R2 三种存储，全部在后台配置，凭据加密保存
+- 保存前可执行写入、读回、删除的完整连接测试
+- 存储之间安全迁移：每个对象读回校验 SHA-256，全部成功才切换；可中断、继续，旧存储由管理员决定删除或保留
+- 一键清空并重建三层图片缓存，可中断、继续，服务重启后自动恢复
+- S3 旧空间回收：只扫描应用管理的前缀，保护数据库仍在引用的对象与 24 小时内的新对象，管理员确认后才清理
 
-登录 `/dashboard` 后，从“相册管理”进入相册。地址栏会保留相册和页签，刷新、浏览器前进后退及从任务中心返回时，可以直接定位到对应工作区。
+### 管理后台
 
-- **图片管理**：默认网格预览，可切换列表，按文件名搜索、格式筛选或上传时间排序。支持本页全选、选择全部筛选结果和跨页保留选择；选中一张图可直接设为封面，多张图可批量删除。
-- **相册资料**：名称、简介和展示日期统一保存。日期留空时自动计算；修改封面仍是选择后立即保存。删除相册放在资料页底部，并要求确认。
-- **公开下载**：在相册内配置下载格式和单张大小上限，查看当前版本 ZIP。旧版本放在“显示历史记录”中。侧栏“下载管理”提供全站状态列表，可勾选多个相册统一设置，也可覆盖全部现有相册。
-- **调整顺序**：在相册列表进入排序模式，上移、下移或置顶后统一保存；取消不改变公开相册顺序。
-- **任务中心**：集中查看当前下载包、最近的存储迁移、缓存重建和 S3 清理任务。失败和待确认项优先显示，可直接进入对应操作页。
+- 概览、相册管理、下载管理、任务中心、存储与维护、网站设置
+- 任务中心集中展示下载包、存储迁移、缓存重建与 S3 清理任务，失败与待确认项优先显示
+- 自定义网站名称、标语、作者、头像与默认主题
+- 管理员导出原始文件：单个相册导出 ZIP，多个相册导出嵌套 ZIP，与公开下载设置互不影响
 
-选择文件后自动加入顶部“上传队列”，全后台共享 7 个并发名额。切换相册或后台页面不会停止上传，文件始终进入最初选定的相册。暂停只阻止新任务开始，正在上传的文件会继续完成。刷新、关闭浏览器或离开后台则不能保证队列继续；待上传文件只保存在当前浏览器内存，不会在重新打开后恢复。失败文件可以手动重试；若提示网络中断，应先核对相册是否已收到图片，以免重复上传。“清除已完成记录”不会删除图片。
+### 安全
 
-管理员导出原始文件位于相册列表：勾选相册后点击“导出原始文件”。它与公开下载独立，不会改变访客下载权限或格式设置。
+- 单一管理员：首次访问 `/dashboard` 时注册，之后注册入口永久关闭
+- 密码使用 Argon2id 哈希；会话为 7 天有效的 `HttpOnly`、`SameSite=Strict` Cookie，数据库只保存令牌摘要
+- 管理写操作须通过与会话绑定的 CSRF 校验；前后端同源，不开放宽松的跨域访问
 
-## 单文件部署
+## 致谢
 
-提交到 `main` 后，GitHub Actions 会在原生 amd64 和 arm64 runner 上编译 Nuxt/Rust、构建镜像并发布多架构的 `ghcr.io/uniseem/chronoframe:latest`。部署机器不需要源码、Node.js 或 Rust，只需要 Docker Compose 和根目录的一个 `docker-compose.yml`。
+Open Gallery 基于 [ChronoFrame](https://github.com/HoshinoSuzumi/chronoframe) 二次开发，原作者为 Timothy Yin（[HoshinoSuzumi](https://github.com/HoshinoSuzumi)）。公开画廊的视觉与交互基础来自原项目，本仓库完整保留了原项目的提交历史。感谢原作者及所有贡献者的开源工作。
 
-```bash
-mkdir chronoframe && cd chronoframe
-curl -fsSLO https://raw.githubusercontent.com/Uniseem/chronoframe/main/docker-compose.yml
-docker compose up -d
-```
-
-也可以手动新建 `docker-compose.yml`，复制下面的完整内容：
-
-```yaml
-name: chronoframe
-
-services:
-  chronoframe:
-    image: ghcr.io/uniseem/chronoframe:latest
-    pull_policy: always
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    ports:
-      - "${CHRONOFRAME_BIND:-0.0.0.0}:${CHRONOFRAME_PORT:-8188}:8080"
-    environment:
-      CF_DATABASE_URL: sqlite:///app/data/chronoframe.db?mode=rwc
-      CF_MASTER_KEY_FILE: /app/data/secret.key
-      CF_CONVERSION_WORKERS: "${CF_CONVERSION_WORKERS:-7}"
-      CF_COOKIE_SECURE: "${CF_COOKIE_SECURE:-auto}"
-      CF_TRUST_PROXY_HEADERS: "${CF_TRUST_PROXY_HEADERS:-true}"
-    volumes:
-      - ./data:/app/data
-```
-
-把文件保存到准备存放相簿数据的目录，在该目录执行 `docker compose up -d`。
-
-默认通过 `0.0.0.0:8188` 提供服务。数据库、主密钥和本地图片会自动写入 Compose 同目录的 `./data`；镜像升级或容器重建不会删除它们。更新只需：
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-如果旧部署的 Compose 仍使用 `build: .`，`docker compose pull` 不会更新应用。请先改用上方示例中的 `image: ghcr.io/uniseem/chronoframe:latest`，并保留原来的 `volumes` 映射，再执行更新命令。新版会要求浏览器重新验证入口 HTML，避免更新后因旧页面继续引用已经移除的脚本而出现空白页。
-
-迁移前先停止写入，然后把 Compose 文件和整个 `data` 目录一起打包：
-
-```bash
-docker compose stop
-sudo tar --numeric-owner -czf chronoframe-backup.tgz docker-compose.yml data
-docker compose start
-```
-
-主密钥权限固定为 `0600`，因此打包必须使用 `sudo` 并确认命令成功；恢复时同样使用 `sudo tar --numeric-owner -xzf chronoframe-backup.tgz`。在新机器解压后进入目录执行 `docker compose up -d` 即可。若使用 WebDAV 或 S3，目录备份会保留数据库、管理员数据、加密主密钥及连接配置，远端图片本身仍在原 WebDAV/S3 中；需要离线完整迁移时还必须另行迁移远端对象。
-
-Compose 无需 `.env`。默认同时允许通过公网 `IP:8188`、域名和 HTTP/HTTPS 反向代理访问；管理请求不会因为 Origin、反代协议、域名或端口不同而被拒绝。程序默认信任 `Forwarded` / `X-Forwarded-Proto` 来自动决定 Cookie 是否增加 `Secure`，代理没有发送这些头时仍可正常使用。需要修改监听地址、端口或 Cookie 策略时，才需使用 `.env.example` 中的可选变量。
-
-全新数据库第一次打开 `/dashboard` 时会显示管理员注册页。第一笔合法注册会在同一个 SQLite 事务中创建管理员和初始会话；一旦创建成功，注册入口永久关闭，之后只能使用该用户名和密码登录。不要让尚未完成首次注册的实例长期暴露在公网，否则其他访问者可能先行取得管理员身份。默认配置可直接使用 HTTP `IP:端口`，也可放在常见的 HTTPS 反向代理后面，无需额外切换环境变量。
-
-## 存储后端
-
-所有存储连接参数都在管理员界面的“存储设置”中维护，并持久化到 SQLite；程序不会从 `.env` 读取本地路径、WebDAV 或 S3 参数。后台可先执行完整的写入、读回、删除连接测试，再保存设置。没有图片时可直接切换目标；已有图片时，保存新的类型、路径、Endpoint、桶或前缀会进入安全迁移流程。同一目标的凭据轮换仍然允许。
-
-单文件 Docker 部署使用本地存储时，请保持后台默认路径 `./data/storage`；它对应宿主机当前目录的 `./data/storage`。改到 `/app/data` 之外的容器路径不会被 Compose 持久化，也不会进入上述目录备份。
-
-Compose 变量只负责服务运行时，不负责存储：
-
-- `CHRONOFRAME_BIND`、`CHRONOFRAME_PORT`：宿主机监听地址和端口。
-- `CF_COOKIE_SECURE`：`auto`、`true` 或 `false`；默认 `auto`，反代报告 HTTPS 时自动使用 Secure Cookie。
-- `CF_TRUST_PROXY_HEADERS`：是否信任 `Forwarded` 和 `X-Forwarded-Proto`；默认 `true`，以兼容无需额外配置的反向代理部署。
-- `CF_CONVERSION_WORKERS`：仅用于兼容旧版本遗留转换任务，默认 7，限制为 1–16；新上传的三层派生图会自动按 CPU 调整并发。
-
-容器内部的 SQLite 路径、主密钥路径、静态前端目录和监听地址已固定在镜像与 Compose 中，无需用户配置。
-
-WebDAV 密码和 S3 秘密访问密钥使用独立安装主密钥进行 AES-256-GCM 加密，读取设置时永不返回明文。主密钥与管理员密码完全解耦；备份或迁移时必须同时保存 SQLite 数据库和 `CF_MASTER_KEY_FILE`，缺少任意一项都无法恢复存储凭据。上传对象在 WebDAV 中会先写入临时对象，再使用 `MOVE` 原子提交；S3 使用临时对象复制到最终键；本地存储则先写入同目录临时文件后重命名。请使用支持 WebDAV `MKCOL`、`PUT`、`MOVE`、`DELETE` 的服务端，以及兼容 S3 path-style 请求的对象存储服务。
-
-从旧的 `X-Admin-Token` 版本升级时，可在第一次启动新版时暂时保留原 `CF_ADMIN_TOKEN`。只有在主密钥文件尚不存在时，程序才会一次性用旧令牌派生兼容密钥并写入 `CF_MASTER_KEY_FILE`；确认密钥文件已经生成后即可移除该环境变量。它不会再被用于登录或 API 鉴权。
-
-上传必须指定一个已存在的相簿。应用本身不限制单次选择的图片数量、单张大小或总大小；浏览器默认使用 7 个异步 worker 连续提交，Rust 后端同时允许 7 个上传请求并行处理，避免逐张等待产生的带宽空档。每张图片仍独立提交并确认，某张失败不会影响其他成功项，失败文件会保留在待上传列表中供直接重试。图片入库后会立即进入并发派生图队列，不需要管理员再执行格式转换。服务仍会校验扩展名、文件签名和完整解码，只接受 PNG、JPG/JPEG 与 WEBP。若通过第三方反向代理或 CDN 访问，还需确保其请求体大小、连接数和超时配置不会额外限制上传。
-
-## 图片删除与存储迁移
-
-管理员可在相簿工作区进入“管理图片”，单选、全选或多选图片后永久删除。数据库记录与持久化删除 outbox 在同一个事务中提交；即使 S3/R2、WebDAV 或本地对象删除临时失败，图片也不会重新出现在相簿中，后台会继续重试尚未清理的对象。
-
-存储中心支持在本地、WebDAV、S3/R2 之间迁移全部现有图片：
-
-- 迁移以后台并发任务运行，公开相簿在复制期间仍可查看；为保证快照一致，上传、转换、删除等写操作会暂时拒绝并提示稍后重试。
-- 每个目标对象写入后都会重新读回，并核对字节数与 SHA-256。只有全部对象校验成功，系统才会在一个数据库事务中切换唯一活动存储。
-- 复制失败、管理员中断或服务重启都不会切换存储。后台保留逐项进度，选择“继续迁移”时只重跑未成功的对象；已经写完但尚未来得及记录进度的对象也会先校验再复用。
-- 切换后旧存储默认完整保留。管理员必须明确选择“删除旧存储图片”或“保留旧存储”；选择删除时，系统会再次验证当前存储中的副本，再通过可重放任务删除旧对象。
-
-迁移本地存储时，目标路径必须位于 Compose 持久化卷内，例如 `/app/data/storage-new`；如果填写 `/app/data` 之外的路径，容器重建后该位置不会保留。
-
-当前活动存储为 S3/R2 时，存储中心还提供“旧空间回收”：系统只分页扫描当前配置前缀下的 `albums/` 对象，不会触碰同一桶里的其他目录。数据库仍引用的母本、上传暂存账本、图片删除 outbox 和旧格式删除 outbox 会组成保护集合；最近 24 小时的对象也会进入宽限期。扫描结果只展示孤儿对象数量和预计可释放容量，不会自动删除；管理员二次确认后才以 8 并发后台清理，并在每次删除前重新核对保护集合。任务可离开页面、安全中断、继续，服务重启会标记为可恢复的中断状态。S3 凭据除读写对象外还需要 `ListBucket`（列出对象）和删除对象权限。
-
-## 相册封面
-
-在后台 **相册管理 → 选择相册 → 相册资料 → 相册封面** 中，可以从该相册的图片中选择封面，也可以从电脑上传一张 PNG、JPG/JPEG 或 WebP。在“图片管理”中选中一张图片，也可直接点击“设为封面”。选择后立即保存，相册首页卡片和详情页背景同步使用该封面；不改变照片排列顺序。未手动设置时自动使用相册最新图片，也可以随时点击「恢复自动封面」。
-
-单独上传的封面会校正图片方向并生成最长边 800px、最多 200KB 的 WebP，原始上传文件不保留，不增加相册照片数量、不进入下载 ZIP。这类封面作为站点素材保存在本地 SQLite 数据库，随现有 `data` 目录备份，无需配置新目录或环境变量，不写入 S3/WebDAV。替换、恢复自动或删除相册时，旧封面记录和图片字节会在同一事务中移除，数据库空闲页可由后续写入复用。选择已有照片不会复制或删除源图；该照片被删除或移出相册时，会自动回退到默认封面。
-
-## 相簿打包下载与站点自定义
-
-### 公开相册下载
-
-进入后台 **下载管理**，选择相册，开启「可供下载」，选择 PNG、JPG、JPEG、WebP 中的一种或多种，并设置**单张图片大小上限（MB）**，保存即可。默认每张最多 5 MB，填写 `0` 表示不限；MB 按 1,000,000 字节计算。此限制不是整个 ZIP 的大小，也不会因为超限而漏掉某张图片：JPEG/WebP 会调整编码质量，仍超限时缩小分辨率；PNG 保持无损编码、通过缩小分辨率满足限制。透明图片转 JPEG 使用白色背景。
-
-需要统一设置时，点击 **批量设置**，选择多个相册或「全部相册」，调整下载开关、格式及单张大小上限，再点击「覆盖并应用」并确认。整批设置一次性保存，会覆盖各相册原来的单独设置，而不是合并；未选中的相册和之后新建的相册不受影响。旧 ZIP 自动清理，启用下载的相册在后台重新生成，原始图片和远端存储对象不会删除。
-
-手机和平板（含使用桌面版网站的 iPad）显示「下载图片」。点击后出现黑色半透明磨砂确认窗，可选择管理员已开放并生成完成的格式，确认后按顺序下载所有照片，显示进度并支持停止、继续剩余图片。照片直接读取本地 ZIP 中的对应文件，不重新转码、不重复请求 S3/WebDAV，且沿用后台的单张大小限制。电脑端仍下载 ZIP。浏览器不能保证直接写入系统相册，进度只表示已提交给浏览器；请允许多文件下载并保持页面打开，必要时在“下载”或“文件”中选中图片后保存到相册。关闭窗口或离开页面会停止剩余下载，已交给浏览器的文件不受影响。
-
-- 每种格式生成独立 ZIP，内容从存储母本生成，不使用低清缩略图。JPG 与 JPEG 编码相同，扩展名不同。
-- 相册首页每张卡片右上角、相册详情标题旁都会显示下载按钮。单格式直接下载，多格式展开下拉菜单；未生成完的格式显示「正在打包」。未开启的相册不显示按钮。
-- ZIP 始终保存在服务器本地的 **`./data/album-downloads`**，不上传 S3/R2 或 WebDAV。使用上面的 Compose 时，该目录随 `./data` 持久化、备份和迁移，不需要新增环境变量或挂载。
-- 任务在服务器后台执行，离开后台不会停止。最多同时处理 2 个 ZIP、全局 4 路图片编码；管理页显示进度、失败原因和已发布 ZIP 占用。
-- 打包读取 S3/R2 原图时，单次最多等待 120 秒；超时、断连、限流或服务端临时错误会自动重试，打包层每张最多尝试 3 次，两次重试前分别等待约 1 秒、2 秒。已处理的图片不重复编码；权限不足、对象不存在或图片损坏会直接报错，不会跳过图片后发布缺图的 ZIP。取消任务会停止正在进行的读取和重试等待，不需要修改存储配置或新增环境变量。升级前已失败的任务需点击「重新生成」，才会使用新的重试策略。
-- 增删图片、修改名称或下载设置后自动生成新版本。旧版本立即停止公开下载并异步清理，只有完整写入并原子提交的当前版本会发布。
-- 管理员可以取消生成或删除本地 ZIP。删除后不会立刻自动生成同一版本；点击「重新生成」即可恢复。关闭「可供下载」会撤下链接并清理该相册本地 ZIP，**不会删除原图或远端存储对象**。
-- 服务重启会清理未完成临时文件并重跑未完成任务；取消、删除状态持久化，过期任务不能重新发布。磁盘余量不足时停止打包，预留 256 MiB 安全空间；失败文件会清理，释放空间后可重新生成。
-
-旧版本升级后所有相册默认关闭公开下载，需要管理员按相册开启。启用后无需登录即可下载，适合公开分享；下载不会绕过已关闭或已删除的状态。
-
-### 管理员导出与站点信息
-
-管理员可在“相簿”页独立勾选一个或多个相簿并下载：只选一个时，ZIP 内直接放置该相簿的图片；选择多个时，下载一个外层 ZIP，每个所选相簿在其中对应一个独立 ZIP。重名文件和重名相簿会自动追加序号，文件名会过滤路径分隔符和不安全字符。
-
-打包同时支持本地、WebDAV 和 S3/R2 存储。服务逐张读取对象并写入磁盘临时区，再由受限线程池压缩并流式发送最终文件，不会把整个相簿压缩包保存在内存中；下载完成、浏览器中断或生成失败都会清理临时目录。同一时刻最多生成两个相簿导出，避免大型相簿把 CPU、磁盘和远端存储连接占满。
-
-“站点设置”恢复原版的公开自定义项：网站名称、标语、作者、头像 URL 和默认浅色/深色/跟随系统主题。它们与存储配置一样保存在 SQLite 中，不需要环境变量；地图、统计脚本、第三方登录等已删除功能不会因此恢复。
-
-## 三层图片、按需导出与重建任务
-
-相册瀑布流按数据库中已知的图片宽高一次计算列位置，不再逐张插入 DOM 测量；只有视口及上下约 320px 内的卡片开始请求 PNG 缩略图。直接滚动到相册底部时，底部图片独立加载，不会排在未浏览图片之后。这是按可见区域调度请求，不是带宽限速。
-
-查看器以相册页上的覆盖层打开（链接形如 `/albums/相册ID?photo=图片ID`），不会卸载相册、在背后渲染全站图库或在关闭时重新请求相册。原来的 `/图片ID` 链接仍可用，只查询该图的元数据后定位到所属相册。关闭动画只执行一次 240ms 的位移与缩放，支持浏览器返回、单击关闭、手机下滑关闭和减少动态效果设置；动画完成回调有 320ms 超时兜底，页面已在后台时直接跳过动画，避免浏览器暂停动画导致退出一直等待。
-
-当前图片独立加载，之后仅预加载前后各两张预览图，最多同时两个低优先级请求。切图时保留并提升正在加载的新当前图，不再全部取消重来。桌面和手机只挂载各自的查看器；桌面缩略图条按可见窗口渲染，缓存命中的图片无需再次等待固定渐显。调度回归测试可在 VPS 的 Node 24 环境执行 `node --test scripts/viewer-performance.test.mjs`。
-
-原始上传文件继续作为存储母本保存在本地、WebDAV 或 S3/R2，公开页面不会直接加载它。应用在 Compose 同目录的 `./data/thumbnails` 为每张图片维护三层派生图：
-
-- 相簿网格使用最长边 320px 的低清 PNG，优先让页面快速铺满。
-- 点进查看器默认使用最长边不超过 2560px、文件严格不超过 1.5 MB 的 WebP；当前图加载完成后才预取左右邻图的同层版本。
-- 只有点击查看器底部“显示高清”后，当前图片才加载最长边不超过 4096px、文件严格不超过 5 MB 的 WebP。不会预取整本相簿的高清版本。
-
-上传接口不等待派生图编码完成；每张图片写入数据库后立即进入 7–32 路自适应并发队列。若后台处理尚未完成，三个公开接口也会按需生成缺失层。管理员可在“存储设置”一键清空并重建全站三层缓存，兼容旧版本上传的图片；该任务逐张持久化进度，可离开页面、安全中断、继续，并在服务重启后自动恢复。
-
-在图片上单击右键，或在移动设备上长按，可展开“复制为”和“下载为”，支持 WEBP、PNG、JPG/JPEG。非 WebP 格式由服务从 5 MB 高清层现场转换，不会新增相簿图片，也不会改动原始母本。浏览器的图片剪贴板只在安全上下文中开放，因此“复制为”需要 HTTPS；HTTP IP + 端口访问仍可浏览和下载。
-
-相簿网格支持多选：桌面端可点击勾选并用 Shift 连选，下载时生成一个 ZIP；移动端长按进入多选后按顺序逐张下载，并显示完成进度。旧版“批量格式转换”入口已经从后台移除；升级时遗留的后端任务表和接口暂时保留，仅用于兼容已有数据。
-
-管理员密码使用带随机盐的 Argon2id 哈希保存，不会写入 Cookie 或前端存储。登录成功后服务端签发 7 天有效的随机会话：浏览器只持有 `HttpOnly`、`SameSite=Strict` 的会话 Cookie，数据库只保存令牌摘要；管理写操作还必须通过与该会话绑定的 CSRF 双重校验。退出会立即删除服务端会话，过期会话不能重放。项目是前后端同源应用，不开放宽松 CORS。
-
-## API 摘要
-
-- `GET /api/auth/status` — 查询是否已完成首次注册及当前会话状态
-- `POST /api/auth/register` — 仅在无管理员时原子创建第一个管理员并登录
-- `POST /api/auth/login`、`POST /api/auth/logout`
-- `GET/PUT /api/settings/storage` — 管理员读取或保存存储后端设置
-- `POST /api/settings/storage/test` — 在不保存的情况下测试候选存储
-- `GET/PUT /api/settings/site` — 公开读取站点信息，或由管理员保存站点自定义设置
-- `GET/POST /api/albums`
-- `POST /api/albums/order` — 提交包含全部当前相簿 ID 的新顺序
-- `GET /api/albums/export?albumIds=id1,id2` — 管理员流式下载单相簿 ZIP 或多相簿嵌套 ZIP
-- `GET /api/album-downloads/public` — 公开相册各格式下载状态与链接
-- `GET /api/album-downloads` — 管理员查询下载设置、任务进度与本地占用
-- `PUT /api/albums/:album_id/download-settings` — 设置 `{ "enabled": true, "formats": ["png", "webp"], "maxImageBytes": 5000000 }`
-- `POST /api/albums/:album_id/downloads/rebuild` — 后台重新生成相册的所有已选格式
-- `GET /api/albums/:album_id/downloads/:format` — 公开流式下载当前 ZIP，支持 Range 断点续传
-- `GET /api/albums/:album_id/downloads/:format/photos` — 当前已发布 ZIP 的图片清单
-- `GET /api/albums/:album_id/downloads/:format/photos/:index?version=job_id` — 按清单逐张下载，支持 Range，每次请求均检查相册仍可下载且版本匹配
-- `PUT /api/album-downloads/settings/bulk` — 管理员批量覆盖下载设置；请求为 `{ "target": { "scope": "selected", "albumIds": ["id1", "id2"] }, "settings": { "enabled": true, "formats": ["png", "webp"], "maxImageBytes": 5000000 } }`，全部现有相册使用 `"target": { "scope": "all" }`；未知相册或无效设置会使整批操作失败，不会部分保存
-- `POST /api/album-downloads/:job_id/cancel`、`DELETE /api/album-downloads/:job_id` — 管理员取消任务或删除本地包，不删除原图
-- `GET/PATCH /api/albums/:album_id` — 相簿详情及其中的图片，或修改简介和显示日期
-- `GET/POST /api/albums/:album_id/photos`
-- `GET /api/photos` — 按创建时间倒序列出图片
-- `DELETE /api/photos/:photo_id`、`POST /api/photos/delete` — 删除单张或批量删除图片
-- `GET /api/photos/:photo_id/thumbnail` — 320px PNG 网格图
-- `GET /api/photos/:photo_id/preview`、`GET /api/photos/:photo_id/high` — 1.5 MB 默认查看图和 5 MB 手动高清图
-- `GET /api/photos/:photo_id/render?format=webp|png|jpg|jpeg&download=true` — 按需复制或下载指定格式
-- `POST /api/photos/export` — 提交 `{ "photoIds": [], "format": "webp|png|jpg|jpeg" }` 并流式下载多选 ZIP
-- `GET/POST /api/storage-migrations` — 查看迁移进度或以新的存储配置开始迁移
-- `POST /api/storage-migrations/:job_id/resume`、`POST /api/storage-migrations/:job_id/cancel`
-- `POST /api/storage-migrations/:job_id/cleanup`、`POST /api/storage-migrations/:job_id/retain` — 删除或保留旧存储图片
-- `GET /api/s3-cleanups/latest`、`POST /api/s3-cleanups/scan` — 查看最近任务或扫描当前 S3 管理前缀中的孤儿对象
-- `POST /api/s3-cleanups/:job_id/delete|resume|cancel` — 确认后台清理、继续或安全中断 S3 旧空间任务
-- `GET /api/thumbnails/rebuilds/latest`、`POST /api/thumbnails/rebuilds` — 查看最近任务或清空缓存并开始并发重建三层派生图
-- `POST /api/thumbnails/rebuilds/:job_id/resume`、`POST /api/thumbnails/rebuilds/:job_id/cancel` — 继续或安全中断派生图重建
-
-## 管理后台的开发与构建
-
-管理后台在 `admin/` 下，是一个与公开画廊完全隔离的 React 单页应用：React 19 + HeroUI v3 + Tailwind CSS v4 + React Router 7，由 Vite 构建。
-
-```bash
-pnpm build          # 先构建后台，再跑 nuxt generate（发布用）
-pnpm build:admin    # 只构建后台
-pnpm build:web      # 只构建公开画廊
-pnpm dev            # 开发公开画廊（Nuxt dev server）
-pnpm dev:admin      # 开发管理后台（Vite dev server，:5174，/api 代理到 :8080）
-pnpm typecheck      # 公开画廊类型检查
-pnpm typecheck:admin # 管理后台类型检查
-```
-
-`pnpm build` 会先运行 `scripts/build-admin.mjs`：它会按需在 `admin/` 内安装依赖、构建 SPA，并把产物复制到 `public/dashboard`。随后 `nuxt generate` 把 `public/` 原样复制进 `.output/public`，后台就出现在 `/dashboard/` 下。`admin/dist`、`public/dashboard` 都是构建产物，不入库。
-
-> **验证后台改动时必须用完整的 `pnpm build`。** 服务端提供的是 `.output/public/dashboard`，而 `pnpm build:admin` 只更新到 `public/dashboard` 为止，不会触发 `nuxt generate`。只跑 `build:admin` 就刷新页面，浏览器拿到的仍是上一次 `nuxt generate` 的旧代码 —— 改动看起来"没生效"。开发时请直接用 `pnpm dev:admin`（Vite 热更新，不需要构建）。
-
-因此**后台代码位于 `admin/src/`**，其目录结构为 `lib/`（API 客户端、类型、格式化、上传队列、主题、跨页共享状态）、`components/`（外壳、表格、分页、上传队列抽屉、下载管理、封面编辑器）与 `pages/`（概览、相册管理、下载管理、任务中心、站点设置、存储与维护）。
-
-有两处必须在改动时留意的服务端配合：
-
-- `backend/src/main.rs` 为 `/dashboard` 挂了一段独立的静态服务，用自己的 `index.html` 做深链回退。后台的深链（如 `/dashboard/albums?album=xxx`）在 `ServeDir` 里没有对应文件，若不单独回退就会被交给站点根 `index.html`（公开画廊的 Nuxt 外壳），而它的路由表里已经不存在 `/dashboard`。该目录不存在时（例如没构建后台）不会挂载，行为自动退回原状。
-- 同一文件里的缓存策略把 `/dashboard/assets/` 视为带内容哈希的不可变资源，与 `/_nuxt/` 一样给一年 `immutable` 缓存；HTML 仍然 `no-cache`，避免发版后命中旧外壳。
-
-**快速入口（对齐现网行为，不要改动）**：`/dashboard` 的路径与 `?album=`、`?tab=` 查询参数是地址栏唯一的持久状态。相册页的 `tab` 只认 `details` 与 `downloads`（默认 `photos` 且不写进 URL），切换用 push；存储页的 `tab` 只认 `migration`、`cache`、`cleanup`（默认 `connection` 且不写进 URL），切换用 replace。其余列表状态（搜索词、页码、勾选、网格/列表视图）只存在内存里，刷新即重置。
-
-## 验收测试
-
-前端逻辑回归在 VPS 的 Node 24 环境运行 `node --test scripts/*.test.mjs`，覆盖上传队列的 7 并发、暂停与手动重试、相册目标固定、日期校验和跨页多选，以及公开查看器、封面和下载逻辑。类型检查和静态构建分别运行 `pnpm typecheck`、`pnpm build`；使用与镜像一致的 Node 24 Alpine 环境安装依赖，勿混用不同系统的原生依赖目录。
-
-`scripts/vps-e2e.sh` 会在隔离的 Docker Compose 项目中拉取 `CHRONOFRAME_IMAGE` 指定的 Actions 镜像，覆盖并发首次注册、Argon2id 哈希、Cookie/CSRF、会话过期与退出，以及本地、WebDAV、S3、四种格式互转、多相簿、并行任务、取消、并发读写、硬终止恢复和临时对象清理；`scripts/vps-s3-cleanup-e2e.sh` 使用隔离 MinIO 验证 24 小时宽限、管理前缀隔离、删除前引用保护和孤儿对象清理；`scripts/vps-delete-interrupt.sh` 专门验证登录会话和管理员确认删除后的 outbox 在进程被强制终止时能够安全续作。`scripts/vps-load.py` 用于并发混合负载和延迟阈值检查。
-
-## 开源许可与致谢
-
-本二次开发重构版沿用 [MIT 许可证](LICENSE)，保留原作者 Timothy Yin 的版权声明。原项目为 [HoshinoSuzumi/chronoframe](https://github.com/HoshinoSuzumi/chronoframe)，二次开发与重构由 [Uniseem](https://github.com/Uniseem) 在[本仓库](https://github.com/Uniseem/chronoframe)维护。
-
-### 迁移与归档说明
-
-本仓库原位于 `FengYuchen1314/chronoframe`，已转移至 [Uniseem](https://github.com/Uniseem)。旧地址由 GitHub 自动重定向。
-
-旧镜像命名空间 `ghcr.io/fengyuchen1314/chronoframe` **作为归档保留、不再更新**：其中的历史版本仍可拉取，但新版本只发布到 `ghcr.io/uniseem/chronoframe`。按旧地址部署的实例需要把 compose 里的 `image:` 改到新地址才能继续获得更新。
-
-迁移前的提交署名历史保留在 tag `archive/pre-uniseem-attribution`，其中包含重写署名之前的原始 SHA（含已发布镜像 label `org.opencontainers.image.revision` 所引用的提交）。
-
-### 原项目作者与贡献者
-
-本仓库保留完整的 git 历史。686 个提交中，**540 个来自原作者 Timothy Yin（[HoshinoSuzumi](https://github.com/HoshinoSuzumi)）**，53 个来自其他第三方贡献者，33 个来自依赖更新机器人。前台的 Nuxt/Vue 视觉与交互基础、WebGL 图片管线等均来自原项目。这些提交的作者署名不作任何改动。
-
-### 本重构版贡献者
-
-二次开发与重构部分共 60 个提交，由 [Uniseem](https://github.com/Uniseem) 维护并对代码负责，实现过程借助 AI 编程助手完成：
-
-| 时间 | 协作者 | 范围 |
-|---|---|---|
-| 2026-08-23 ～ 09-01 | **GPT** | 服务端改写为 Rust、相簿优先的数据模型、三层派生图与查看器性能、存储迁移与 S3 旧对象清理、公开下载与批量设置、Ant Design 后台 |
-| 2026-09-12 ～ 09-13 | **DeepSeek**、**Claude** | 管理后台重写为 `admin/` 下的独立 React SPA。DeepSeek 完成重写主体与四份实现规格，Claude 完成 review、缺陷修复与回归测试 |
-
-AI 协作者按其实际参与的时间段列出；署名范围仅限本重构版自身的 60 个提交。
+本项目沿用 [MIT 许可证](LICENSE)，保留原作者的版权声明。

@@ -143,7 +143,7 @@ export function usePhotoActions() {
           body: JSON.stringify({ photoIds: photos.map(photo => photo.id), format }),
         }))
         transfer.value.completed = photos.length
-        saveBlob(blob, `chronoframe-${photos.length}-${formatExtension(format)}.zip`)
+        saveBlob(blob, `open-gallery-${photos.length}-${formatExtension(format)}.zip`)
         toast.add({
           title: 'ZIP 已生成',
           description: `${photos.length} 张 ${format.toUpperCase()} 图片开始下载。`,

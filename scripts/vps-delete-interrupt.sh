@@ -38,7 +38,7 @@ wait_app_ready() {
     if curl -fsS --connect-timeout 2 --max-time 4 "$BASE/api/albums" >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
   done
-  [[ "$ready" = 1 ]] || { "${COMPOSE[@]}" logs --tail=200 chronoframe >&2 || true; echo "ChronoFrame did not become ready" >&2; exit 1; }
+  [[ "$ready" = 1 ]] || { "${COMPOSE[@]}" logs --tail=200 chronoframe >&2 || true; echo "Open Gallery did not become ready" >&2; exit 1; }
 }
 
 : >"$COOKIE_JAR"

@@ -1,6 +1,6 @@
-# ChronoFrame development notes
+# Open Gallery development notes
 
-ChronoFrame is an album-first self-hosted gallery. The browser client is a root-level Nuxt 4 + Vue 3 + TypeScript static app (`app/`, `i18n/`, `shared/`, and `public/`); the API and background workers are Rust/Axum in `backend/`. `pnpm build` emits `.output/public`, which the Rust service hosts in production.
+Open Gallery is an album-first self-hosted gallery. The browser client is a root-level Nuxt 4 + Vue 3 + TypeScript static app (`app/`, `i18n/`, `shared/`, and `public/`); the API and background workers are Rust/Axum in `backend/`. `pnpm build` emits `.output/public`, which the Rust service hosts in production.
 
 - Keep the root view album-first. An album must exist before uploads are accepted.
 - Supported image formats are PNG, JPG/JPEG and WEBP only.

@@ -1,9 +1,9 @@
 import type { SiteSettings } from '~/types/dashboard'
 
 export const DEFAULT_SITE_SETTINGS: SiteSettings = {
-  title: 'ChronoFrame',
+  title: 'Open Gallery',
   slogan: 'Frame the moments that matter.',
-  author: 'ChronoFrame',
+  author: 'Open Gallery',
   avatarUrl: '/web-app-manifest-192x192.png',
   theme: 'system',
 }

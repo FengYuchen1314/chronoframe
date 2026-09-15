@@ -98,7 +98,7 @@ const selectedFilterCount = computed(() => Object.values(selectedCounts.value).r
           @mouseenter="repoHover = true"
           @mouseleave="repoHover = false"
         >
-          <Icon name="tabler:brand-github" /> ChronoFrame
+          <Icon name="tabler:brand-github" /> Open Gallery
           <AnimatePresence>
             <motion.span v-if="repoHover" :initial="{ width: 0, opacity: 0 }" :animate="{ width: 'auto', opacity: 1 }" :exit="{ width: 0, opacity: 0 }" class="overflow-hidden whitespace-nowrap">
               ({{ config.public.VERSION }})

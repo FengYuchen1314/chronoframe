@@ -1460,16 +1460,16 @@
       },
       "current": "In Progress",
       "stepCounter": "Step {0} / {1}",
-      "logoAlt": "ChronoFrame Logo"
+      "logoAlt": "Open Gallery Logo"
     },
     "actions": {
       "next": "Next",
       "completeSetup": "Complete Setup"
     },
     "welcome": {
-      "title": "Welcome to ChronoFrame",
+      "title": "Welcome to Open Gallery",
       "description": "Follow the wizard to set up your gallery in a few minutes.",
-      "intro": "ChronoFrame is a versatile personal gallery app. Before uploading photos, we need to configure a few essentials:",
+      "intro": "Open Gallery is a versatile personal gallery app. Before uploading photos, we need to configure a few essentials:",
       "cards": {
         "admin": {
           "title": "Admin Account",
@@ -1488,7 +1488,7 @@
           "description": "Visualize locations and mark shooting spots"
         }
       },
-      "privacyNotice": "ChronoFrame does not collect any of your data.",
+      "privacyNotice": "Open Gallery does not collect any of your data.",
       "start": "Get Started"
     },
     "admin": {
@@ -1509,7 +1509,7 @@
     },
     "complete": {
       "title": "Almost Done!",
-      "description": "Your ChronoFrame gallery is ready to use.",
+      "description": "Your Open Gallery gallery is ready to use.",
       "body": "You have completed all essential setup steps. You can now sign in with your admin account and start uploading photos.",
       "goToDashboard": "Go to Dashboard",
       "setupFailedTitle": "Setup Failed",

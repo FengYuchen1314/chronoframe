@@ -1386,16 +1386,16 @@
       },
       "current": "進行中",
       "stepCounter": "第 {0} 步 / 共 {1} 步",
-      "logoAlt": "ChronoFrame 標誌"
+      "logoAlt": "Open Gallery 標誌"
     },
     "actions": {
       "next": "下一步",
       "completeSetup": "完成設定"
     },
     "welcome": {
-      "title": "歡迎使用 ChronoFrame",
+      "title": "歡迎使用 Open Gallery",
       "description": "跟著精靈，在幾分鐘內完成畫廊設定。",
-      "intro": "ChronoFrame 是多功能個人畫廊應用程式。開始上傳照片前，請先完成以下設定：",
+      "intro": "Open Gallery 是多功能個人畫廊應用程式。開始上傳照片前，請先完成以下設定：",
       "cards": {
         "admin": {
           "title": "管理員帳號",
@@ -1414,7 +1414,7 @@
           "description": "位置可視化與拍攝地標記"
         }
       },
-      "privacyNotice": "ChronoFrame 不會收集你的任何資料。",
+      "privacyNotice": "Open Gallery 不會收集你的任何資料。",
       "start": "開始吧"
     },
     "admin": {
@@ -1435,7 +1435,7 @@
     },
     "complete": {
       "title": "即將完成！",
-      "description": "你的 ChronoFrame 畫廊已可使用。",
+      "description": "你的 Open Gallery 畫廊已可使用。",
       "body": "你已完成所有基本設定。現在可使用管理員帳號登入並開始上傳照片。",
       "goToDashboard": "前往儀表板",
       "setupFailedTitle": "設定失敗",

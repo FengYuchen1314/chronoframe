@@ -11,9 +11,9 @@ import PageHeader from '../components/PageHeader'
 import { useDocumentTitle } from '../lib/hooks'
 
 const DEFAULTS: SiteSettings = {
-  title: 'ChronoFrame',
+  title: 'Open Gallery',
   slogan: 'Frame the moments that matter.',
-  author: 'ChronoFrame',
+  author: 'Open Gallery',
   avatarUrl: '/web-app-manifest-192x192.png',
   theme: 'system',
 }

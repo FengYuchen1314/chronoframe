@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/uniseem/chronoframe
+  IMAGE: ghcr.io/uniseem/open-gallery
 
 jobs:
   build:

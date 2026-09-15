@@ -625,7 +625,7 @@ impl S3Store {
 
     async fn delete_physical_object(&self, physical_key: &str) -> Result<()> {
         if self.logical_key(physical_key).is_none() {
-            bail!("拒绝删除 ChronoFrame 管理前缀之外的 S3 对象");
+            bail!("拒绝删除 Open Gallery 管理前缀之外的 S3 对象");
         }
         timeout(
             STORAGE_IO_TIMEOUT,
@@ -896,9 +896,9 @@ struct StorageSettingsOutput {
     s3_prefix: String,
 }
 
-const DEFAULT_SITE_TITLE: &str = "ChronoFrame";
+const DEFAULT_SITE_TITLE: &str = "Open Gallery";
 const DEFAULT_SITE_SLOGAN: &str = "Frame the moments that matter.";
-const DEFAULT_SITE_AUTHOR: &str = "ChronoFrame";
+const DEFAULT_SITE_AUTHOR: &str = "Open Gallery";
 const DEFAULT_SITE_AVATAR_URL: &str = "/web-app-manifest-192x192.png";
 const DEFAULT_SITE_THEME: &str = "system";
 
@@ -4452,14 +4452,14 @@ async fn export_albums(
                 .expect("single album export has an archive");
             Ok((path, filename))
         } else {
-            let path = temporary_dir.join("chronoframe-albums.zip");
+            let path = temporary_dir.join("open-gallery-albums.zip");
             tokio::task::spawn_blocking({
                 let path = path.clone();
                 move || write_nested_export_zip(&path, &album_archives)
             })
             .await
             .context("多相簿打包线程异常")??;
-            Ok((path, "chronoframe-albums.zip".into()))
+            Ok((path, "open-gallery-albums.zip".into()))
         }
     }
     .await;
@@ -4506,7 +4506,7 @@ async fn export_albums(
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
-            "attachment; filename=\"chronoframe-albums.zip\"; filename*=UTF-8''{}",
+            "attachment; filename=\"open-gallery-albums.zip\"; filename*=UTF-8''{}",
             urlencoding::encode(&download_name)
         ))
         .map_err(AppError::internal)?,
@@ -5810,7 +5810,7 @@ async fn export_photos(
                 archive_name: unique_export_name(name, &mut used_names),
             })
             .collect::<Vec<_>>();
-        let archive_path = temporary_dir.join("chronoframe-selected-photos.zip");
+        let archive_path = temporary_dir.join("open-gallery-selected-photos.zip");
         tokio::task::spawn_blocking({
             let archive_path = archive_path.clone();
             move || write_album_zip(&archive_path, &prepared)
@@ -5844,7 +5844,7 @@ async fn export_photos(
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"chronoframe-selected-photos.zip\""),
+        HeaderValue::from_static("attachment; filename=\"open-gallery-selected-photos.zip\""),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -6984,7 +6984,7 @@ async fn main() -> Result<()> {
         .with_state(state);
     let bind_addr = env::var("CF_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!("ChronoFrame listening on http://{bind_addr}");
+    info!("Open Gallery listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
